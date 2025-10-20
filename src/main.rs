@@ -5,6 +5,7 @@
 //
 // Phase 1 Goal: Verify we can decode liquidity events in real-time
 
+use alloy_consensus::{BlockHeader, TxReceipt};
 use alloy_sol_types::{sol, SolEvent};
 use futures::TryStreamExt;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
@@ -73,9 +74,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(
 
                 // Process each block in the committed chain
                 for (block, receipts) in new.blocks_and_receipts() {
-                    let block_number = block.number;
+                    let block_number = block.number();
                     let block_hash = block.hash();
-                    let block_timestamp = block.timestamp;
+                    let block_timestamp = block.timestamp();
 
                     // Track events found in this block
                     let mut mint_count = 0;
@@ -84,7 +85,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(
                     // Process each transaction's receipts
                     for receipt in receipts.iter() {
                         // Process each log in the receipt
-                        for log in receipt.logs.iter() {
+                        for log in receipt.logs().iter() {
                             let log_address = format!("{:#x}", log.address);
 
                             // Filter: only process logs from tracked pools
@@ -93,7 +94,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(
                             }
 
                             // Try to decode as Mint event
-                            if let Ok(mint_event) = Mint::decode_log_data(log, true) {
+                            if let Ok(mint_event) = Mint::decode_log_data(log) {
                                 mint_count += 1;
                                 info!(
                                     "🟢 MINT | Block {} | Pool {} | Owner {} | Ticks [{}, {}] | Amount {} | Amount0 {} | Amount1 {}",
@@ -110,7 +111,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(
                             }
 
                             // Try to decode as Burn event
-                            if let Ok(burn_event) = Burn::decode_log_data(log, true) {
+                            if let Ok(burn_event) = Burn::decode_log_data(log) {
                                 burn_count += 1;
                                 info!(
                                     "🔴 BURN | Block {} | Pool {} | Owner {} | Ticks [{}, {}] | Amount {} | Amount0 {} | Amount1 {}",
@@ -168,7 +169,7 @@ fn main() -> eyre::Result<()> {
     reth::cli::Cli::parse_args().run(|builder, _| async move {
         let handle = builder
             .node(EthereumNode::default())
-            .install_exex("Liquidity", liquidity_exex)
+            .install_exex("Liquidity", async move |ctx| Ok(liquidity_exex(ctx)))
             .launch()
             .await?;
 
