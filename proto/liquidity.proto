@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package liquidity;
+
+// Service for streaming liquidity events from ExEx to Python consumer
+service LiquidityEventStream {
+  // Subscribe to liquidity events
+  rpc Subscribe(SubscribeRequest) returns (stream ExExNotification);
+}
+
+message SubscribeRequest {
+  // Optional: filter by specific pool addresses
+  repeated string pool_addresses = 1;
+}
+
+message ExExNotification {
+  oneof notification {
+    ChainCommitted chain_committed = 1;
+    ChainReorged chain_reorged = 2;
+    ChainReverted chain_reverted = 3;
+  }
+}
+
+message ChainCommitted {
+  Chain new_chain = 1;
+}
+
+message ChainReorged {
+  Chain old_chain = 1;
+  Chain new_chain = 2;
+}
+
+message ChainReverted {
+  Chain old_chain = 1;
+}
+
+message Chain {
+  repeated Block blocks = 1;
+  uint64 tip_number = 2;
+  string tip_hash = 3;
+}
+
+message Block {
+  uint64 number = 1;
+  string hash = 2;
+  uint64 timestamp = 3;
+  repeated LiquidityEvent events = 4;
+}
+
+message LiquidityEvent {
+  // Pool identification
+  string pool_address = 1;
+  string factory_address = 2;
+
+  // Event type
+  enum EventType {
+    MINT = 0;
+    BURN = 1;
+  }
+  EventType event_type = 3;
+
+  // Transaction context
+  string transaction_hash = 4;
+  uint32 transaction_index = 5;
+  uint32 log_index = 6;
+
+  // Event data
+  int32 tick_lower = 7;
+  int32 tick_upper = 8;
+  string liquidity_delta = 9;  // int128 as string
+  string sender_address = 10;
+  string amount0 = 11;  // uint256 as string
+  string amount1 = 12;  // uint256 as string
+
+  // Pool metadata (for new pools)
+  optional string asset0 = 13;
+  optional string asset1 = 14;
+  optional uint32 fee = 15;
+  optional int32 tick_spacing = 16;
+}
