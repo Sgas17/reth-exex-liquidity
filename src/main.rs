@@ -1,157 +1,430 @@
-// Minimal Uniswap V3 Liquidity Event ExEx
+// Reth ExEx: Liquidity Pool Event Decoder with Unix Socket Output
 //
-// This ExEx subscribes to Reth notifications and decodes Mint/Burn events
-// from tracked Uniswap V3 pools, printing them to console.
+// This ExEx:
+// 1. Subscribes to pool whitelist updates from dynamicWhitelist (via NATS or file)
+// 2. Decodes Uniswap V2/V3/V4 Swap/Mint/Burn events from tracked pools
+// 3. Sends pool state updates via Unix Domain Socket to orderbook engine
 //
-// Phase 1 Goal: Verify we can decode liquidity events in real-time
+// Architecture:
+//   Reth ExEx → Event Decoder → Pool State Extractor → Unix Socket → Orderbook Engine
+
+mod events;
+mod nats_client;
+mod pool_tracker;
+mod socket;
+mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
-use alloy_sol_types::{sol, SolEvent};
-use futures::TryStreamExt;
+use alloy_primitives::U256;
+use events::{decode_log, DecodedEvent};
+use nats_client::WhitelistNatsClient;
+// Removed: use eyre::Result; (unused import)
+use futures::{StreamExt, TryStreamExt};
+use pool_tracker::PoolTracker;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
-use reth_tracing::tracing::info;
-use std::collections::HashSet;
+use socket::PoolUpdateSocketServer;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+use types::{ControlMessage, PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, UpdateType};
 
-// Define Uniswap V3 liquidity events using Alloy's sol! macro
-sol! {
-    /// Emitted when liquidity is added to a position
-    event Mint(
-        address indexed sender,
-        address indexed owner,
-        int24 indexed tickLower,
-        int24 tickUpper,
-        uint128 amount,
-        uint256 amount0,
-        uint256 amount1
-    );
+/// Main ExEx state
+struct LiquidityExEx {
+    /// Pool tracker (shared, can be updated from whitelist subscription)
+    pool_tracker: Arc<RwLock<PoolTracker>>,
 
-    /// Emitted when liquidity is removed from a position
-    event Burn(
-        address indexed owner,
-        int24 indexed tickLower,
-        int24 tickUpper,
-        uint128 amount,
-        uint256 amount0,
-        uint256 amount1
-    );
+    /// Socket sender for outgoing messages
+    socket_tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
+
+    /// Statistics
+    events_processed: u64,
+    blocks_processed: u64,
 }
 
-/// High-volume Uniswap V3 pools to track (hardcoded for Phase 1)
-const TRACKED_POOLS: &[&str] = &[
-    "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640", // USDC/WETH 0.05%
-    "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8", // USDC/WETH 0.3%
-    "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed", // WBTC/WETH 0.3%
-    "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36", // WETH/USDT 0.3%
-];
+impl LiquidityExEx {
+    fn new(socket_tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>) -> Self {
+        Self {
+            pool_tracker: Arc::new(RwLock::new(PoolTracker::new())),
+            socket_tx,
+            events_processed: 0,
+            blocks_processed: 0,
+        }
+    }
 
-/// Convert pool addresses to a HashSet for fast lookups
-fn get_tracked_pool_set() -> HashSet<String> {
-    TRACKED_POOLS
-        .iter()
-        .map(|addr| addr.to_lowercase())
-        .collect()
+    /// Convert a decoded event into a PoolUpdateMessage
+    fn create_pool_update(
+        &self,
+        event: DecodedEvent,
+        block_number: u64,
+        block_timestamp: u64,
+        tx_index: u64,
+        log_index: u64,
+        _pool_tracker: &PoolTracker,
+    ) -> Option<PoolUpdateMessage> {
+        match event {
+            // ============================================================================
+            // UNISWAP V2 EVENTS
+            // ============================================================================
+            DecodedEvent::V2Swap {
+                pool,
+                amount0_in,
+                amount1_in,
+                amount0_out,
+                amount1_out,
+            } => {
+                // Get current reserves from pool metadata (we'd need to store this)
+                // For now, calculate reserve deltas
+                let delta0 = if amount0_in > U256::ZERO {
+                    amount0_in
+                } else {
+                    amount0_out
+                };
+                let delta1 = if amount1_in > U256::ZERO {
+                    amount1_in
+                } else {
+                    amount1_out
+                };
+
+                // Note: In production, we'd fetch current reserves and add deltas
+                // For now, send deltas as reserves (consumer will handle)
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::UniswapV2,
+                    update_type: UpdateType::Swap,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    update: PoolUpdate::V2Reserves {
+                        reserve0: delta0,
+                        reserve1: delta1,
+                    },
+                })
+            }
+
+            DecodedEvent::V2Mint {
+                pool,
+                amount0,
+                amount1,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::UniswapV2,
+                update_type: UpdateType::Mint,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                update: PoolUpdate::V2Reserves {
+                    reserve0: amount0,
+                    reserve1: amount1,
+                },
+            }),
+
+            DecodedEvent::V2Burn {
+                pool,
+                amount0,
+                amount1,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::UniswapV2,
+                update_type: UpdateType::Burn,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                update: PoolUpdate::V2Reserves {
+                    reserve0: amount0,
+                    reserve1: amount1,
+                },
+            }),
+
+            // ============================================================================
+            // UNISWAP V3 EVENTS
+            // ============================================================================
+            DecodedEvent::V3Swap {
+                pool,
+                sqrt_price_x96,
+                liquidity,
+                tick,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::UniswapV3,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                update: PoolUpdate::V3Swap {
+                    sqrt_price_x96,
+                    liquidity,
+                    tick,
+                },
+            }),
+
+            DecodedEvent::V3Mint {
+                pool,
+                tick_lower,
+                tick_upper,
+                amount,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::UniswapV3,
+                update_type: UpdateType::Mint,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                update: PoolUpdate::V3Liquidity {
+                    tick_lower,
+                    tick_upper,
+                    liquidity_delta: amount as i128, // Mint is positive
+                },
+            }),
+
+            DecodedEvent::V3Burn {
+                pool,
+                tick_lower,
+                tick_upper,
+                amount,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::UniswapV3,
+                update_type: UpdateType::Burn,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                update: PoolUpdate::V3Liquidity {
+                    tick_lower,
+                    tick_upper,
+                    liquidity_delta: -(amount as i128), // Burn is negative
+                },
+            }),
+
+            // ============================================================================
+            // UNISWAP V4 EVENTS
+            // ============================================================================
+            DecodedEvent::V4Swap {
+                pool_id,
+                sqrt_price_x96,
+                liquidity,
+                tick,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::PoolId(pool_id),
+                protocol: Protocol::UniswapV4,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                update: PoolUpdate::V4Swap {
+                    sqrt_price_x96,
+                    liquidity,
+                    tick,
+                },
+            }),
+
+            DecodedEvent::V4ModifyLiquidity {
+                pool_id,
+                tick_lower,
+                tick_upper,
+                liquidity_delta,
+            } => {
+                let update_type = if liquidity_delta > 0 {
+                    UpdateType::Mint
+                } else {
+                    UpdateType::Burn
+                };
+
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::PoolId(pool_id),
+                    protocol: Protocol::UniswapV4,
+                    update_type,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    update: PoolUpdate::V4Liquidity {
+                        tick_lower,
+                        tick_upper,
+                        liquidity_delta,
+                    },
+                })
+            }
+        }
+    }
 }
 
-/// Main ExEx logic
-async fn liquidity_exex<Node: FullNodeComponents>(
-    mut ctx: ExExContext<Node>,
-) -> eyre::Result<()> {
-    let tracked_pools = get_tracked_pool_set();
+/// Main ExEx entry point
+async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
+    info!("🚀 Liquidity ExEx starting");
 
-    info!("Liquidity ExEx started");
-    info!("Tracking {} pools", tracked_pools.len());
-    for pool in TRACKED_POOLS {
-        info!("  - {}", pool);
+    // Start Unix socket server
+    let socket_server = PoolUpdateSocketServer::new()?;
+    let socket_tx = socket_server.get_sender();
+
+    // Spawn socket server task
+    tokio::spawn(async move {
+        if let Err(e) = socket_server.run().await {
+            warn!("Socket server error: {}", e);
+        }
+    });
+
+    // Initialize ExEx state
+    let mut exex = LiquidityExEx::new(socket_tx);
+
+    // Subscribe to NATS for whitelist updates
+    let nats_url =
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let chain = std::env::var("CHAIN").unwrap_or_else(|_| "ethereum".to_string());
+
+    info!("Connecting to NATS at {} for chain {}", nats_url, chain);
+
+    match WhitelistNatsClient::connect(&nats_url).await {
+        Ok(nats_client) => {
+            info!("✅ NATS connected successfully");
+
+            // Subscribe to whitelist updates
+            match nats_client.subscribe_whitelist(&chain).await {
+                Ok(mut subscriber) => {
+                    info!("✅ Subscribed to whitelist updates for {}", chain);
+
+                    // Spawn task to handle whitelist updates
+                    let pool_tracker = exex.pool_tracker.clone();
+                    tokio::spawn(async move {
+                        while let Some(message) = subscriber.next().await {
+                            match nats_client.parse_message(&message.payload) {
+                                Ok(whitelist_msg) => {
+                                    match nats_client.convert_to_pool_metadata(whitelist_msg) {
+                                        Ok(whitelist_update) => {
+                                            info!(
+                                                "Received whitelist update: {} pools",
+                                                whitelist_update.pools.len()
+                                            );
+
+                                            // Update pool tracker
+                                            pool_tracker
+                                                .write()
+                                                .await
+                                                .update_whitelist(whitelist_update.pools);
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to convert whitelist message: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse whitelist message: {}", e);
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to subscribe to NATS: {}", e);
+                    info!("⚠️  Starting with empty pool whitelist");
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to connect to NATS: {}", e);
+            info!("⚠️  Starting with empty pool whitelist");
+            info!("   Set NATS_URL environment variable to enable whitelist updates");
+        }
     }
 
     // Main event loop: receive notifications from Reth
     while let Some(notification) = ctx.notifications.try_next().await? {
         match &notification {
             ExExNotification::ChainCommitted { new } => {
-                info!("Processing committed chain with {} blocks", new.blocks().len());
+                debug!(
+                    "Processing committed chain with {} blocks",
+                    new.blocks().len()
+                );
 
                 // Process each block in the committed chain
                 for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
-                    let block_hash = block.hash();
                     let block_timestamp = block.timestamp();
 
-                    // Track events found in this block
-                    let mut mint_count = 0;
-                    let mut burn_count = 0;
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    let mut events_in_block = 0;
 
                     // Process each transaction's receipts
-                    for receipt in receipts.iter() {
+                    for (tx_index, receipt) in receipts.iter().enumerate() {
                         // Process each log in the receipt
-                        for log in receipt.logs().iter() {
-                            let log_address = format!("{:#x}", log.address);
+                        for (log_index, log) in receipt.logs().iter().enumerate() {
+                            let log_address = log.address;
 
-                            // Filter: only process logs from tracked pools
-                            if !tracked_pools.contains(&log_address.to_lowercase()) {
+                            // Fast path: check if this is a tracked pool address
+                            if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
 
-                            // Try to decode as Mint event
-                            if let Ok(mint_event) = Mint::decode_log_data(log) {
-                                mint_count += 1;
-                                info!(
-                                    "🟢 MINT | Block {} | Pool {} | Owner {} | Ticks [{}, {}] | Amount {} | Amount0 {} | Amount1 {}",
+                            // Try to decode the log
+                            if let Some(decoded_event) = decode_log(log) {
+                                // Convert decoded event to pool update message
+                                if let Some(update_msg) = exex.create_pool_update(
+                                    decoded_event,
                                     block_number,
-                                    log_address,
-                                    mint_event.owner,
-                                    mint_event.tickLower,
-                                    mint_event.tickUpper,
-                                    mint_event.amount,
-                                    mint_event.amount0,
-                                    mint_event.amount1
-                                );
-                                continue;
-                            }
+                                    block_timestamp,
+                                    tx_index as u64,
+                                    log_index as u64,
+                                    &pool_tracker,
+                                ) {
+                                    // Send to socket
+                                    if let Err(e) =
+                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                    {
+                                        warn!("Failed to send pool update: {}", e);
+                                    }
 
-                            // Try to decode as Burn event
-                            if let Ok(burn_event) = Burn::decode_log_data(log) {
-                                burn_count += 1;
-                                info!(
-                                    "🔴 BURN | Block {} | Pool {} | Owner {} | Ticks [{}, {}] | Amount {} | Amount0 {} | Amount1 {}",
-                                    block_number,
-                                    log_address,
-                                    burn_event.owner,
-                                    burn_event.tickLower,
-                                    burn_event.tickUpper,
-                                    burn_event.amount,
-                                    burn_event.amount0,
-                                    burn_event.amount1
-                                );
-                                continue;
+                                    events_in_block += 1;
+                                    exex.events_processed += 1;
+                                }
                             }
                         }
                     }
 
-                    // Log block summary if we found events
-                    if mint_count > 0 || burn_count > 0 {
+                    if events_in_block > 0 {
+                        debug!(
+                            "Block {}: processed {} liquidity events",
+                            block_number, events_in_block
+                        );
+                    }
+
+                    exex.blocks_processed += 1;
+
+                    // Log stats every 100 blocks
+                    if exex.blocks_processed % 100 == 0 {
                         info!(
-                            "📊 Block {} summary: {} Mints, {} Burns (timestamp: {})",
-                            block_number, mint_count, burn_count, block_timestamp
+                            "Stats: {} blocks, {} events processed",
+                            exex.blocks_processed, exex.events_processed
+                        );
+
+                        let stats = pool_tracker.stats();
+                        info!(
+                            "Tracking: {} pools ({} V2, {} V3, {} V4)",
+                            stats.total_pools, stats.v2_pools, stats.v3_pools, stats.v4_pools
                         );
                     }
                 }
             }
+
             ExExNotification::ChainReorged { old, new } => {
-                info!(
-                    "⚠️  Chain reorg detected: old chain {} blocks, new chain {} blocks",
+                warn!(
+                    "⚠️  Chain reorg: {} old blocks, {} new blocks",
                     old.blocks().len(),
                     new.blocks().len()
                 );
-                // Phase 1: Just log reorgs, don't handle them yet
+                // TODO: Handle reorg by reverting old blocks
             }
+
             ExExNotification::ChainReverted { old } => {
-                info!(
-                    "⚠️  Chain reverted: {} blocks",
-                    old.blocks().len()
-                );
-                // Phase 1: Just log reverts, don't handle them yet
+                warn!("⚠️  Chain reverted: {} blocks", old.blocks().len());
+                // TODO: Handle revert
             }
         }
 
