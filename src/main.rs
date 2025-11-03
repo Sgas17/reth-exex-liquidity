@@ -307,18 +307,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         while let Some(message) = subscriber.next().await {
                             match nats_client.parse_message(&message.payload) {
                                 Ok(whitelist_msg) => {
-                                    match nats_client.convert_to_pool_metadata(whitelist_msg) {
-                                        Ok(whitelist_update) => {
-                                            info!(
-                                                "Received whitelist update: {} pools",
-                                                whitelist_update.pools.len()
-                                            );
-
-                                            // Update pool tracker
+                                    match nats_client.convert_to_pool_update(whitelist_msg) {
+                                        Ok(update) => {
+                                            // Queue the differential update
                                             pool_tracker
                                                 .write()
                                                 .await
-                                                .update_whitelist(whitelist_update.pools);
+                                                .queue_update(update);
                                         }
                                         Err(e) => {
                                             warn!("Failed to convert whitelist message: {}", e);
