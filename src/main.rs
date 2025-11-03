@@ -61,6 +61,7 @@ impl LiquidityExEx {
         block_timestamp: u64,
         tx_index: u64,
         log_index: u64,
+        is_revert: bool,
         _pool_tracker: &PoolTracker,
     ) -> Option<PoolUpdateMessage> {
         match event {
@@ -97,6 +98,7 @@ impl LiquidityExEx {
                     block_timestamp,
                     tx_index,
                     log_index,
+                    is_revert,
                     update: PoolUpdate::V2Reserves {
                         reserve0: delta0,
                         reserve1: delta1,
@@ -116,6 +118,7 @@ impl LiquidityExEx {
                 block_timestamp,
                 tx_index,
                 log_index,
+                is_revert,
                 update: PoolUpdate::V2Reserves {
                     reserve0: amount0,
                     reserve1: amount1,
@@ -134,6 +137,7 @@ impl LiquidityExEx {
                 block_timestamp,
                 tx_index,
                 log_index,
+                is_revert,
                 update: PoolUpdate::V2Reserves {
                     reserve0: amount0,
                     reserve1: amount1,
@@ -156,6 +160,7 @@ impl LiquidityExEx {
                 block_timestamp,
                 tx_index,
                 log_index,
+                is_revert,
                 update: PoolUpdate::V3Swap {
                     sqrt_price_x96,
                     liquidity,
@@ -176,6 +181,7 @@ impl LiquidityExEx {
                 block_timestamp,
                 tx_index,
                 log_index,
+                is_revert,
                 update: PoolUpdate::V3Liquidity {
                     tick_lower,
                     tick_upper,
@@ -196,6 +202,7 @@ impl LiquidityExEx {
                 block_timestamp,
                 tx_index,
                 log_index,
+                is_revert,
                 update: PoolUpdate::V3Liquidity {
                     tick_lower,
                     tick_upper,
@@ -219,6 +226,7 @@ impl LiquidityExEx {
                 block_timestamp,
                 tx_index,
                 log_index,
+                is_revert,
                 update: PoolUpdate::V4Swap {
                     sqrt_price_x96,
                     liquidity,
@@ -246,6 +254,7 @@ impl LiquidityExEx {
                     block_timestamp,
                     tx_index,
                     log_index,
+                    is_revert,
                     update: PoolUpdate::V4Liquidity {
                         tick_lower,
                         tick_upper,
@@ -255,6 +264,7 @@ impl LiquidityExEx {
             }
         }
     }
+
 }
 
 /// Main ExEx entry point
@@ -344,37 +354,47 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     new.blocks().len()
                 );
 
-                // Process each block in the committed chain
+                // Process each block with block boundaries
                 for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
 
+                    // 🔒 Begin block - lock whitelist updates until block completes
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.begin_block();
+                    }
+
+                    // Send BeginBlock marker
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::BeginBlock {
+                        block_number,
+                        block_timestamp,
+                        is_revert: false,
+                    }) {
+                        warn!("Failed to send BeginBlock: {}", e);
+                    }
+
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
 
-                    // Process each transaction's receipts
                     for (tx_index, receipt) in receipts.iter().enumerate() {
-                        // Process each log in the receipt
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
-                            // Fast path: check if this is a tracked pool address
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
 
-                            // Try to decode the log
                             if let Some(decoded_event) = decode_log(log) {
-                                // Convert decoded event to pool update message
                                 if let Some(update_msg) = exex.create_pool_update(
                                     decoded_event,
                                     block_number,
                                     block_timestamp,
                                     tx_index as u64,
                                     log_index as u64,
+                                    false,
                                     &pool_tracker,
                                 ) {
-                                    // Send to socket
                                     if let Err(e) =
                                         exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
                                     {
@@ -386,6 +406,23 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 }
                             }
                         }
+                    }
+
+                    // Release read lock before sending EndBlock
+                    drop(pool_tracker);
+
+                    // Send EndBlock marker
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::EndBlock {
+                        block_number,
+                        num_updates: events_in_block,
+                    }) {
+                        warn!("Failed to send EndBlock: {}", e);
+                    }
+
+                    // 🔓 End block - apply any pending whitelist updates atomically
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.end_block();
                     }
 
                     if events_in_block > 0 {
@@ -404,6 +441,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             exex.blocks_processed, exex.events_processed
                         );
 
+                        let pool_tracker = exex.pool_tracker.read().await;
                         let stats = pool_tracker.stats();
                         info!(
                             "Tracking: {} pools ({} V2, {} V3, {} V4)",
@@ -415,16 +453,241 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
             ExExNotification::ChainReorged { old, new } => {
                 warn!(
-                    "⚠️  Chain reorg: {} old blocks, {} new blocks",
+                    "⚠️  Chain reorg detected: reverting {} old blocks, applying {} new blocks",
                     old.blocks().len(),
                     new.blocks().len()
                 );
-                // TODO: Handle reorg by reverting old blocks
+
+                // Step 1: Revert old blocks
+                info!("Step 1: Reverting {} old blocks", old.blocks().len());
+                for (block, receipts) in old.blocks_and_receipts() {
+                    let block_number = block.number();
+                    let block_timestamp = block.timestamp();
+
+                    // 🔒 Begin block
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.begin_block();
+                    }
+
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::BeginBlock {
+                        block_number,
+                        block_timestamp,
+                        is_revert: true,
+                    }) {
+                        warn!("Failed to send BeginBlock: {}", e);
+                    }
+
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    let mut events_reverted = 0;
+
+                    for (tx_index, receipt) in receipts.iter().enumerate() {
+                        for (log_index, log) in receipt.logs().iter().enumerate() {
+                            let log_address = log.address;
+
+                            if !pool_tracker.is_tracked_address(&log_address) {
+                                continue;
+                            }
+
+                            if let Some(decoded_event) = decode_log(log) {
+                                if let Some(update_msg) = exex.create_pool_update(
+                                    decoded_event,
+                                    block_number,
+                                    block_timestamp,
+                                    tx_index as u64,
+                                    log_index as u64,
+                                    true,
+                                    &pool_tracker,
+                                ) {
+                                    if let Err(e) =
+                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                    {
+                                        warn!("Failed to send pool revert: {}", e);
+                                    }
+
+                                    events_reverted += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    drop(pool_tracker);
+
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::EndBlock {
+                        block_number,
+                        num_updates: events_reverted,
+                    }) {
+                        warn!("Failed to send EndBlock: {}", e);
+                    }
+
+                    // 🔓 End block - apply pending updates
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.end_block();
+                    }
+
+                    if events_reverted > 0 {
+                        debug!("Block {}: reverted {} liquidity events", block_number, events_reverted);
+                    }
+                }
+
+                // Step 2: Process new blocks
+                info!("Step 2: Processing {} new blocks", new.blocks().len());
+                for (block, receipts) in new.blocks_and_receipts() {
+                    let block_number = block.number();
+                    let block_timestamp = block.timestamp();
+
+                    // 🔒 Begin block
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.begin_block();
+                    }
+
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::BeginBlock {
+                        block_number,
+                        block_timestamp,
+                        is_revert: false,
+                    }) {
+                        warn!("Failed to send BeginBlock: {}", e);
+                    }
+
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    let mut events_in_block = 0;
+
+                    for (tx_index, receipt) in receipts.iter().enumerate() {
+                        for (log_index, log) in receipt.logs().iter().enumerate() {
+                            let log_address = log.address;
+
+                            if !pool_tracker.is_tracked_address(&log_address) {
+                                continue;
+                            }
+
+                            if let Some(decoded_event) = decode_log(log) {
+                                if let Some(update_msg) = exex.create_pool_update(
+                                    decoded_event,
+                                    block_number,
+                                    block_timestamp,
+                                    tx_index as u64,
+                                    log_index as u64,
+                                    false,
+                                    &pool_tracker,
+                                ) {
+                                    if let Err(e) =
+                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                    {
+                                        warn!("Failed to send pool update: {}", e);
+                                    }
+
+                                    events_in_block += 1;
+                                    exex.events_processed += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    drop(pool_tracker);
+
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::EndBlock {
+                        block_number,
+                        num_updates: events_in_block,
+                    }) {
+                        warn!("Failed to send EndBlock: {}", e);
+                    }
+
+                    // 🔓 End block - apply pending updates
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.end_block();
+                    }
+
+                    if events_in_block > 0 {
+                        debug!(
+                            "Block {}: processed {} liquidity events",
+                            block_number, events_in_block
+                        );
+                    }
+
+                    exex.blocks_processed += 1;
+                }
+
+                info!("✅ Reorg handled successfully");
             }
 
             ExExNotification::ChainReverted { old } => {
-                warn!("⚠️  Chain reverted: {} blocks", old.blocks().len());
-                // TODO: Handle revert
+                warn!("⚠️  Chain reverted: reverting {} blocks", old.blocks().len());
+
+                for (block, receipts) in old.blocks_and_receipts() {
+                    let block_number = block.number();
+                    let block_timestamp = block.timestamp();
+
+                    // 🔒 Begin block
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.begin_block();
+                    }
+
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::BeginBlock {
+                        block_number,
+                        block_timestamp,
+                        is_revert: true,
+                    }) {
+                        warn!("Failed to send BeginBlock: {}", e);
+                    }
+
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    let mut events_reverted = 0;
+
+                    for (tx_index, receipt) in receipts.iter().enumerate() {
+                        for (log_index, log) in receipt.logs().iter().enumerate() {
+                            let log_address = log.address;
+
+                            if !pool_tracker.is_tracked_address(&log_address) {
+                                continue;
+                            }
+
+                            if let Some(decoded_event) = decode_log(log) {
+                                if let Some(update_msg) = exex.create_pool_update(
+                                    decoded_event,
+                                    block_number,
+                                    block_timestamp,
+                                    tx_index as u64,
+                                    log_index as u64,
+                                    true,
+                                    &pool_tracker,
+                                ) {
+                                    if let Err(e) =
+                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                    {
+                                        warn!("Failed to send pool revert: {}", e);
+                                    }
+
+                                    events_reverted += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    drop(pool_tracker);
+
+                    if let Err(e) = exex.socket_tx.send(ControlMessage::EndBlock {
+                        block_number,
+                        num_updates: events_reverted,
+                    }) {
+                        warn!("Failed to send EndBlock: {}", e);
+                    }
+
+                    // 🔓 End block - apply pending updates
+                    {
+                        let mut pool_tracker = exex.pool_tracker.write().await;
+                        pool_tracker.end_block();
+                    }
+
+                    if events_reverted > 0 {
+                        debug!("Block {}: reverted {} liquidity events", block_number, events_reverted);
+                    }
+                }
+
+                info!("✅ Revert handled successfully");
             }
         }
 

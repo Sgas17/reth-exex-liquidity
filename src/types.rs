@@ -25,6 +25,10 @@ pub struct PoolUpdateMessage {
     pub tx_index: u64,
     pub log_index: u64,
 
+    /// Whether this is a revert (due to chain reorg)
+    /// If true, the consumer should apply the inverse of this update
+    pub is_revert: bool,
+
     /// The actual update data
     pub update: PoolUpdate,
 }
@@ -131,8 +135,25 @@ pub enum ControlMessage {
     /// Update the pool whitelist
     UpdateWhitelist(WhitelistUpdate),
 
-    /// Pool state update
+    /// Block boundary: Start of block processing
+    /// Consumer should buffer all PoolUpdates until EndBlock
+    BeginBlock {
+        block_number: u64,
+        block_timestamp: u64,
+        /// If true, this block's events are reverts (from ChainReorged or ChainReverted)
+        is_revert: bool,
+    },
+
+    /// Pool state update (can be forward or revert based on parent BeginBlock)
     PoolUpdate(PoolUpdateMessage),
+
+    /// Block boundary: End of block processing
+    /// Consumer should now apply all buffered updates atomically and recalculate paths
+    EndBlock {
+        block_number: u64,
+        /// Number of pool updates sent for this block (for validation)
+        num_updates: u64,
+    },
 
     /// Heartbeat / keepalive
     Ping,
