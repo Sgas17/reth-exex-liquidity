@@ -6,9 +6,18 @@
 // 3. Pending update queue - whitelist changes queued and applied atomically
 
 use crate::types::{PoolIdentifier, PoolMetadata, Protocol};
-use alloy_primitives::Address;
+use alloy_primitives::{address, Address};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{info, warn};
+
+// ============================================================================
+// UNISWAP V4 CONSTANTS
+// ============================================================================
+
+/// Uniswap V4 PoolManager singleton contract address (Ethereum Mainnet)
+/// All V4 Swap and ModifyLiquidity events are emitted from this address
+/// Deployed: https://etherscan.io/address/0x000000000004444c5dc75cb358380d2e3de08a90
+pub const UNISWAP_V4_POOL_MANAGER: Address = address!("000000000004444c5dc75cb358380d2e3de08a90");
 
 /// Differential whitelist update operations
 #[derive(Debug, Clone)]
@@ -144,8 +153,15 @@ impl PoolTracker {
                     self.pools_by_address.insert(*addr, pool.clone());
                 }
                 PoolIdentifier::PoolId(id) => {
+                    // For V4 pools, track the poolId AND the PoolManager address
                     self.tracked_pool_ids.insert(*id);
                     self.pools_by_id.insert(*id, pool.clone());
+
+                    // Also track PoolManager address so we receive its events
+                    if !self.tracked_addresses.contains(&UNISWAP_V4_POOL_MANAGER) {
+                        self.tracked_addresses.insert(UNISWAP_V4_POOL_MANAGER);
+                        info!("🔧 Added PoolManager address to tracked addresses for V4 events: {:?}", UNISWAP_V4_POOL_MANAGER);
+                    }
                 }
             }
 

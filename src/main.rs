@@ -265,6 +265,27 @@ impl LiquidityExEx {
         }
     }
 
+    /// Check if we should process this decoded event
+    /// For V2/V3: checks if pool address is tracked
+    /// For V4: checks if pool_id is tracked (NOT the PoolManager address)
+    fn should_process_event(&self, event: &DecodedEvent, pool_tracker: &PoolTracker) -> bool {
+        match event {
+            // V2/V3 events: check pool address
+            DecodedEvent::V2Swap { pool, .. }
+            | DecodedEvent::V2Mint { pool, .. }
+            | DecodedEvent::V2Burn { pool, .. }
+            | DecodedEvent::V3Swap { pool, .. }
+            | DecodedEvent::V3Mint { pool, .. }
+            | DecodedEvent::V3Burn { pool, .. } => pool_tracker.is_tracked_address(pool),
+
+            // V4 events: check pool_id (NOT address!)
+            DecodedEvent::V4Swap { pool_id, .. }
+            | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
+                pool_tracker.is_tracked_pool_id(pool_id)
+            }
+        }
+    }
+
 }
 
 /// Main ExEx entry point
@@ -376,29 +397,42 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
+                            // Quick address filter (includes V2/V3 pools + PoolManager for V4)
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
 
-                            if let Some(decoded_event) = decode_log(log) {
-                                if let Some(update_msg) = exex.create_pool_update(
-                                    decoded_event,
-                                    block_number,
-                                    block_timestamp,
-                                    tx_index as u64,
-                                    log_index as u64,
-                                    false,
-                                    &pool_tracker,
-                                ) {
-                                    if let Err(e) =
-                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
-                                    {
-                                        warn!("Failed to send pool update: {}", e);
-                                    }
+                            // Decode event first
+                            let decoded_event = match decode_log(log) {
+                                Some(event) => event,
+                                None => continue,
+                            };
 
-                                    events_in_block += 1;
-                                    exex.events_processed += 1;
+                            // Check if we should process this specific event
+                            // For V2/V3: checks pool address
+                            // For V4: checks pool_id from event data (NOT PoolManager address)
+                            if !exex.should_process_event(&decoded_event, &pool_tracker) {
+                                continue;
+                            }
+
+                            // Create and send update
+                            if let Some(update_msg) = exex.create_pool_update(
+                                decoded_event,
+                                block_number,
+                                block_timestamp,
+                                tx_index as u64,
+                                log_index as u64,
+                                false,
+                                &pool_tracker,
+                            ) {
+                                if let Err(e) =
+                                    exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                {
+                                    warn!("Failed to send pool update: {}", e);
                                 }
+
+                                events_in_block += 1;
+                                exex.events_processed += 1;
                             }
                         }
                     }
@@ -480,28 +514,41 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
+                            // Quick address filter (includes V2/V3 pools + PoolManager for V4)
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
 
-                            if let Some(decoded_event) = decode_log(log) {
-                                if let Some(update_msg) = exex.create_pool_update(
-                                    decoded_event,
-                                    block_number,
-                                    block_timestamp,
-                                    tx_index as u64,
-                                    log_index as u64,
-                                    true,
-                                    &pool_tracker,
-                                ) {
-                                    if let Err(e) =
-                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
-                                    {
-                                        warn!("Failed to send pool revert: {}", e);
-                                    }
+                            // Decode event first
+                            let decoded_event = match decode_log(log) {
+                                Some(event) => event,
+                                None => continue,
+                            };
 
-                                    events_reverted += 1;
+                            // Check if we should process this specific event
+                            // For V2/V3: checks pool address
+                            // For V4: checks pool_id from event data (NOT PoolManager address)
+                            if !exex.should_process_event(&decoded_event, &pool_tracker) {
+                                continue;
+                            }
+
+                            // Create and send revert update
+                            if let Some(update_msg) = exex.create_pool_update(
+                                decoded_event,
+                                block_number,
+                                block_timestamp,
+                                tx_index as u64,
+                                log_index as u64,
+                                true,
+                                &pool_tracker,
+                            ) {
+                                if let Err(e) =
+                                    exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                {
+                                    warn!("Failed to send pool revert: {}", e);
                                 }
+
+                                events_reverted += 1;
                             }
                         }
                     }
@@ -553,29 +600,42 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
+                            // Quick address filter (includes V2/V3 pools + PoolManager for V4)
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
 
-                            if let Some(decoded_event) = decode_log(log) {
-                                if let Some(update_msg) = exex.create_pool_update(
-                                    decoded_event,
-                                    block_number,
-                                    block_timestamp,
-                                    tx_index as u64,
-                                    log_index as u64,
-                                    false,
-                                    &pool_tracker,
-                                ) {
-                                    if let Err(e) =
-                                        exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
-                                    {
-                                        warn!("Failed to send pool update: {}", e);
-                                    }
+                            // Decode event first
+                            let decoded_event = match decode_log(log) {
+                                Some(event) => event,
+                                None => continue,
+                            };
 
-                                    events_in_block += 1;
-                                    exex.events_processed += 1;
+                            // Check if we should process this specific event
+                            // For V2/V3: checks pool address
+                            // For V4: checks pool_id from event data (NOT PoolManager address)
+                            if !exex.should_process_event(&decoded_event, &pool_tracker) {
+                                continue;
+                            }
+
+                            // Create and send update
+                            if let Some(update_msg) = exex.create_pool_update(
+                                decoded_event,
+                                block_number,
+                                block_timestamp,
+                                tx_index as u64,
+                                log_index as u64,
+                                false,
+                                &pool_tracker,
+                            ) {
+                                if let Err(e) =
+                                    exex.socket_tx.send(ControlMessage::PoolUpdate(update_msg))
+                                {
+                                    warn!("Failed to send pool update: {}", e);
                                 }
+
+                                events_in_block += 1;
+                                exex.events_processed += 1;
                             }
                         }
                     }
