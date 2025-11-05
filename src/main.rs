@@ -414,19 +414,27 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
+                    let mut logs_checked = 0;
+                    let mut logs_matched_address = 0;
+                    let mut logs_decoded = 0;
 
                     for (tx_index, receipt) in receipts.iter().enumerate() {
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
+                            logs_checked += 1;
 
                             // Quick address filter (includes V2/V3 pools + PoolManager for V4)
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
+                            logs_matched_address += 1;
 
                             // Decode event first
                             let decoded_event = match decode_log(log) {
-                                Some(event) => event,
+                                Some(event) => {
+                                    logs_decoded += 1;
+                                    event
+                                },
                                 None => continue,
                             };
 
@@ -480,6 +488,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         info!(
                             "Block {}: processed {} liquidity events",
                             block_number, events_in_block
+                        );
+                    }
+
+                    // Debug logging every block for now
+                    if logs_checked > 0 || events_in_block > 0 {
+                        info!(
+                            "🔍 Block {}: checked {} logs, {} matched address, {} decoded, {} events",
+                            block_number, logs_checked, logs_matched_address, logs_decoded, events_in_block
                         );
                     }
 

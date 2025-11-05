@@ -193,84 +193,90 @@ pub enum DecodedEvent {
 pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     let pool = log.address;
 
-    // Try V2 events
-    if let Ok(event) = UniswapV2Swap::decode_log_data(&log.data) {
+    // Log the signature we're trying to decode (for debugging)
+    if let Some(sig) = log.topics().first() {
+        use tracing::debug;
+        debug!("Attempting to decode log with signature: {:#x} from pool: {:?}", sig, pool);
+    }
+
+    // Try V2 events - using decode_log() to validate signature (topic[0])
+    if let Ok(event) = UniswapV2Swap::decode_log(log) {
         return Some(DecodedEvent::V2Swap {
             pool,
-            amount0_in: event.amount0In,
-            amount1_in: event.amount1In,
-            amount0_out: event.amount0Out,
-            amount1_out: event.amount1Out,
+            amount0_in: event.data.amount0In,
+            amount1_in: event.data.amount1In,
+            amount0_out: event.data.amount0Out,
+            amount1_out: event.data.amount1Out,
         });
     }
 
-    if let Ok(event) = UniswapV2Mint::decode_log_data(&log.data) {
+    if let Ok(event) = UniswapV2Mint::decode_log(log) {
         return Some(DecodedEvent::V2Mint {
             pool,
-            amount0: event.amount0,
-            amount1: event.amount1,
+            amount0: event.data.amount0,
+            amount1: event.data.amount1,
         });
     }
 
-    if let Ok(event) = UniswapV2Burn::decode_log_data(&log.data) {
+    if let Ok(event) = UniswapV2Burn::decode_log(log) {
         return Some(DecodedEvent::V2Burn {
             pool,
-            amount0: event.amount0,
-            amount1: event.amount1,
+            amount0: event.data.amount0,
+            amount1: event.data.amount1,
         });
     }
 
-    // Try V3 events
-    if let Ok(event) = UniswapV3Swap::decode_log_data(&log.data) {
+    // Try V3 events - using decode_log() to validate signature (topic[0])
+    if let Ok(event) = UniswapV3Swap::decode_log(log) {
         return Some(DecodedEvent::V3Swap {
             pool,
-            sqrt_price_x96: U256::from(event.sqrtPriceX96),
-            liquidity: event.liquidity,
-            tick: event.tick.as_i32(),
+            sqrt_price_x96: U256::from(event.data.sqrtPriceX96),
+            liquidity: event.data.liquidity,
+            tick: event.data.tick.as_i32(),
         });
     }
 
-    if let Ok(event) = UniswapV3Mint::decode_log_data(&log.data) {
+    if let Ok(event) = UniswapV3Mint::decode_log(log) {
         return Some(DecodedEvent::V3Mint {
             pool,
-            tick_lower: event.tickLower.as_i32(),
-            tick_upper: event.tickUpper.as_i32(),
-            amount: event.amount,
+            tick_lower: event.data.tickLower.as_i32(),
+            tick_upper: event.data.tickUpper.as_i32(),
+            amount: event.data.amount,
         });
     }
 
-    if let Ok(event) = UniswapV3Burn::decode_log_data(&log.data) {
+    if let Ok(event) = UniswapV3Burn::decode_log(log) {
         return Some(DecodedEvent::V3Burn {
             pool,
-            tick_lower: event.tickLower.as_i32(),
-            tick_upper: event.tickUpper.as_i32(),
-            amount: event.amount,
+            tick_lower: event.data.tickLower.as_i32(),
+            tick_upper: event.data.tickUpper.as_i32(),
+            amount: event.data.amount,
         });
     }
 
-    // Try V4 events
-    if let Ok(event) = UniswapV4Swap::decode_log_data(&log.data) {
-        let pool_id: [u8; 32] = event.poolId.into();
+    // Try V4 events - using decode_log() to validate signature (topic[0])
+    if let Ok(event) = UniswapV4Swap::decode_log(log) {
+        let pool_id: [u8; 32] = event.data.poolId.into();
         return Some(DecodedEvent::V4Swap {
             pool_id,
-            sqrt_price_x96: U256::from(event.sqrtPriceX96),
-            liquidity: event.liquidity,
-            tick: event.tick.as_i32(),
+            sqrt_price_x96: U256::from(event.data.sqrtPriceX96),
+            liquidity: event.data.liquidity,
+            tick: event.data.tick.as_i32(),
         });
     }
 
-    if let Ok(event) = UniswapV4ModifyLiquidity::decode_log_data(&log.data) {
-        let pool_id: [u8; 32] = event.poolId.into();
+    if let Ok(event) = UniswapV4ModifyLiquidity::decode_log(log) {
+        let pool_id: [u8; 32] = event.data.poolId.into();
 
         // Convert i256 to i128 (safe because liquidity deltas won't overflow i128)
-        let liquidity_delta = if event.liquidityDelta >= alloy_primitives::I256::ZERO {
+        let liquidity_delta = if event.data.liquidityDelta >= alloy_primitives::I256::ZERO {
             // Positive value
-            let abs = event.liquidityDelta.into_raw();
+            let abs = event.data.liquidityDelta.into_raw();
             // Take lower 128 bits for positive value
             i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
         } else {
             // Negative value
-            let abs = (-event.liquidityDelta).into_raw();
+            let abs = (-event.data.liquidityDelta).into_raw();
             // Take lower 128 bits and negate
             -i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
         };

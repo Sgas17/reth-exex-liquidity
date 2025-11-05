@@ -8,9 +8,9 @@ use std::path::Path;
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
-    sync::mpsc,
+    sync::{broadcast, mpsc},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 const SOCKET_PATH: &str = "/tmp/reth_exex_pool_updates.sock";
 const BUFFER_SIZE: usize = 10_000; // Buffer up to 10k messages if client is slow
@@ -19,7 +19,8 @@ const BUFFER_SIZE: usize = 10_000; // Buffer up to 10k messages if client is slo
 pub struct PoolUpdateSocketServer {
     listener: UnixListener,
     message_tx: mpsc::UnboundedSender<ControlMessage>,
-    _message_rx: mpsc::UnboundedReceiver<ControlMessage>,
+    message_rx: mpsc::UnboundedReceiver<ControlMessage>,
+    broadcast_tx: broadcast::Sender<ControlMessage>,
 }
 
 impl PoolUpdateSocketServer {
@@ -45,11 +46,13 @@ impl PoolUpdateSocketServer {
         info!("Unix socket server listening on {}", SOCKET_PATH);
 
         let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (broadcast_tx, _) = broadcast::channel(BUFFER_SIZE);
 
         Ok(Self {
             listener,
             message_tx,
-            _message_rx: message_rx,
+            message_rx,
+            broadcast_tx,
         })
     }
 
@@ -59,23 +62,23 @@ impl PoolUpdateSocketServer {
     }
 
     /// Run the server, accepting connections and broadcasting messages
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         info!("Pool update socket server starting");
+
+        let broadcast_tx = self.broadcast_tx.clone();
 
         // Spawn task to accept new connections
         let listener = self.listener;
-        let message_tx = self.message_tx.clone();
-
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
                         info!("New client connected to pool update socket");
-                        let tx = message_tx.clone();
+                        let client_rx = broadcast_tx.subscribe();
 
                         // Spawn handler for this client
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, tx).await {
+                            if let Err(e) = handle_client(stream, client_rx).await {
                                 warn!("Client handler error: {}", e);
                             }
                         });
@@ -87,66 +90,68 @@ impl PoolUpdateSocketServer {
             }
         });
 
-        // Main broadcast loop (receives messages and sends to all clients)
-        // Note: In production, we'd track connected clients and broadcast to all
-        // For now, each client gets its own message stream from the channel
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            debug!("Socket server heartbeat");
+        // Main broadcast loop - receive from message_rx and broadcast to all clients
+        info!("Socket server broadcast loop starting");
+        while let Some(message) = self.message_rx.recv().await {
+            // Broadcast to all connected clients
+            // Ignore errors - clients may disconnect
+            let _ = self.broadcast_tx.send(message);
         }
+
+        info!("Socket server shutting down");
+        Ok(())
     }
 }
 
 /// Handle a single client connection
 async fn handle_client(
     mut stream: UnixStream,
-    _message_tx: mpsc::UnboundedSender<ControlMessage>,
+    mut broadcast_rx: broadcast::Receiver<ControlMessage>,
 ) -> Result<()> {
-    // Create a bounded channel for this client to apply backpressure
-    let (_client_tx, mut client_rx) = mpsc::channel::<ControlMessage>(BUFFER_SIZE);
-
-    // Subscribe this client to the broadcast
-    // Note: This is a simplified version. In production, we'd use broadcast channels
-    // For now, messages sent to message_tx will be cloned for each client
-
-    // Send messages to this client
-    let write_task = tokio::spawn(async move {
-        while let Some(message) = client_rx.recv().await {
-            // Serialize message with bincode
-            let serialized = match bincode::serialize(&message) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!("Failed to serialize message: {}", e);
-                    continue;
-                }
-            };
-
-            // Send length prefix (4 bytes) + message
-            let len = serialized.len() as u32;
-            let len_bytes = len.to_le_bytes();
-
-            if let Err(e) = stream.write_all(&len_bytes).await {
-                error!("Failed to write message length: {}", e);
+    // Receive messages from broadcast channel and send to this client
+    loop {
+        let message = match broadcast_rx.recv().await {
+            Ok(msg) => msg,
+            Err(broadcast::error::RecvError::Closed) => {
+                info!("Broadcast channel closed");
                 break;
             }
-
-            if let Err(e) = stream.write_all(&serialized).await {
-                error!("Failed to write message: {}", e);
-                break;
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!("Client lagged, skipped {} messages", skipped);
+                continue;
             }
+        };
 
-            if let Err(e) = stream.flush().await {
-                error!("Failed to flush stream: {}", e);
-                break;
+        // Serialize message with bincode
+        let serialized = match bincode::serialize(&message) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize message: {}", e);
+                continue;
             }
+        };
+
+        // Send length prefix (4 bytes) + message
+        let len = serialized.len() as u32;
+        let len_bytes = len.to_le_bytes();
+
+        if let Err(e) = stream.write_all(&len_bytes).await {
+            error!("Failed to write message length: {}", e);
+            break;
         }
 
-        info!("Client disconnected");
-        Ok::<(), eyre::Error>(())
-    });
+        if let Err(e) = stream.write_all(&serialized).await {
+            error!("Failed to write message: {}", e);
+            break;
+        }
 
-    write_task.await??;
+        if let Err(e) = stream.flush().await {
+            error!("Failed to flush stream: {}", e);
+            break;
+        }
+    }
 
+    info!("Client disconnected");
     Ok(())
 }
 
