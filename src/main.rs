@@ -269,7 +269,7 @@ impl LiquidityExEx {
     /// For V2/V3: checks if pool address is tracked
     /// For V4: checks if pool_id is tracked (NOT the PoolManager address)
     fn should_process_event(&self, event: &DecodedEvent, pool_tracker: &PoolTracker) -> bool {
-        match event {
+        let should_process = match event {
             // V2/V3 events: check pool address
             DecodedEvent::V2Swap { pool, .. }
             | DecodedEvent::V2Mint { pool, .. }
@@ -283,7 +283,29 @@ impl LiquidityExEx {
             | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
                 pool_tracker.is_tracked_pool_id(pool_id)
             }
+        };
+
+        // Log when events are filtered out to help with debugging
+        if !should_process {
+            match event {
+                DecodedEvent::V2Swap { pool, .. }
+                | DecodedEvent::V2Mint { pool, .. }
+                | DecodedEvent::V2Burn { pool, .. } => {
+                    debug!("Filtered V2 event from untracked pool: {:?}", pool);
+                }
+                DecodedEvent::V3Swap { pool, .. }
+                | DecodedEvent::V3Mint { pool, .. }
+                | DecodedEvent::V3Burn { pool, .. } => {
+                    debug!("Filtered V3 event from untracked pool: {:?}", pool);
+                }
+                DecodedEvent::V4Swap { pool_id, .. }
+                | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
+                    debug!("Filtered V4 event from untracked pool_id: {:?}", hex::encode(pool_id));
+                }
+            }
         }
+
+        should_process
     }
 
 }
@@ -455,7 +477,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
 
                     if events_in_block > 0 {
-                        debug!(
+                        info!(
                             "Block {}: processed {} liquidity events",
                             block_number, events_in_block
                         );
@@ -476,6 +498,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             "Tracking: {} pools ({} V2, {} V3, {} V4)",
                             stats.total_pools, stats.v2_pools, stats.v3_pools, stats.v4_pools
                         );
+
+                        if stats.total_pools == 0 {
+                            warn!("⚠️  No pools in whitelist! Events will be filtered out.");
+                            warn!("   Check that NATS whitelist updates are being received.");
+                        }
                     }
                 }
             }
