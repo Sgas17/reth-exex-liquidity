@@ -75,9 +75,12 @@ pub enum UpdateType {
 /// Pool update data - enum of all possible update types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolUpdate {
-    /// V2 Reserve Delta (signed - positive for adds, negative for removes)
-    /// Mint: both positive, Burn: both negative, Swap: one positive (in), one negative (out)
-    V2Reserves { reserve0: I256, reserve1: I256 },
+    /// V2 Swap Update (reserve deltas - one positive, one negative)
+    V2Swap { amount0: I256, amount1: I256 },
+
+    /// V2 Liquidity Update (Mint or Burn)
+    /// Positive amounts for mint, negative amounts for burn
+    V2Liquidity { amount0: I256, amount1: I256 },
 
     /// V3 Swap Update (sqrtPriceX96, liquidity, tick)
     V3Swap {

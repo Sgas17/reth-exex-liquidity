@@ -98,9 +98,9 @@ impl LiquidityExEx {
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::V2Reserves {
-                        reserve0: amount0,
-                        reserve1: amount1,
+                    update: PoolUpdate::V2Swap {
+                        amount0,
+                        amount1,
                     },
                 })
             }
@@ -123,9 +123,9 @@ impl LiquidityExEx {
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::V2Reserves {
-                        reserve0: delta0,
-                        reserve1: delta1,
+                    update: PoolUpdate::V2Liquidity {
+                        amount0: delta0,
+                        amount1: delta1,
                     },
                 })
             }
@@ -148,9 +148,9 @@ impl LiquidityExEx {
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::V2Reserves {
-                        reserve0: delta0,
-                        reserve1: delta1,
+                    update: PoolUpdate::V2Liquidity {
+                        amount0: delta0,
+                        amount1: delta1,
                     },
                 })
             }
