@@ -250,19 +250,23 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
         });
     }
 
-    // Try V4 events
-    if let Ok(event) = UniswapV4Swap::decode_log_data(&log.data) {
-        let pool_id: [u8; 32] = event.poolId.into();
-        return Some(DecodedEvent::V4Swap {
-            pool_id,
-            sqrt_price_x96: U256::from(event.sqrtPriceX96),
-            liquidity: event.liquidity,
-            tick: event.tick.as_i32(),
-        });
-    }
+    // Try V4 events - poolId is indexed (in topics), not in data!
+    // topics[0] = event signature, topics[1] = poolId (indexed), topics[2] = sender (indexed)
+    if log.topics().len() >= 2 {
+        if let Ok(event) = UniswapV4Swap::decode_log_data(&log.data) {
+            // Extract poolId from topics[1] (first indexed parameter)
+            let pool_id: [u8; 32] = log.topics()[1].into();
+            return Some(DecodedEvent::V4Swap {
+                pool_id,
+                sqrt_price_x96: U256::from(event.sqrtPriceX96),
+                liquidity: event.liquidity,
+                tick: event.tick.as_i32(),
+            });
+        }
 
-    if let Ok(event) = UniswapV4ModifyLiquidity::decode_log_data(&log.data) {
-        let pool_id: [u8; 32] = event.poolId.into();
+        if let Ok(event) = UniswapV4ModifyLiquidity::decode_log_data(&log.data) {
+            // Extract poolId from topics[1] (first indexed parameter)
+            let pool_id: [u8; 32] = log.topics()[1].into();
 
         // Convert i256 to i128 (safe because liquidity deltas won't overflow i128)
         let liquidity_delta = if event.liquidityDelta >= alloy_primitives::I256::ZERO {
@@ -277,12 +281,13 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
             -i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
         };
 
-        return Some(DecodedEvent::V4ModifyLiquidity {
-            pool_id,
-            tick_lower: event.tickLower.as_i32(),
-            tick_upper: event.tickUpper.as_i32(),
-            liquidity_delta,
-        });
+            return Some(DecodedEvent::V4ModifyLiquidity {
+                pool_id,
+                tick_lower: event.tickLower.as_i32(),
+                tick_upper: event.tickUpper.as_i32(),
+                liquidity_delta,
+            });
+        }
     }
 
     None
