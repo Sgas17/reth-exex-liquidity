@@ -114,7 +114,8 @@ mod v4 {
             int128 amount1,
             uint160 sqrtPriceX96,
             uint128 liquidity,
-            int24 tick
+            int24 tick,
+            uint24 fee
         );
 
         /// V4 ModifyLiquidity - replaces separate Mint/Burn
@@ -125,7 +126,8 @@ mod v4 {
             address indexed sender,
             int24 tickLower,
             int24 tickUpper,
-            int256 liquidityDelta
+            int256 liquidityDelta,
+            bytes32 salt
         );
     }
 }
@@ -254,39 +256,44 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
         });
     }
 
-    // Try V4 events - using decode_log() to validate signature (topic[0])
-    if let Ok(event) = UniswapV4Swap::decode_log(log) {
-        let pool_id: [u8; 32] = event.data.poolId.into();
-        return Some(DecodedEvent::V4Swap {
-            pool_id,
-            sqrt_price_x96: U256::from(event.data.sqrtPriceX96),
-            liquidity: event.data.liquidity,
-            tick: event.data.tick.as_i32(),
-        });
-    }
+    // Try V4 events - poolId is indexed (in topics), not in data!
+    // topics[0] = event signature, topics[1] = poolId (indexed), topics[2] = sender (indexed)
+    if log.topics().len() >= 2 {
+        if let Ok(event) = UniswapV4Swap::decode_log_data(&log.data) {
+            // Extract poolId from topics[1] (first indexed parameter)
+            let pool_id: [u8; 32] = log.topics()[1].into();
+            return Some(DecodedEvent::V4Swap {
+                pool_id,
+                sqrt_price_x96: U256::from(event.sqrtPriceX96),
+                liquidity: event.liquidity,
+                tick: event.tick.as_i32(),
+            });
+        }
 
-    if let Ok(event) = UniswapV4ModifyLiquidity::decode_log(log) {
-        let pool_id: [u8; 32] = event.data.poolId.into();
+        if let Ok(event) = UniswapV4ModifyLiquidity::decode_log_data(&log.data) {
+            // Extract poolId from topics[1] (first indexed parameter)
+            let pool_id: [u8; 32] = log.topics()[1].into();
 
-        // Convert i256 to i128 (safe because liquidity deltas won't overflow i128)
-        let liquidity_delta = if event.data.liquidityDelta >= alloy_primitives::I256::ZERO {
-            // Positive value
-            let abs = event.data.liquidityDelta.into_raw();
-            // Take lower 128 bits for positive value
-            i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
-        } else {
-            // Negative value
-            let abs = (-event.data.liquidityDelta).into_raw();
-            // Take lower 128 bits and negate
-            -i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
-        };
+            // Convert i256 to i128 (safe because liquidity deltas won't overflow i128)
+            let liquidity_delta = if event.liquidityDelta >= alloy_primitives::I256::ZERO {
+                // Positive value
+                let abs = event.liquidityDelta.into_raw();
+                // Take lower 128 bits for positive value
+                i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
+            } else {
+                // Negative value
+                let abs = (-event.liquidityDelta).into_raw();
+                // Take lower 128 bits and negate
+                -i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
+            };
 
-        return Some(DecodedEvent::V4ModifyLiquidity {
-            pool_id,
-            tick_lower: event.tickLower.as_i32(),
-            tick_upper: event.tickUpper.as_i32(),
-            liquidity_delta,
-        });
+            return Some(DecodedEvent::V4ModifyLiquidity {
+                pool_id,
+                tick_lower: event.tickLower.as_i32(),
+                tick_upper: event.tickUpper.as_i32(),
+                liquidity_delta,
+            });
+        }
     }
 
     None
@@ -338,16 +345,16 @@ mod tests {
         );
 
         // V4 Event Signatures
-        // Swap(bytes32,address,int128,int128,uint160,uint128,int24)
+        // Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)
         assert_eq!(
             UniswapV4Swap::SIGNATURE_HASH.to_string(),
-            "0x9cd312f3503782cb1d29f4114896ca5405e9cf41adf9a23b76f74203d292296e"
+            "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
         );
 
         // ModifyLiquidity(bytes32,address,int24,int24,int256)
         assert_eq!(
             UniswapV4ModifyLiquidity::SIGNATURE_HASH.to_string(),
-            "0x541c041c2cce48e614b3de043c9280f06b6164c0a1741649e2de3c3d375f7974"
+            "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
         );
     }
 

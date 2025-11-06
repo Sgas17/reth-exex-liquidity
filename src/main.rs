@@ -15,7 +15,7 @@ mod socket;
 mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
-use alloy_primitives::U256;
+use alloy_primitives::{I256, U256};
 use events::{decode_log, DecodedEvent};
 use nats_client::WhitelistNatsClient;
 // Removed: use eyre::Result; (unused import)
@@ -75,21 +75,20 @@ impl LiquidityExEx {
                 amount0_out,
                 amount1_out,
             } => {
-                // Get current reserves from pool metadata (we'd need to store this)
-                // For now, calculate reserve deltas
-                let delta0 = if amount0_in > U256::ZERO {
-                    amount0_in
+                // Calculate signed reserve deltas for V2 swaps
+                // Match Python logic: if amount0In == 0, use (negative out, positive in), else (positive in, negative out)
+                let (amount0, amount1) = if amount0_in == U256::ZERO {
+                    // Token1 -> Token0 swap: token0 going OUT (negative), token1 coming IN (positive)
+                    let delta0 = -I256::try_from(amount0_out).unwrap_or(I256::ZERO);
+                    let delta1 = I256::try_from(amount1_in).unwrap_or(I256::ZERO);
+                    (delta0, delta1)
                 } else {
-                    amount0_out
-                };
-                let delta1 = if amount1_in > U256::ZERO {
-                    amount1_in
-                } else {
-                    amount1_out
+                    // Token0 -> Token1 swap: token0 coming IN (positive), token1 going OUT (negative)
+                    let delta0 = I256::try_from(amount0_in).unwrap_or(I256::ZERO);
+                    let delta1 = -I256::try_from(amount1_out).unwrap_or(I256::ZERO);
+                    (delta0, delta1)
                 };
 
-                // Note: In production, we'd fetch current reserves and add deltas
-                // For now, send deltas as reserves (consumer will handle)
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::UniswapV2,
@@ -99,9 +98,9 @@ impl LiquidityExEx {
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::V2Reserves {
-                        reserve0: delta0,
-                        reserve1: delta1,
+                    update: PoolUpdate::V2Swap {
+                        amount0,
+                        amount1,
                     },
                 })
             }
@@ -110,39 +109,51 @@ impl LiquidityExEx {
                 pool,
                 amount0,
                 amount1,
-            } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::UniswapV2,
-                update_type: UpdateType::Mint,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::V2Reserves {
-                    reserve0: amount0,
-                    reserve1: amount1,
-                },
-            }),
+            } => {
+                // Mint: positive deltas (liquidity added)
+                let delta0 = I256::try_from(amount0).unwrap_or(I256::ZERO);
+                let delta1 = I256::try_from(amount1).unwrap_or(I256::ZERO);
+
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::UniswapV2,
+                    update_type: UpdateType::Mint,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::V2Liquidity {
+                        amount0: delta0,
+                        amount1: delta1,
+                    },
+                })
+            }
 
             DecodedEvent::V2Burn {
                 pool,
                 amount0,
                 amount1,
-            } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::UniswapV2,
-                update_type: UpdateType::Burn,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::V2Reserves {
-                    reserve0: amount0,
-                    reserve1: amount1,
-                },
-            }),
+            } => {
+                // Burn: negative deltas (liquidity removed)
+                let delta0 = -I256::try_from(amount0).unwrap_or(I256::ZERO);
+                let delta1 = -I256::try_from(amount1).unwrap_or(I256::ZERO);
+
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::UniswapV2,
+                    update_type: UpdateType::Burn,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::V2Liquidity {
+                        amount0: delta0,
+                        amount1: delta1,
+                    },
+                })
+            }
 
             // ============================================================================
             // UNISWAP V3 EVENTS

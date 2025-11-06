@@ -2,7 +2,7 @@
 //
 // This module defines all message types sent over Unix socket from ExEx to Orderbook Engine
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, I256, U256};
 use serde::{Deserialize, Serialize};
 
 /// Main envelope for all pool update messages
@@ -75,8 +75,12 @@ pub enum UpdateType {
 /// Pool update data - enum of all possible update types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolUpdate {
-    /// V2 Reserve Update (from Swap, Mint, or Burn)
-    V2Reserves { reserve0: U256, reserve1: U256 },
+    /// V2 Swap Update (reserve deltas - one positive, one negative)
+    V2Swap { amount0: I256, amount1: I256 },
+
+    /// V2 Liquidity Update (Mint or Burn)
+    /// Positive amounts for mint, negative amounts for burn
+    V2Liquidity { amount0: I256, amount1: I256 },
 
     /// V3 Swap Update (sqrtPriceX96, liquidity, tick)
     V3Swap {
