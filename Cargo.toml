@@ -5,13 +5,13 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Reth ExEx framework (pinned to v1.8.2 like examples)
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.8.2" }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.8.2", features = ["serde"] }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.8.2" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.8.2" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.8.2" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.8.2" }
+# Reth ExEx framework (updated to v1.9.3 for Fusaka hardfork support)
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3", features = ["serde"] }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
 
 # Alloy for type-safe event decoding
 alloy-consensus = { version = "1.0.37", default-features = false }
