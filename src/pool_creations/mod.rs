@@ -18,9 +18,9 @@ fn build_pool_rows(
 
     Some(PoolRow {
         address: decoded.pool_address,
-        factory: decoded.factory.to_checksum(None),
-        asset0: decoded.token0.to_checksum(None),
-        asset1: decoded.token1.to_checksum(None),
+        factory: format!("{:#x}", decoded.factory),
+        asset0: format!("{:#x}", decoded.token0),
+        asset1: format!("{:#x}", decoded.token1),
         creation_block: block_number,
         fee: decoded.fee,
         tick_spacing: decoded.tick_spacing,

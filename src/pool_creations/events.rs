@@ -13,7 +13,7 @@ sol! {
 }
 
 pub struct DecodedPoolCreation {
-    /// Pool/pair contract address (checksummed hex for V2/V3, pool ID hex for V4)
+    /// Pool/pair contract address (lowercase hex for V2/V3, pool ID hex for V4)
     pub pool_address: String,
     /// Factory or pool manager address
     pub factory: Address,
@@ -37,7 +37,7 @@ pub fn decode_pair_created(log: &Log) -> Option<DecodedPoolCreation> {
     let decoded = PairCreated::decode_log(log).ok()?;
 
     Some(DecodedPoolCreation {
-        pool_address: to_checksum(&decoded.data.pair),
+        pool_address: to_lowercase_hex(&decoded.data.pair),
         factory: log.address,
         token0: decoded.data.token0,
         token1: decoded.data.token1,
@@ -57,7 +57,7 @@ pub fn decode_pool_created(log: &Log) -> Option<DecodedPoolCreation> {
     let decoded = PoolCreated::decode_log(log).ok()?;
 
     Some(DecodedPoolCreation {
-        pool_address: to_checksum(&decoded.data.pool),
+        pool_address: to_lowercase_hex(&decoded.data.pool),
         factory: log.address,
         token0: decoded.data.token0,
         token1: decoded.data.token1,
@@ -88,7 +88,7 @@ pub fn decode_initialize(log: &Log) -> Option<DecodedPoolCreation> {
         fee: Some(decoded.data.fee.to::<i32>()),
         tick_spacing: Some(decoded.data.tickSpacing.as_i32()),
         additional_data: Some(serde_json::json!({
-            "hooks_address": to_checksum(&decoded.data.hooks),
+            "hooks_address": to_lowercase_hex(&decoded.data.hooks),
         })),
     })
 }
@@ -100,9 +100,9 @@ pub fn decode_pool_creation(log: &Log) -> Option<DecodedPoolCreation> {
         .or_else(|| decode_initialize(log))
 }
 
-/// Convert an Address to EIP-55 checksummed hex string.
-fn to_checksum(addr: &Address) -> String {
-    addr.to_checksum(None)
+/// Convert an Address to lowercase hex string (matching existing DB convention).
+fn to_lowercase_hex(addr: &Address) -> String {
+    format!("{:#x}", addr)
 }
 
 #[cfg(test)]

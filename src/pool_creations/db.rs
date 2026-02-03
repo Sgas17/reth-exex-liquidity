@@ -3,10 +3,10 @@ use sqlx::PgPool;
 use tracing::info;
 
 pub struct PoolRow {
-    pub address: String,           // checksummed hex (or pool ID hex for V4)
-    pub factory: String,           // checksummed hex
-    pub asset0: String,            // checksummed hex
-    pub asset1: String,            // checksummed hex
+    pub address: String,           // lowercase hex (or pool ID hex for V4)
+    pub factory: String,           // lowercase hex
+    pub asset0: String,            // lowercase hex
+    pub asset1: String,            // lowercase hex
     pub creation_block: u64,
     pub fee: Option<i32>,
     pub tick_spacing: Option<i32>,
