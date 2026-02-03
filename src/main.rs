@@ -10,8 +10,10 @@
 
 mod events;
 mod nats_client;
+mod pool_creations;
 mod pool_tracker;
 mod socket;
+mod transfers;
 mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
@@ -815,6 +817,8 @@ fn main() -> eyre::Result<()> {
         let handle = builder
             .node(EthereumNode::default())
             .install_exex("Liquidity", async move |ctx| Ok(liquidity_exex(ctx)))
+            .install_exex("Transfers", async move |ctx| Ok(transfers::transfers_exex(ctx)))
+            .install_exex("PoolCreations", async move |ctx| Ok(pool_creations::pool_creations_exex(ctx)))
             .launch()
             .await?;
 

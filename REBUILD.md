@@ -8,6 +8,11 @@ The ExEx binary is bind-mounted from the host filesystem into the Reth container
 
 This means you only need to rebuild the binary and restart the container - no manual file copying required.
 
+The binary runs three ExExes in a single Reth node:
+- **Liquidity** — Decodes Uniswap V2/V3/V4 Swap/Mint/Burn events from whitelisted pools, sends updates via Unix socket
+- **Transfers** — Indexes all ERC20 Transfer events to PostgreSQL, with aggregation and cleanup
+- **PoolCreations** — Indexes Uniswap V2/V3/V4 pool creation events to PostgreSQL
+
 ## Build Requirements
 
 The ExEx must be built in Ubuntu 22.04 to match Reth's GLIBC version (2.35). Building on a newer system will cause `GLIBC_2.38/2.39 not found` errors.
@@ -58,13 +63,23 @@ cd /home/sam-sullivan/eth-docker && ./ethd restart execution
 Check the ExEx logs:
 
 ```bash
-./ethd logs execution --tail 50 | grep -E "exex|ExEx|Liquidity|connected_peers"
+./ethd logs execution --tail 50 | grep -E "exex|ExEx|Liquidity|Transfers|Pool Creations|connected_peers"
 ```
 
 Look for:
-- `🚀 Liquidity ExEx starting`
-- `✅ NATS connected successfully`
+- `Liquidity ExEx starting`
+- `Transfers ExEx starting`
+- `Pool Creations ExEx starting`
+- `NATS connected successfully`
 - `connected_peers=X` where X > 0
+
+## Environment Variables
+
+| Variable | Used by | Default |
+|---|---|---|
+| `NATS_URL` | Liquidity | `nats://localhost:4222` |
+| `CHAIN` | Liquidity | `ethereum` |
+| `DATABASE_URL` | Transfers, PoolCreations | `postgres://transfers_user:transfers_pass@localhost:5433/transfers` |
 
 ## Updating Reth Version
 
