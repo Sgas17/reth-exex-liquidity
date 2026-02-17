@@ -133,14 +133,26 @@ pub struct WhitelistUpdate {
     pub pools: Vec<PoolMetadata>,
 }
 
-/// Control message types for socket communication
+/// Compact block-range summary used by reorg boundary messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorgRange {
+    pub first_block: Option<u64>,
+    pub last_block: Option<u64>,
+    pub block_count: u64,
+}
+
+/// Control message types for socket communication.
+///
+/// Backward compatibility notes:
+/// - Legacy variants (`BeginBlock`, `PoolUpdate`, `EndBlock`) are retained.
+/// - V2 sequenced variants add `stream_seq` and explicit reorg boundaries.
+/// - Producers should emit V2 variants; consumers may accept both during migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
     /// Update the pool whitelist
     UpdateWhitelist(WhitelistUpdate),
 
-    /// Block boundary: Start of block processing
-    /// Consumer should buffer all PoolUpdates until EndBlock
+    /// Legacy block boundary start (v1)
     BeginBlock {
         block_number: u64,
         block_timestamp: u64,
@@ -148,11 +160,10 @@ pub enum ControlMessage {
         is_revert: bool,
     },
 
-    /// Pool state update (can be forward or revert based on parent BeginBlock)
+    /// Legacy pool update (v1)
     PoolUpdate(PoolUpdateMessage),
 
-    /// Block boundary: End of block processing
-    /// Consumer should now apply all buffered updates atomically and recalculate paths
+    /// Legacy block boundary end (v1)
     EndBlock {
         block_number: u64,
         /// Number of pool updates sent for this block (for validation)
@@ -162,6 +173,63 @@ pub enum ControlMessage {
     /// Heartbeat / keepalive
     Ping,
     Pong,
+
+    /// V2 block boundary start with monotonic stream sequence.
+    BeginBlockV2 {
+        stream_seq: u64,
+        block_number: u64,
+        block_timestamp: u64,
+        is_revert: bool,
+    },
+
+    /// V2 pool update wrapper with monotonic stream sequence.
+    PoolUpdateV2 {
+        stream_seq: u64,
+        event: PoolUpdateMessage,
+    },
+
+    /// V2 block boundary end with monotonic stream sequence.
+    EndBlockV2 {
+        stream_seq: u64,
+        block_number: u64,
+        num_updates: u64,
+    },
+
+    /// Reorg boundary: emitted exactly once when a reorg batch starts.
+    ReorgStart {
+        stream_seq: u64,
+        old_range: ReorgRange,
+        new_range: ReorgRange,
+    },
+
+    /// Reorg boundary: emitted exactly once after the final EndBlock for that reorg batch.
+    ReorgComplete {
+        stream_seq: u64,
+        final_tip_block: u64,
+        /// Pools that require slot0 resync after the reorg.
+        ///
+        /// Emitted deterministically from reverted V3/V4 swap events.
+        slot0_resync_required: Vec<PoolIdentifier>,
+    },
+}
+
+impl ControlMessage {
+    /// Returns stream sequence for V2-sequenced messages.
+    pub fn stream_seq(&self) -> Option<u64> {
+        match self {
+            ControlMessage::BeginBlockV2 { stream_seq, .. }
+            | ControlMessage::PoolUpdateV2 { stream_seq, .. }
+            | ControlMessage::EndBlockV2 { stream_seq, .. }
+            | ControlMessage::ReorgStart { stream_seq, .. }
+            | ControlMessage::ReorgComplete { stream_seq, .. } => Some(*stream_seq),
+            ControlMessage::UpdateWhitelist(_)
+            | ControlMessage::BeginBlock { .. }
+            | ControlMessage::PoolUpdate(_)
+            | ControlMessage::EndBlock { .. }
+            | ControlMessage::Ping
+            | ControlMessage::Pong => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +250,53 @@ mod tests {
         let id = PoolIdentifier::PoolId(pool_id);
         assert_eq!(id.as_pool_id(), Some(pool_id));
         assert_eq!(id.as_address(), None);
+    }
+
+    #[test]
+    fn test_control_message_stream_seq_v2() {
+        let msg = ControlMessage::BeginBlockV2 {
+            stream_seq: 42,
+            block_number: 1000,
+            block_timestamp: 123,
+            is_revert: false,
+        };
+
+        assert_eq!(msg.stream_seq(), Some(42));
+    }
+
+    #[test]
+    fn test_control_message_stream_seq_v1_none() {
+        let msg = ControlMessage::BeginBlock {
+            block_number: 1000,
+            block_timestamp: 123,
+            is_revert: false,
+        };
+
+        assert_eq!(msg.stream_seq(), None);
+    }
+
+    #[test]
+    fn test_reorg_complete_roundtrip() {
+        let msg = ControlMessage::ReorgComplete {
+            stream_seq: 7,
+            final_tip_block: 12345,
+            slot0_resync_required: vec![PoolIdentifier::PoolId([1u8; 32])],
+        };
+
+        let encoded = bincode::serialize(&msg).expect("serialize");
+        let decoded: ControlMessage = bincode::deserialize(&encoded).expect("deserialize");
+
+        match decoded {
+            ControlMessage::ReorgComplete {
+                stream_seq,
+                final_tip_block,
+                slot0_resync_required,
+            } => {
+                assert_eq!(stream_seq, 7);
+                assert_eq!(final_tip_block, 12345);
+                assert_eq!(slot0_resync_required.len(), 1);
+            }
+            other => panic!("unexpected decoded variant: {other:?}"),
+        }
     }
 }
