@@ -1,12 +1,13 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::time::Duration;
 use tracing::info;
 
 pub struct PoolRow {
-    pub address: String,           // lowercase hex (or pool ID hex for V4)
-    pub factory: String,           // lowercase hex
-    pub asset0: String,            // lowercase hex
-    pub asset1: String,            // lowercase hex
+    pub address: String, // lowercase hex (or pool ID hex for V4)
+    pub factory: String, // lowercase hex
+    pub asset0: String,  // lowercase hex
+    pub asset1: String,  // lowercase hex
     pub creation_block: u64,
     pub fee: Option<i32>,
     pub tick_spacing: Option<i32>,
@@ -20,7 +21,11 @@ pub struct PoolDb {
 impl PoolDb {
     pub async fn new(database_url: &str) -> eyre::Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(10)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(60))
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(1800))
             .connect(database_url)
             .await?;
 
@@ -59,11 +64,10 @@ impl PoolDb {
 
     /// Delete all pools created in a specific block (reorg handling).
     pub async fn delete_block(&self, block_number: u64) -> eyre::Result<u64> {
-        let result =
-            sqlx::query("DELETE FROM network_1_dex_pools_cryo WHERE creation_block = $1")
-                .bind(block_number as i32)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query("DELETE FROM network_1_dex_pools_cryo WHERE creation_block = $1")
+            .bind(block_number as i32)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected())
     }
 }

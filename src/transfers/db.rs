@@ -1,5 +1,6 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::time::Duration;
 use tracing::info;
 
 pub struct TransferRow {
@@ -20,7 +21,11 @@ pub struct TransferDb {
 impl TransferDb {
     pub async fn new(database_url: &str) -> eyre::Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(20)
+            .min_connections(2)
+            .acquire_timeout(Duration::from_secs(60))
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(1800))
             .connect(database_url)
             .await?;
 
@@ -183,7 +188,8 @@ impl TransferDb {
                     .push_bind(&t.token_address)
                     .push_bind(&t.from_address)
                     .push_bind(&t.to_address)
-                    .push_bind(&t.amount_str).push_unseparated("::NUMERIC")
+                    .push_bind(&t.amount_str)
+                    .push_unseparated("::NUMERIC")
                     .push_bind(t.block_timestamp as i64);
             });
 

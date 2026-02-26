@@ -8,6 +8,7 @@
 // Architecture:
 //   Reth ExEx → Event Decoder → Pool State Extractor → Unix Socket → Orderbook Engine
 
+mod balance_monitor;
 mod events;
 mod nats_client;
 mod pool_creations;
@@ -40,59 +41,15 @@ struct LiquidityExEx {
     pool_tracker: Arc<RwLock<PoolTracker>>,
 
     /// Socket sender for outgoing messages
-    socket_tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
+    socket_tx: tokio::sync::mpsc::Sender<ControlMessage>,
 
     /// Statistics
     events_processed: u64,
     blocks_processed: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SocketProtocolMode {
-    /// Legacy socket protocol (v1): no stream sequencing, no explicit reorg boundaries.
-    V1,
-    /// Socket protocol v2: sequenced block/update/end + explicit reorg boundaries.
-    V2,
-    /// Emit v2 protocol but also log v1-equivalent messages for debugging.
-    V2ShadowV1,
-}
-
-impl SocketProtocolMode {
-    fn from_env() -> Self {
-        let raw = std::env::var("SOCKET_PROTOCOL").unwrap_or_else(|_| "v2".to_string());
-        match raw.to_ascii_lowercase().as_str() {
-            "v1" => Self::V1,
-            "v2" => Self::V2,
-            "v2_shadow_v1" => Self::V2ShadowV1,
-            other => {
-                warn!(
-                    socket_protocol = other,
-                    "Unknown SOCKET_PROTOCOL value; defaulting to v2"
-                );
-                Self::V2
-            }
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::V1 => "v1",
-            Self::V2 => "v2",
-            Self::V2ShadowV1 => "v2_shadow_v1",
-        }
-    }
-
-    fn stream_seq_enabled(self) -> bool {
-        matches!(self, Self::V2 | Self::V2ShadowV1)
-    }
-
-    fn shadow_v1_logs(self) -> bool {
-        matches!(self, Self::V2ShadowV1)
-    }
-}
-
 impl LiquidityExEx {
-    fn new(socket_tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>) -> Self {
+    fn new(socket_tx: tokio::sync::mpsc::Sender<ControlMessage>) -> Self {
         Self {
             pool_tracker: Arc::new(RwLock::new(PoolTracker::new())),
             socket_tx,
@@ -323,195 +280,67 @@ impl LiquidityExEx {
 
     fn send_begin_block(
         &self,
-        mode: SocketProtocolMode,
         stream_seq: &mut u64,
         block_number: u64,
         block_timestamp: u64,
         is_revert: bool,
     ) {
-        if mode.shadow_v1_logs() {
-            debug!(
-                block = block_number,
-                timestamp = block_timestamp,
-                is_revert,
-                "shadow_v1 BeginBlock equivalent"
-            );
-        }
-
-        match mode {
-            SocketProtocolMode::V1 => {
-                if let Err(e) = self.socket_tx.send(ControlMessage::BeginBlock {
-                    block_number,
-                    block_timestamp,
-                    is_revert,
-                }) {
-                    warn!("Failed to send BeginBlock: {}", e);
-                }
-            }
-            SocketProtocolMode::V2 | SocketProtocolMode::V2ShadowV1 => {
-                let seq = next_stream_seq(stream_seq);
-                if let Err(e) = self.socket_tx.send(ControlMessage::BeginBlockV2 {
-                    stream_seq: seq,
-                    block_number,
-                    block_timestamp,
-                    is_revert,
-                }) {
-                    warn!("Failed to send BeginBlockV2: {}", e);
-                }
-            }
+        let seq = next_stream_seq(stream_seq);
+        if let Err(e) = self.socket_tx.try_send(ControlMessage::BeginBlock {
+            stream_seq: seq,
+            block_number,
+            block_timestamp,
+            is_revert,
+        }) {
+            warn!("Failed to send BeginBlock: {}", e);
         }
     }
 
-    fn send_pool_update(
-        &self,
-        mode: SocketProtocolMode,
-        stream_seq: &mut u64,
-        update_msg: PoolUpdateMessage,
-    ) {
-        if mode.shadow_v1_logs() {
-            tracing::trace!(
-                block = update_msg.block_number,
-                tx = update_msg.tx_index,
-                log = update_msg.log_index,
-                is_revert = update_msg.is_revert,
-                protocol = ?update_msg.protocol,
-                update_type = ?update_msg.update_type,
-                pool_id = ?update_msg.pool_id,
-                "shadow_v1 PoolUpdate equivalent"
-            );
-        }
-
-        match mode {
-            SocketProtocolMode::V1 => {
-                if let Err(e) = self.socket_tx.send(ControlMessage::PoolUpdate(update_msg)) {
-                    warn!("Failed to send PoolUpdate: {}", e);
-                }
-            }
-            SocketProtocolMode::V2 | SocketProtocolMode::V2ShadowV1 => {
-                let seq = next_stream_seq(stream_seq);
-                if let Err(e) = self.socket_tx.send(ControlMessage::PoolUpdateV2 {
-                    stream_seq: seq,
-                    event: update_msg,
-                }) {
-                    warn!("Failed to send PoolUpdateV2: {}", e);
-                }
-            }
+    fn send_pool_update(&self, stream_seq: &mut u64, update_msg: PoolUpdateMessage) {
+        let seq = next_stream_seq(stream_seq);
+        if let Err(e) = self.socket_tx.try_send(ControlMessage::PoolUpdate {
+            stream_seq: seq,
+            event: update_msg,
+        }) {
+            warn!("Failed to send PoolUpdate: {}", e);
         }
     }
 
-    fn send_end_block(
-        &self,
-        mode: SocketProtocolMode,
-        stream_seq: &mut u64,
-        block_number: u64,
-        num_updates: u64,
-    ) {
-        if mode.shadow_v1_logs() {
-            debug!(
-                block = block_number,
-                num_updates, "shadow_v1 EndBlock equivalent"
-            );
-        }
-
-        match mode {
-            SocketProtocolMode::V1 => {
-                if let Err(e) = self.socket_tx.send(ControlMessage::EndBlock {
-                    block_number,
-                    num_updates,
-                }) {
-                    warn!("Failed to send EndBlock: {}", e);
-                }
-            }
-            SocketProtocolMode::V2 | SocketProtocolMode::V2ShadowV1 => {
-                let seq = next_stream_seq(stream_seq);
-                if let Err(e) = self.socket_tx.send(ControlMessage::EndBlockV2 {
-                    stream_seq: seq,
-                    block_number,
-                    num_updates,
-                }) {
-                    warn!("Failed to send EndBlockV2: {}", e);
-                }
-            }
+    fn send_end_block(&self, stream_seq: &mut u64, block_number: u64, num_updates: u64) {
+        let seq = next_stream_seq(stream_seq);
+        if let Err(e) = self.socket_tx.try_send(ControlMessage::EndBlock {
+            stream_seq: seq,
+            block_number,
+            num_updates,
+        }) {
+            warn!("Failed to send EndBlock: {}", e);
         }
     }
 
-    fn send_reorg_start(
-        &self,
-        mode: SocketProtocolMode,
-        stream_seq: &mut u64,
-        old_range: ReorgRange,
-        new_range: ReorgRange,
-    ) {
-        match mode {
-            SocketProtocolMode::V1 => {
-                debug!(
-                    old_first = ?old_range.first_block,
-                    old_last = ?old_range.last_block,
-                    old_blocks = old_range.block_count,
-                    new_first = ?new_range.first_block,
-                    new_last = ?new_range.last_block,
-                    new_blocks = new_range.block_count,
-                    "SOCKET_PROTOCOL=v1: skipping explicit ReorgStart emission"
-                );
-            }
-            SocketProtocolMode::V2 | SocketProtocolMode::V2ShadowV1 => {
-                if mode.shadow_v1_logs() {
-                    debug!(
-                        old_first = ?old_range.first_block,
-                        old_last = ?old_range.last_block,
-                        old_blocks = old_range.block_count,
-                        new_first = ?new_range.first_block,
-                        new_last = ?new_range.last_block,
-                        new_blocks = new_range.block_count,
-                        "shadow_v1: ReorgStart has no direct v1 equivalent"
-                    );
-                }
-
-                let seq = next_stream_seq(stream_seq);
-                if let Err(e) = self.socket_tx.send(ControlMessage::ReorgStart {
-                    stream_seq: seq,
-                    old_range,
-                    new_range,
-                }) {
-                    warn!("Failed to send ReorgStart: {}", e);
-                }
-            }
+    fn send_reorg_start(&self, stream_seq: &mut u64, old_range: ReorgRange, new_range: ReorgRange) {
+        let seq = next_stream_seq(stream_seq);
+        if let Err(e) = self.socket_tx.try_send(ControlMessage::ReorgStart {
+            stream_seq: seq,
+            old_range,
+            new_range,
+        }) {
+            warn!("Failed to send ReorgStart: {}", e);
         }
     }
 
     fn send_reorg_complete(
         &self,
-        mode: SocketProtocolMode,
         stream_seq: &mut u64,
         final_tip_block: u64,
         slot0_resync_required: Vec<PoolIdentifier>,
     ) {
-        match mode {
-            SocketProtocolMode::V1 => {
-                debug!(
-                    final_tip_block,
-                    slot0_resync_required = slot0_resync_required.len(),
-                    "SOCKET_PROTOCOL=v1: skipping explicit ReorgComplete emission"
-                );
-            }
-            SocketProtocolMode::V2 | SocketProtocolMode::V2ShadowV1 => {
-                if mode.shadow_v1_logs() {
-                    debug!(
-                        final_tip_block,
-                        slot0_resync_required = slot0_resync_required.len(),
-                        "shadow_v1: ReorgComplete has no direct v1 equivalent"
-                    );
-                }
-
-                let seq = next_stream_seq(stream_seq);
-                if let Err(e) = self.socket_tx.send(ControlMessage::ReorgComplete {
-                    stream_seq: seq,
-                    final_tip_block,
-                    slot0_resync_required,
-                }) {
-                    warn!("Failed to send ReorgComplete: {}", e);
-                }
-            }
+        let seq = next_stream_seq(stream_seq);
+        if let Err(e) = self.socket_tx.try_send(ControlMessage::ReorgComplete {
+            stream_seq: seq,
+            final_tip_block,
+            slot0_resync_required,
+        }) {
+            warn!("Failed to send ReorgComplete: {}", e);
         }
     }
 
@@ -580,16 +409,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
     // Initialize ExEx state
     let mut exex = LiquidityExEx::new(socket_tx);
 
-    let socket_protocol = SocketProtocolMode::from_env();
-    info!(
-        socket_protocol = socket_protocol.as_str(),
-        stream_seq_enabled = socket_protocol.stream_seq_enabled(),
-        shadow_v1_logs = socket_protocol.shadow_v1_logs(),
-        "Socket protocol mode configured"
-    );
+    info!("Socket protocol configured: v2 (cutover, legacy v1 removed)");
 
-    // Monotonic stream sequence for socket protocol v2 modes.
-    // Increments for every emitted V2 control/update/reorg message.
+    // Monotonic stream sequence for socket protocol messages.
     let mut stream_seq: u64 = 0;
 
     // Subscribe to NATS for whitelist updates
@@ -605,27 +427,48 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
             // Subscribe to whitelist updates
             match nats_client.subscribe_whitelist(&chain).await {
-                Ok(mut subscriber) => {
+                Ok(subscriber) => {
                     info!("✅ Subscribed to whitelist updates for {}", chain);
 
-                    // Spawn task to handle whitelist updates
+                    // Spawn task to handle whitelist updates with reconnect
                     let pool_tracker = exex.pool_tracker.clone();
+                    let chain_for_task = chain.clone();
                     tokio::spawn(async move {
-                        while let Some(message) = subscriber.next().await {
-                            match nats_client.parse_message(&message.payload) {
-                                Ok(whitelist_msg) => {
-                                    match nats_client.convert_to_pool_update(whitelist_msg) {
-                                        Ok(update) => {
-                                            // Queue the differential update
-                                            pool_tracker.write().await.queue_update(update);
-                                        }
-                                        Err(e) => {
-                                            warn!("Failed to convert whitelist message: {}", e);
+                        let mut current_sub = subscriber;
+                        loop {
+                            while let Some(message) = current_sub.next().await {
+                                match nats_client.parse_message(&message.payload) {
+                                    Ok(whitelist_msg) => {
+                                        match nats_client.convert_to_pool_update(whitelist_msg) {
+                                            Ok(update) => {
+                                                pool_tracker.write().await.queue_update(update);
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to convert whitelist message: {}", e);
+                                            }
                                         }
                                     }
+                                    Err(e) => {
+                                        warn!("Failed to parse whitelist message: {}", e);
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Failed to parse whitelist message: {}", e);
+                            }
+
+                            // Stream closed — attempt resubscribe with backoff
+                            warn!("Whitelist subscription closed, attempting resubscribe");
+                            let mut backoff = std::time::Duration::from_secs(1);
+                            loop {
+                                tokio::time::sleep(backoff).await;
+                                match nats_client.subscribe_whitelist(&chain_for_task).await {
+                                    Ok(new_sub) => {
+                                        info!("✅ Whitelist subscription restored");
+                                        current_sub = new_sub;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to resubscribe, retrying in {:?}", backoff);
+                                        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                                    }
                                 }
                             }
                         }
@@ -664,13 +507,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        block_timestamp,
-                        false,
-                    );
+                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, false);
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
@@ -715,7 +552,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
-                                exex.send_pool_update(socket_protocol, &mut stream_seq, update_msg);
+                                exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
                                 exex.events_processed += 1;
@@ -726,12 +563,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     // Release read lock before sending EndBlock
                     drop(pool_tracker);
 
-                    exex.send_end_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        events_in_block,
-                    );
+                    exex.send_end_block(&mut stream_seq, block_number, events_in_block);
 
                     // 🔓 End block - apply any pending whitelist updates atomically
                     {
@@ -792,12 +624,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     .or(old_range.last_block)
                     .unwrap_or_default();
 
-                exex.send_reorg_start(
-                    socket_protocol,
-                    &mut stream_seq,
-                    old_range.clone(),
-                    new_range.clone(),
-                );
+                exex.send_reorg_start(&mut stream_seq, old_range.clone(), new_range.clone());
 
                 let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
 
@@ -813,13 +640,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        block_timestamp,
-                        true,
-                    );
+                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, true);
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_reverted = 0;
@@ -860,7 +681,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                     &update_msg,
                                     &mut slot0_resync_required,
                                 );
-                                exex.send_pool_update(socket_protocol, &mut stream_seq, update_msg);
+                                exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
                             }
@@ -869,12 +690,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                     drop(pool_tracker);
 
-                    exex.send_end_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        events_reverted,
-                    );
+                    exex.send_end_block(&mut stream_seq, block_number, events_reverted);
 
                     // 🔓 End block - apply pending updates
                     {
@@ -902,13 +718,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        block_timestamp,
-                        false,
-                    );
+                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, false);
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
@@ -945,7 +755,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
-                                exex.send_pool_update(socket_protocol, &mut stream_seq, update_msg);
+                                exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
                                 exex.events_processed += 1;
@@ -955,12 +765,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                     drop(pool_tracker);
 
-                    exex.send_end_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        events_in_block,
-                    );
+                    exex.send_end_block(&mut stream_seq, block_number, events_in_block);
 
                     // 🔓 End block - apply pending updates
                     {
@@ -979,12 +784,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
 
                 sort_pool_identifiers_deterministically(&mut slot0_resync_required);
-                exex.send_reorg_complete(
-                    socket_protocol,
-                    &mut stream_seq,
-                    final_tip_block,
-                    slot0_resync_required,
-                );
+                exex.send_reorg_complete(&mut stream_seq, final_tip_block, slot0_resync_required);
 
                 info!("✅ Reorg handled successfully");
             }
@@ -1002,7 +802,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     .unwrap_or_default();
 
                 exex.send_reorg_start(
-                    socket_protocol,
                     &mut stream_seq,
                     old_range.clone(),
                     ReorgRange {
@@ -1024,13 +823,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        block_timestamp,
-                        true,
-                    );
+                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, true);
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_reverted = 0;
@@ -1043,40 +836,39 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 continue;
                             }
 
-                            if let Some(decoded_event) = decode_log(log) {
-                                if let Some(update_msg) = exex.create_pool_update(
-                                    decoded_event,
-                                    block_number,
-                                    block_timestamp,
-                                    tx_index as u64,
-                                    log_index as u64,
-                                    true,
-                                    &pool_tracker,
-                                ) {
-                                    maybe_record_slot0_resync_pool(
-                                        &update_msg,
-                                        &mut slot0_resync_required,
-                                    );
-                                    exex.send_pool_update(
-                                        socket_protocol,
-                                        &mut stream_seq,
-                                        update_msg,
-                                    );
+                            let decoded_event = match decode_log(log) {
+                                Some(event) => event,
+                                None => continue,
+                            };
 
-                                    events_reverted += 1;
-                                }
+                            // Filter by pool_id for V4 (same as Committed/Reorged paths)
+                            if !exex.should_process_event(&decoded_event, &pool_tracker) {
+                                continue;
+                            }
+
+                            if let Some(update_msg) = exex.create_pool_update(
+                                decoded_event,
+                                block_number,
+                                block_timestamp,
+                                tx_index as u64,
+                                log_index as u64,
+                                true,
+                                &pool_tracker,
+                            ) {
+                                maybe_record_slot0_resync_pool(
+                                    &update_msg,
+                                    &mut slot0_resync_required,
+                                );
+                                exex.send_pool_update(&mut stream_seq, update_msg);
+
+                                events_reverted += 1;
                             }
                         }
                     }
 
                     drop(pool_tracker);
 
-                    exex.send_end_block(
-                        socket_protocol,
-                        &mut stream_seq,
-                        block_number,
-                        events_reverted,
-                    );
+                    exex.send_end_block(&mut stream_seq, block_number, events_reverted);
 
                     // 🔓 End block - apply pending updates
                     {
@@ -1093,12 +885,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
 
                 sort_pool_identifiers_deterministically(&mut slot0_resync_required);
-                exex.send_reorg_complete(
-                    socket_protocol,
-                    &mut stream_seq,
-                    final_tip_block,
-                    slot0_resync_required,
-                );
+                exex.send_reorg_complete(&mut stream_seq, final_tip_block, slot0_resync_required);
 
                 info!("✅ Revert handled successfully");
             }
@@ -1193,6 +980,9 @@ fn main() -> eyre::Result<()> {
             .node(EthereumNode::default())
             .install_exex("Liquidity", async move |ctx| Ok(liquidity_exex(ctx)))
             // .install_exex("Transfers", async move |ctx| Ok(transfers::transfers_exex(ctx)))
+            .install_exex("BalanceMonitor", async move |ctx| {
+                Ok(balance_monitor::balance_monitor_exex(ctx))
+            })
             .install_exex("PoolCreations", async move |ctx| {
                 Ok(pool_creations::pool_creations_exex(ctx))
             })

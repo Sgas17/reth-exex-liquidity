@@ -41,17 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create test message
     let message = WhitelistPoolMessage {
-        pools: vec![
-            PoolData {
-                address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640".to_string(),
-                token0: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
-                token1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string(),
-                protocol: "UniswapV3".to_string(),
-                factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984".to_string(),
-                tick_spacing: Some(10),
-                fee: Some(500),
-            },
-        ],
+        pools: vec![PoolData {
+            address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640".to_string(),
+            token0: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+            token1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string(),
+            protocol: "UniswapV3".to_string(),
+            factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984".to_string(),
+            tick_spacing: Some(10),
+            fee: Some(500),
+        }],
         chain: "ethereum".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
     };

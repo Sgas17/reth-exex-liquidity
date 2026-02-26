@@ -19,8 +19,8 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhitelistPoolMessage {
     #[serde(rename = "type", default = "default_message_type")]
-    pub message_type: String,  // "add", "remove", or "full"
-    pub pools: Vec<String>,    // Pool addresses (20 bytes for V2/V3, 32 bytes for V4)
+    pub message_type: String, // "add", "remove", or "full"
+    pub pools: Vec<String>, // Pool addresses (20 bytes for V2/V3, 32 bytes for V4)
     #[serde(default)]
     pub protocols: Vec<String>, // Protocol version for each pool: "v2", "v3", or "v4"
     pub chain: String,
@@ -123,7 +123,11 @@ impl WhitelistNatsClient {
     }
 
     /// Parse pool addresses into PoolMetadata (for Add/Full updates)
-    fn parse_pool_addresses(&self, addresses: &[String], protocols: &[String]) -> Result<Vec<PoolMetadata>> {
+    fn parse_pool_addresses(
+        &self,
+        addresses: &[String],
+        protocols: &[String],
+    ) -> Result<Vec<PoolMetadata>> {
         // Require protocols array to match pools array length
         if addresses.len() != protocols.len() {
             return Err(eyre::eyre!(
@@ -142,7 +146,10 @@ impl WhitelistNatsClient {
                 "v3" => Protocol::UniswapV3,
                 "v4" => Protocol::UniswapV4,
                 unknown => {
-                    warn!("Unknown protocol '{}' for pool {}, skipping", unknown, address_str);
+                    warn!(
+                        "Unknown protocol '{}' for pool {}, skipping",
+                        unknown, address_str
+                    );
                     continue;
                 }
             };

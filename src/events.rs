@@ -96,6 +96,29 @@ mod v3 {
 // Re-export with namespaced names to avoid conflicts
 use v3::{Burn as UniswapV3Burn, Mint as UniswapV3Mint, Swap as UniswapV3Swap};
 
+// PancakeSwap V3 uses a Swap event with two extra trailing uint128 fields.
+// Signature: Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)
+mod v3_pancake {
+    use super::*;
+
+    sol! {
+        #[derive(Debug)]
+        event Swap(
+            address indexed sender,
+            address indexed recipient,
+            int256 amount0,
+            int256 amount1,
+            uint160 sqrtPriceX96,
+            uint128 liquidity,
+            int24 tick,
+            uint128 protocolFeesToken0,
+            uint128 protocolFeesToken1
+        );
+    }
+}
+
+use v3_pancake::Swap as PancakeV3Swap;
+
 // ============================================================================
 // UNISWAP V4 EVENTS (from PoolManager singleton)
 // ============================================================================
@@ -198,7 +221,10 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     // Log the signature we're trying to decode (for debugging)
     if let Some(sig) = log.topics().first() {
         use tracing::debug;
-        debug!("Attempting to decode log with signature: {:#x} from pool: {:?}", sig, pool);
+        debug!(
+            "Attempting to decode log with signature: {:#x} from pool: {:?}",
+            sig, pool
+        );
     }
 
     // Try V2 events - using decode_log() to validate signature (topic[0])
@@ -238,6 +264,16 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
         });
     }
 
+    // PancakeSwap V3 swap variant with extra protocol fee fields.
+    if let Ok(event) = PancakeV3Swap::decode_log(log) {
+        return Some(DecodedEvent::V3Swap {
+            pool,
+            sqrt_price_x96: U256::from(event.data.sqrtPriceX96),
+            liquidity: event.data.liquidity,
+            tick: event.data.tick.as_i32(),
+        });
+    }
+
     if let Ok(event) = UniswapV3Mint::decode_log(log) {
         return Some(DecodedEvent::V3Mint {
             pool,
@@ -258,41 +294,41 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
 
     // Try V4 events - poolId is indexed (in topics), not in data!
     // topics[0] = event signature, topics[1] = poolId (indexed), topics[2] = sender (indexed)
-    if log.topics().len() >= 2 {
-        if let Ok(event) = UniswapV4Swap::decode_log_data(&log.data) {
-            // Extract poolId from topics[1] (first indexed parameter)
-            let pool_id: [u8; 32] = log.topics()[1].into();
-            return Some(DecodedEvent::V4Swap {
-                pool_id,
-                sqrt_price_x96: U256::from(event.sqrtPriceX96),
-                liquidity: event.liquidity,
-                tick: event.tick.as_i32(),
-            });
+    // Must validate topic0 against the expected signature first — decode_log_data
+    // only parses the data section and does NOT check the event signature.
+    if log.topics().len() >= 3 {
+        if log.topics()[0] == UniswapV4Swap::SIGNATURE_HASH {
+            if let Ok(event) = UniswapV4Swap::decode_log_data(&log.data) {
+                let pool_id: [u8; 32] = log.topics()[1].into();
+                return Some(DecodedEvent::V4Swap {
+                    pool_id,
+                    sqrt_price_x96: U256::from(event.sqrtPriceX96),
+                    liquidity: event.liquidity,
+                    tick: event.tick.as_i32(),
+                });
+            }
         }
 
-        if let Ok(event) = UniswapV4ModifyLiquidity::decode_log_data(&log.data) {
-            // Extract poolId from topics[1] (first indexed parameter)
-            let pool_id: [u8; 32] = log.topics()[1].into();
+        if log.topics()[0] == UniswapV4ModifyLiquidity::SIGNATURE_HASH {
+            if let Ok(event) = UniswapV4ModifyLiquidity::decode_log_data(&log.data) {
+                let pool_id: [u8; 32] = log.topics()[1].into();
 
-            // Convert i256 to i128 (safe because liquidity deltas won't overflow i128)
-            let liquidity_delta = if event.liquidityDelta >= alloy_primitives::I256::ZERO {
-                // Positive value
-                let abs = event.liquidityDelta.into_raw();
-                // Take lower 128 bits for positive value
-                i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
-            } else {
-                // Negative value
-                let abs = (-event.liquidityDelta).into_raw();
-                // Take lower 128 bits and negate
-                -i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
-            };
+                // Convert i256 to i128 (safe because liquidity deltas won't overflow i128)
+                let liquidity_delta = if event.liquidityDelta >= alloy_primitives::I256::ZERO {
+                    let abs = event.liquidityDelta.into_raw();
+                    i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
+                } else {
+                    let abs = (-event.liquidityDelta).into_raw();
+                    -i128::try_from(abs.saturating_to::<u128>()).unwrap_or(i128::MAX)
+                };
 
-            return Some(DecodedEvent::V4ModifyLiquidity {
-                pool_id,
-                tick_lower: event.tickLower.as_i32(),
-                tick_upper: event.tickUpper.as_i32(),
-                liquidity_delta,
-            });
+                return Some(DecodedEvent::V4ModifyLiquidity {
+                    pool_id,
+                    tick_lower: event.tickLower.as_i32(),
+                    tick_upper: event.tickUpper.as_i32(),
+                    liquidity_delta,
+                });
+            }
         }
     }
 
@@ -330,6 +366,12 @@ mod tests {
         assert_eq!(
             UniswapV3Swap::SIGNATURE_HASH.to_string(),
             "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+        );
+
+        // Pancake V3 Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)
+        assert_eq!(
+            PancakeV3Swap::SIGNATURE_HASH.to_string(),
+            "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83"
         );
 
         // Mint(address,address,int24,int24,uint128,uint256,uint256)
@@ -431,6 +473,24 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_v3_swap_pancake() {
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![
+                    PancakeV3Swap::SIGNATURE_HASH,
+                    alloy_primitives::B256::ZERO, // sender
+                    alloy_primitives::B256::ZERO, // recipient
+                ],
+                vec![0u8; 224].into(), // + two uint128 protocol fee fields
+            ),
+        };
+
+        let decoded = decode_log(&log);
+        assert!(matches!(decoded, Some(DecodedEvent::V3Swap { .. })));
+    }
+
+    #[test]
     fn test_decode_v3_mint() {
         let log = Log {
             address: Address::ZERO,
@@ -501,7 +561,10 @@ mod tests {
         };
 
         let decoded = decode_log(&log);
-        assert!(matches!(decoded, Some(DecodedEvent::V4ModifyLiquidity { .. })));
+        assert!(matches!(
+            decoded,
+            Some(DecodedEvent::V4ModifyLiquidity { .. })
+        ));
     }
 
     #[test]
@@ -542,8 +605,12 @@ mod tests {
         // Topics: [signature, sender, recipient]
         let topics = vec![
             signature,
-            B256::from(hex!("000000000000000000000000e592427a0aece92de3edee1f18e0157c05861564")), // sender (router)
-            B256::from(hex!("000000000000000000000000e592427a0aece92de3edee1f18e0157c05861564")), // recipient
+            B256::from(hex!(
+                "000000000000000000000000e592427a0aece92de3edee1f18e0157c05861564"
+            )), // sender (router)
+            B256::from(hex!(
+                "000000000000000000000000e592427a0aece92de3edee1f18e0157c05861564"
+            )), // recipient
         ];
 
         // Data: amount0, amount1, sqrtPriceX96, liquidity, tick (simplified example)
@@ -553,7 +620,8 @@ mod tests {
             "00000000000000000000000000000001000000000000000000000000000000ff" // sqrtPriceX96
             "00000000000000000000000000000000000000000000000000000000deadbeef" // liquidity
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8ad0" // tick (-30000 in two's complement)
-        ).to_vec();
+        )
+        .to_vec();
 
         let log = Log {
             address: pool_address,
@@ -567,7 +635,12 @@ mod tests {
         assert!(decoded.is_some(), "Failed to decode real V3 Swap event");
 
         match decoded.unwrap() {
-            DecodedEvent::V3Swap { pool, sqrt_price_x96, liquidity, tick } => {
+            DecodedEvent::V3Swap {
+                pool,
+                sqrt_price_x96,
+                liquidity,
+                tick,
+            } => {
                 assert_eq!(pool, pool_address);
                 assert!(sqrt_price_x96 > U256::ZERO);
                 assert!(liquidity > 0);
@@ -589,9 +662,15 @@ mod tests {
         // Topics: [signature, owner, tickLower, tickUpper]
         let topics = vec![
             signature,
-            B256::from(hex!("000000000000000000000000c36442b4a4522e871399cd717abdd847ab11fe88")), // owner (position manager)
-            B256::from(hex!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8ad0")), // tickLower (-30000)
-            B256::from(hex!("0000000000000000000000000000000000000000000000000000000000007530")), // tickUpper (30000)
+            B256::from(hex!(
+                "000000000000000000000000c36442b4a4522e871399cd717abdd847ab11fe88"
+            )), // owner (position manager)
+            B256::from(hex!(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8ad0"
+            )), // tickLower (-30000)
+            B256::from(hex!(
+                "0000000000000000000000000000000000000000000000000000000000007530"
+            )), // tickUpper (30000)
         ];
 
         // Data: sender, amount, amount0, amount1
@@ -600,7 +679,8 @@ mod tests {
             "00000000000000000000000000000000000000000000000000000000000f4240" // amount (1000000)
             "0000000000000000000000000000000000000000000000000de0b6b3a7640000" // amount0
             "0000000000000000000000000000000000000000000000000de0b6b3a7640000" // amount1
-        ).to_vec();
+        )
+        .to_vec();
 
         let log = Log {
             address: pool_address,
@@ -611,7 +691,12 @@ mod tests {
         assert!(decoded.is_some(), "Failed to decode real V3 Mint event");
 
         match decoded.unwrap() {
-            DecodedEvent::V3Mint { pool, tick_lower, tick_upper, amount } => {
+            DecodedEvent::V3Mint {
+                pool,
+                tick_lower,
+                tick_upper,
+                amount,
+            } => {
                 assert_eq!(pool, pool_address);
                 assert_eq!(tick_lower, -30000);
                 assert_eq!(tick_upper, 30000);

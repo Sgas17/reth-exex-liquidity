@@ -1,6 +1,6 @@
 mod aggregator;
 mod db;
-mod events;
+pub mod events;
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
 use db::{TransferDb, TransferRow};
@@ -11,16 +11,22 @@ use reth_node_api::{BlockBody, FullNodeComponents};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-pub async fn transfers_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
+pub async fn transfers_exex<Node: FullNodeComponents>(
+    mut ctx: ExExContext<Node>,
+) -> eyre::Result<()> {
     info!("Transfers ExEx starting");
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://transfers_user:transfers_pass@localhost:5433/transfers".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://transfers_user:transfers_pass@localhost:5433/transfers".to_string()
+    });
     let db = Arc::new(TransferDb::new(&database_url).await?);
     info!("Connected to PostgreSQL");
 
-    aggregator::spawn_aggregator(db.clone());
+    // Temporarily disable expensive transfer aggregation while node catches up.
+    // Keep daily cleanup enabled so table size remains bounded.
+    // aggregator::spawn_aggregator(db.clone());
     aggregator::spawn_cleanup(db.clone());
+    info!("Transfers aggregation task is disabled");
 
     let mut blocks_processed: u64 = 0;
     let mut total_transfers: u64 = 0;
@@ -59,14 +65,31 @@ pub async fn transfers_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>
 
                     if !rows.is_empty() {
                         let count = rows.len();
-                        match db.insert_transfers(&rows).await {
-                            Ok(()) => {
-                                total_transfers += count as u64;
-                                debug!("Block {}: inserted {} transfers", block_number, count);
+                        let mut inserted = false;
+                        for attempt in 1..=3 {
+                            match db.insert_transfers(&rows).await {
+                                Ok(()) => {
+                                    total_transfers += count as u64;
+                                    debug!("Block {}: inserted {} transfers", block_number, count);
+                                    inserted = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to insert {} transfers for block {} (attempt {}/3): {}",
+                                        count, block_number, attempt, e
+                                    );
+                                    if attempt < 3 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            attempt as u64 * 2,
+                                        ))
+                                        .await;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                warn!("Failed to insert {} transfers for block {}: {}", count, block_number, e);
-                            }
+                        }
+                        if !inserted {
+                            warn!("Giving up on block {} after 3 retries", block_number);
                         }
                     }
 
@@ -90,7 +113,11 @@ pub async fn transfers_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>
                 for (block, _) in old.blocks_and_receipts() {
                     match db.delete_block(block.number()).await {
                         Ok(deleted) if deleted > 0 => {
-                            debug!("Reverted block {}: deleted {} transfers", block.number(), deleted);
+                            debug!(
+                                "Reverted block {}: deleted {} transfers",
+                                block.number(),
+                                deleted
+                            );
                         }
                         Err(e) => {
                             warn!("Failed to delete reverted block {}: {}", block.number(), e);
@@ -129,8 +156,22 @@ pub async fn transfers_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>
                     }
 
                     if !rows.is_empty() {
-                        if let Err(e) = db.insert_transfers(&rows).await {
-                            warn!("Failed to insert transfers for reorged block {}: {}", block_number, e);
+                        for attempt in 1..=3 {
+                            match db.insert_transfers(&rows).await {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to insert transfers for reorged block {} (attempt {}/3): {}",
+                                        block_number, attempt, e
+                                    );
+                                    if attempt < 3 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            attempt as u64 * 2,
+                                        ))
+                                        .await;
+                                    }
+                                }
+                            }
                         }
                     }
                     blocks_processed += 1;
@@ -142,7 +183,11 @@ pub async fn transfers_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>
                 for (block, _) in old.blocks_and_receipts() {
                     match db.delete_block(block.number()).await {
                         Ok(deleted) if deleted > 0 => {
-                            debug!("Reverted block {}: deleted {} transfers", block.number(), deleted);
+                            debug!(
+                                "Reverted block {}: deleted {} transfers",
+                                block.number(),
+                                deleted
+                            );
                         }
                         Err(e) => {
                             warn!("Failed to delete reverted block {}: {}", block.number(), e);

@@ -2,10 +2,12 @@
 //
 // Exposes modules for reuse and testing
 
+pub mod balance_monitor;
 pub mod events;
 pub mod nats_client;
 pub mod pool_tracker;
 pub mod socket;
+pub mod transfers;
 pub mod types;
 
 // Re-export commonly used items for testing

@@ -78,6 +78,9 @@ fn load_from_disk(path: &Path) -> Option<HashMap<Address, u8>> {
     Some(tokens)
 }
 
+/// Atomic write: serialize → write to `.tmp` → rename over target.
+/// `rename` is atomic on POSIX when src and dst are on the same filesystem
+/// (guaranteed here since they share the same parent directory).
 fn save_to_disk(path: &Path, tokens: &HashMap<Address, u8>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
@@ -87,7 +90,10 @@ fn save_to_disk(path: &Path, tokens: &HashMap<Address, u8>) -> Result<(), String
         .map(|(addr, dec)| (format!("{addr:#x}"), *dec))
         .collect();
     let json = serde_json::to_string_pretty(&raw).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(path, json).map_err(|e| format!("write: {e}"))?;
+
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, &json).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
 }
 

@@ -5,18 +5,18 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Reth ExEx framework (updated to v1.9.3 for Fusaka hardfork support)
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3", features = ["serde"] }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
+# Reth ExEx framework (v1.11.1 — two critical fixes over v1.11.0)
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1", features = ["serde"] }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
 
-# Alloy for type-safe event decoding
-alloy-consensus = { version = "1.0.37", default-features = false }
-alloy-sol-types = { version = "1.3.1", features = ["json"] }
-alloy-primitives = { version = "1.3.1", default-features = false }
+# Alloy for type-safe event decoding (versions matched to reth v1.11.0)
+alloy-consensus = { version = "1.6.3", default-features = false }
+alloy-sol-types = { version = "1.5.6", features = ["json"] }
+alloy-primitives = { version = "1.5.6", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -29,6 +29,7 @@ eyre = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1.3"
+rust_decimal = { version = "1.39", features = ["serde", "serde-with-str"] }
 
 # Logging
 tracing = "0.1"
@@ -42,6 +43,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 
 [dev-dependencies]
 chrono = "0.4"
+rust_decimal_macros = "1.39"
 
 [[bin]]
 name = "exex"

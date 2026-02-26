@@ -26,7 +26,10 @@ fn main() {
     let i256_pos_bytes = bincode::serialize(&i256_pos).unwrap();
     println!("I256 positive value: {}", i256_pos);
     println!("I256 positive bytes length: {}", i256_pos_bytes.len());
-    println!("I256 positive bytes (hex): {}", hex::encode(&i256_pos_bytes));
+    println!(
+        "I256 positive bytes (hex): {}",
+        hex::encode(&i256_pos_bytes)
+    );
     println!();
 
     // Test I256 negative
@@ -34,11 +37,16 @@ fn main() {
     let i256_neg_bytes = bincode::serialize(&i256_neg).unwrap();
     println!("I256 negative value: {}", i256_neg);
     println!("I256 negative bytes length: {}", i256_neg_bytes.len());
-    println!("I256 negative bytes (hex): {}", hex::encode(&i256_neg_bytes));
+    println!(
+        "I256 negative bytes (hex): {}",
+        hex::encode(&i256_neg_bytes)
+    );
     println!();
 
     // Test Address
-    let addr = "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8".parse::<Address>().unwrap();
+    let addr = "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8"
+        .parse::<Address>()
+        .unwrap();
     let addr_bytes = bincode::serialize(&addr).unwrap();
     println!("Address value: {:?}", addr);
     println!("Address bytes length: {}", addr_bytes.len());

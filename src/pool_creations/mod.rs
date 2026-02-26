@@ -10,10 +10,7 @@ use reth_node_api::FullNodeComponents;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-fn build_pool_rows(
-    log: &alloy_primitives::Log,
-    block_number: u64,
-) -> Option<PoolRow> {
+fn build_pool_rows(log: &alloy_primitives::Log, block_number: u64) -> Option<PoolRow> {
     let decoded = decode_pool_creation(log)?;
 
     Some(PoolRow {

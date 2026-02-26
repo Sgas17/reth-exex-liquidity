@@ -112,7 +112,10 @@ impl PoolTracker {
             return;
         }
 
-        info!("Applying {} pending whitelist updates", self.pending_updates.len());
+        info!(
+            "Applying {} pending whitelist updates",
+            self.pending_updates.len()
+        );
 
         while let Some(update) = self.pending_updates.pop_front() {
             match update {
@@ -160,7 +163,10 @@ impl PoolTracker {
                     // Also track PoolManager address so we receive its events
                     if !self.tracked_addresses.contains(&UNISWAP_V4_POOL_MANAGER) {
                         self.tracked_addresses.insert(UNISWAP_V4_POOL_MANAGER);
-                        info!("🔧 Added PoolManager address to tracked addresses for V4 events: {:?}", UNISWAP_V4_POOL_MANAGER);
+                        info!(
+                            "🔧 Added PoolManager address to tracked addresses for V4 events: {:?}",
+                            UNISWAP_V4_POOL_MANAGER
+                        );
                     }
                 }
             }
@@ -344,9 +350,9 @@ mod tests {
         assert_eq!(tracker.stats().total_pools, 2);
 
         // Remove pool1
-        tracker.queue_update(WhitelistUpdate::Remove(vec![
-            PoolIdentifier::Address(addr1)
-        ]));
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(
+            addr1,
+        )]));
 
         assert_eq!(tracker.stats().total_pools, 1);
         assert_eq!(tracker.stats().v2_pools, 0);

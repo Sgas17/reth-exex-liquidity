@@ -6,8 +6,8 @@
 use alloy_primitives::{address, Address, Log, LogData, B256};
 use alloy_sol_types::SolEvent;
 use reth_exex_liquidity::{
-    decode_log, DecodedEvent, PoolTracker, WhitelistUpdate, PoolIdentifier, PoolMetadata,
-    Protocol, UNISWAP_V4_POOL_MANAGER,
+    decode_log, DecodedEvent, PoolIdentifier, PoolMetadata, PoolTracker, Protocol, WhitelistUpdate,
+    UNISWAP_V4_POOL_MANAGER,
 };
 
 #[derive(Debug)]
@@ -19,10 +19,7 @@ struct EventProcessingResult {
 }
 
 /// Simulates the exact filtering logic from main.rs lines 397-436
-fn simulate_event_processing(
-    log: &Log,
-    pool_tracker: &PoolTracker,
-) -> EventProcessingResult {
+fn simulate_event_processing(log: &Log, pool_tracker: &PoolTracker) -> EventProcessingResult {
     let log_address = log.address;
 
     // Step 1: Quick address filter (main.rs:401)
@@ -95,10 +92,7 @@ fn test_diagnostic_v2_event_processing() {
 
     println!("✓ Added V2 pool to whitelist: {:?}", pool_addr);
     println!("  Tracker stats: {:?}", tracker.stats());
-    println!(
-        "  Is tracked: {}",
-        tracker.is_tracked_address(&pool_addr)
-    );
+    println!("  Is tracked: {}", tracker.is_tracked_address(&pool_addr));
 
     // Create V2 Swap event
     use alloy_sol_types::sol;
@@ -195,11 +189,7 @@ fn test_diagnostic_v2_event_wrong_pool() {
     let log = Log {
         address: untracked_pool, // Different pool!
         data: LogData::new_unchecked(
-            vec![
-                Swap::SIGNATURE_HASH,
-                B256::ZERO,
-                B256::ZERO,
-            ],
+            vec![Swap::SIGNATURE_HASH, B256::ZERO, B256::ZERO],
             vec![0u8; 160].into(),
         ),
     };
@@ -259,11 +249,7 @@ fn test_diagnostic_v3_event_processing() {
     let log = Log {
         address: pool_addr,
         data: LogData::new_unchecked(
-            vec![
-                Swap::SIGNATURE_HASH,
-                B256::ZERO,
-                B256::ZERO,
-            ],
+            vec![Swap::SIGNATURE_HASH, B256::ZERO, B256::ZERO],
             vec![0u8; 224].into(),
         ),
     };
@@ -307,7 +293,10 @@ fn test_diagnostic_v4_event_processing() {
         "  PoolManager tracked: {}",
         tracker.is_tracked_address(&UNISWAP_V4_POOL_MANAGER)
     );
-    println!("  Pool ID tracked: {}", tracker.is_tracked_pool_id(&pool_id));
+    println!(
+        "  Pool ID tracked: {}",
+        tracker.is_tracked_pool_id(&pool_id)
+    );
 
     use alloy_sol_types::sol;
     sol! {
@@ -326,11 +315,7 @@ fn test_diagnostic_v4_event_processing() {
     let log = Log {
         address: UNISWAP_V4_POOL_MANAGER,
         data: LogData::new_unchecked(
-            vec![
-                Swap::SIGNATURE_HASH,
-                B256::from(pool_id),
-                B256::ZERO,
-            ],
+            vec![Swap::SIGNATURE_HASH, B256::from(pool_id), B256::ZERO],
             vec![0u8; 224].into(),
         ),
     };
@@ -341,7 +326,10 @@ fn test_diagnostic_v4_event_processing() {
     let result = simulate_event_processing(&log, &tracker);
 
     println!("\n=== Processing Results ===");
-    println!("  Stage 1 - Address filter (PoolManager): {}", result.passed_address_filter);
+    println!(
+        "  Stage 1 - Address filter (PoolManager): {}",
+        result.passed_address_filter
+    );
     println!("  Stage 2 - Event decoded: {}", result.decoded_successfully);
     println!("  Stage 3 - Pool ID filter: {}", result.passed_pool_filter);
     println!("  Should output: {}", result.should_output);
@@ -419,7 +407,10 @@ fn test_diagnostic_v4_wrong_pool_id() {
     let result = simulate_event_processing(&log, &tracker);
 
     println!("\n=== Processing Results ===");
-    println!("  Stage 1 - Address filter (PoolManager): {}", result.passed_address_filter);
+    println!(
+        "  Stage 1 - Address filter (PoolManager): {}",
+        result.passed_address_filter
+    );
     println!("  Stage 2 - Event decoded: {}", result.decoded_successfully);
     println!("  Stage 3 - Pool ID filter: {}", result.passed_pool_filter);
     println!("  Should output: {}", result.should_output);
@@ -465,11 +456,7 @@ fn test_diagnostic_empty_whitelist() {
     let log = Log {
         address: pool_addr,
         data: LogData::new_unchecked(
-            vec![
-                Swap::SIGNATURE_HASH,
-                B256::ZERO,
-                B256::ZERO,
-            ],
+            vec![Swap::SIGNATURE_HASH, B256::ZERO, B256::ZERO],
             vec![0u8; 160].into(),
         ),
     };
@@ -519,10 +506,7 @@ fn test_diagnostic_whitelist_not_applied() {
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
 
     println!("✓ Queued whitelist update during block processing");
-    println!(
-        "  Has pending updates: {}",
-        tracker.has_pending_updates()
-    );
+    println!("  Has pending updates: {}", tracker.has_pending_updates());
     println!("  Pool tracked: {}", tracker.is_tracked_address(&pool_addr));
 
     use alloy_sol_types::sol;
@@ -541,11 +525,7 @@ fn test_diagnostic_whitelist_not_applied() {
     let log = Log {
         address: pool_addr,
         data: LogData::new_unchecked(
-            vec![
-                Swap::SIGNATURE_HASH,
-                B256::ZERO,
-                B256::ZERO,
-            ],
+            vec![Swap::SIGNATURE_HASH, B256::ZERO, B256::ZERO],
             vec![0u8; 160].into(),
         ),
     };
@@ -565,10 +545,7 @@ fn test_diagnostic_whitelist_not_applied() {
     tracker.end_block();
 
     println!("\n✓ Called end_block() - updates applied");
-    println!(
-        "  Has pending updates: {}",
-        tracker.has_pending_updates()
-    );
+    println!("  Has pending updates: {}", tracker.has_pending_updates());
     println!("  Pool tracked: {}", tracker.is_tracked_address(&pool_addr));
 
     let result_after = simulate_event_processing(&log, &tracker);

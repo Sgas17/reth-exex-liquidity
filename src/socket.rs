@@ -15,11 +15,16 @@ use tracing::{error, info, warn};
 const SOCKET_PATH: &str = "/tmp/reth_exex_pool_updates.sock";
 const BUFFER_SIZE: usize = 10_000; // Buffer up to 10k messages if client is slow
 
+/// Bounded channel capacity between ExEx producer and socket broadcast loop.
+/// 50k messages ≈ several thousand blocks worth of events. If exceeded, the
+/// ExEx drops messages rather than accumulating unbounded memory.
+const CHANNEL_CAPACITY: usize = 50_000;
+
 /// Unix socket server that broadcasts pool updates to connected clients
 pub struct PoolUpdateSocketServer {
     listener: UnixListener,
-    message_tx: mpsc::UnboundedSender<ControlMessage>,
-    message_rx: mpsc::UnboundedReceiver<ControlMessage>,
+    message_tx: mpsc::Sender<ControlMessage>,
+    message_rx: mpsc::Receiver<ControlMessage>,
     broadcast_tx: broadcast::Sender<ControlMessage>,
 }
 
@@ -45,7 +50,7 @@ impl PoolUpdateSocketServer {
 
         info!("Unix socket server listening on {}", SOCKET_PATH);
 
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (message_tx, message_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (broadcast_tx, _) = broadcast::channel(BUFFER_SIZE);
 
         Ok(Self {
@@ -57,7 +62,7 @@ impl PoolUpdateSocketServer {
     }
 
     /// Get a sender handle for publishing messages
-    pub fn get_sender(&self) -> mpsc::UnboundedSender<ControlMessage> {
+    pub fn get_sender(&self) -> mpsc::Sender<ControlMessage> {
         self.message_tx.clone()
     }
 
