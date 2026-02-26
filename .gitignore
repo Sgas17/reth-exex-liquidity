@@ -36,3 +36,4 @@ Thumbs.db
 # Config
 config.json
 .env
+/target-user/
