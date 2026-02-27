@@ -14,6 +14,7 @@ mod nats_client;
 mod pool_creations;
 mod pool_tracker;
 mod socket;
+mod swap_monitor;
 mod transfers;
 mod types;
 

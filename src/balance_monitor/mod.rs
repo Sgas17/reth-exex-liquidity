@@ -9,11 +9,11 @@
 pub mod slots;
 pub mod token_tracker;
 
-use alloy_consensus::{BlockHeader, TxReceipt};
+use alloy_consensus::{BlockHeader, TxReceipt, transaction::TxHashRef};
 use alloy_primitives::{Address, Log, U256};
 use futures::{StreamExt, TryStreamExt};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth_node_api::{FullNodeComponents, NodePrimitives, NodeTypes};
+use reth_node_api::{BlockBody, FullNodeComponents, NodePrimitives, NodeTypes};
 use reth::providers::StateProviderFactory;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use token_tracker::TokenTracker;
 use tracing::{debug, info, warn};
 
+use crate::swap_monitor::{self, SwapConfirmation};
 use crate::transfers::events::decode_transfer;
 
 /// NATS message matching `ChainBalanceSnapshot` schema in defi_arb_rust/common.
@@ -165,13 +166,15 @@ where
         });
 
     let nats_subject = format!("balances.chain.{chain_id}");
+    let swap_subject = format!("swap.confirmed.{chain_id}");
 
     info!(
         executor = %executor_address,
         chain_id = %chain_id,
         persist_path = %persist_path.display(),
         nats_subject = %nats_subject,
-        "balance monitor config"
+        swap_subject = %swap_subject,
+        "balance monitor + swap monitor config"
     );
 
     // ── NATS ────────────────────────────────────────────────────────────
@@ -254,6 +257,32 @@ where
                             "published balance snapshot"
                         );
                     }
+                }
+
+                // ── Swap confirmation scanning ───────────────────────────
+                let swap_confirmations = scan_swaps_in_notification(
+                    &notification,
+                    executor_address,
+                );
+                for confirmation in &swap_confirmations {
+                    let payload = serde_json::to_vec(confirmation)
+                        .expect("SwapConfirmation serializes");
+                    if publish_with_retry(&nats_client, &swap_subject, payload).await {
+                        debug!(
+                            tx_hash = %confirmation.tx_hash,
+                            pool = %confirmation.pool,
+                            protocol = %confirmation.protocol,
+                            block = confirmation.block_number,
+                            "published swap confirmation"
+                        );
+                    }
+                }
+                if !swap_confirmations.is_empty() {
+                    info!(
+                        count = swap_confirmations.len(),
+                        block = notification_tip_block(&notification),
+                        "swap confirmations published"
+                    );
                 }
 
                 // Acknowledge processed height.
@@ -358,6 +387,55 @@ where
 }
 
 // ─── Block processing ────────────────────────────────────────────────────────
+
+/// Scan a notification for swap events involving the executor address.
+/// Only scans ChainCommitted (not reverts — we don't confirm reversed swaps).
+fn scan_swaps_in_notification<N>(
+    notification: &ExExNotification<N>,
+    executor: Address,
+) -> Vec<SwapConfirmation>
+where
+    N: NodePrimitives<Receipt: TxReceipt<Log = Log>>,
+    N::BlockBody: BlockBody<Transaction: TxHashRef>,
+{
+    let mut confirmations = Vec::new();
+    let ts = now_ms();
+
+    // Only scan committed blocks — swaps in reverted blocks are not confirmed.
+    let chain = match notification {
+        ExExNotification::ChainCommitted { new } => new,
+        ExExNotification::ChainReorged { new, .. } => new,
+        ExExNotification::ChainReverted { .. } => return confirmations,
+    };
+
+    for (block, receipts) in chain.blocks_and_receipts() {
+        let block_number = block.number();
+        for (tx_index, receipt) in receipts.iter().enumerate() {
+            let tx_hash = block
+                .body()
+                .transactions()
+                .get(tx_index)
+                .map(|tx| format!("{:#x}", tx.tx_hash()))
+                .unwrap_or_default();
+
+            if tx_hash.is_empty() {
+                continue;
+            }
+
+            let swaps = swap_monitor::scan_receipt_for_swaps(
+                receipt,
+                executor,
+                &tx_hash,
+                block_number,
+                tx_index as u64,
+                ts,
+            );
+            confirmations.extend(swaps);
+        }
+    }
+
+    confirmations
+}
 
 /// Process a notification and return the set of tokens whose balances changed.
 fn process_notification<N: NodePrimitives<Receipt: TxReceipt<Log = Log>>>(
