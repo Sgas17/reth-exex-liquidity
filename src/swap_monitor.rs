@@ -11,11 +11,14 @@ use tracing::debug;
 
 // Re-use the sol! event definitions from events.rs (same crate).
 // We need the full event structs with sender/recipient for swap detection.
-mod swap_events {
-    use alloy_sol_types::sol;
+// Each protocol's Swap event is in its own module so the sol! macro
+// generates the canonical name `Swap(...)` — matching the on-chain signature.
+// Using `V2Swap`/`V3Swap`/`V4Swap` would produce wrong topic0 hashes.
 
+mod v2_swap {
+    use alloy_sol_types::sol;
     sol! {
-        event V2Swap(
+        event Swap(
             address indexed sender,
             uint256 amount0In,
             uint256 amount1In,
@@ -23,8 +26,13 @@ mod swap_events {
             uint256 amount1Out,
             address indexed to
         );
+    }
+}
 
-        event V3Swap(
+mod v3_swap {
+    use alloy_sol_types::sol;
+    sol! {
+        event Swap(
             address indexed sender,
             address indexed recipient,
             int256 amount0,
@@ -33,10 +41,15 @@ mod swap_events {
             uint128 liquidity,
             int24 tick
         );
+    }
+}
 
+mod v4_swap {
+    use alloy_sol_types::sol;
+    sol! {
         // V4: topics[0]=sig, topics[1]=poolId, topics[2]=sender (indexed)
         // Data: amount0, amount1, sqrtPriceX96, liquidity, tick, fee
-        event V4Swap(
+        event Swap(
             bytes32 indexed id,
             address indexed sender,
             int128 amount0,
@@ -73,7 +86,7 @@ pub struct SwapConfirmation {
 /// For V4: executor must be `sender` (topic2).
 pub fn decode_executor_swap(log: &Log, executor: Address) -> Option<DecodedSwap> {
     // V2 Swap
-    if let Ok(event) = swap_events::V2Swap::decode_log(log) {
+    if let Ok(event) = v2_swap::Swap::decode_log(log) {
         let sender = event.topics().1;
         let to = event.topics().2;
         if sender != executor && to != executor {
@@ -100,7 +113,7 @@ pub fn decode_executor_swap(log: &Log, executor: Address) -> Option<DecodedSwap>
     }
 
     // V3 Swap
-    if let Ok(event) = swap_events::V3Swap::decode_log(log) {
+    if let Ok(event) = v3_swap::Swap::decode_log(log) {
         let sender = event.topics().1;
         let recipient = event.topics().2;
         if sender != executor && recipient != executor {
@@ -115,8 +128,8 @@ pub fn decode_executor_swap(log: &Log, executor: Address) -> Option<DecodedSwap>
     }
 
     // V4 Swap
-    if log.topics().len() >= 3 && log.topics()[0] == swap_events::V4Swap::SIGNATURE_HASH {
-        if let Ok(event) = swap_events::V4Swap::decode_log_data(&log.data) {
+    if log.topics().len() >= 3 && log.topics()[0] == v4_swap::Swap::SIGNATURE_HASH {
+        if let Ok(event) = v4_swap::Swap::decode_log_data(&log.data) {
             // Indexed address is stored right-aligned in 32-byte topic.
             let sender = Address::from_slice(&log.topics()[2].as_slice()[12..]);
             if sender != executor {
@@ -197,7 +210,7 @@ mod tests {
 
     fn make_v3_swap_log(pool: Address, sender: Address, recipient: Address) -> Log {
         // V3 Swap topics: [sig, sender, recipient]
-        let sig = swap_events::V3Swap::SIGNATURE_HASH;
+        let sig = v3_swap::Swap::SIGNATURE_HASH;
         let mut sender_topic = FixedBytes::<32>::ZERO;
         sender_topic[12..].copy_from_slice(sender.as_slice());
         let mut recipient_topic = FixedBytes::<32>::ZERO;
