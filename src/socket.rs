@@ -90,6 +90,7 @@ impl PoolUpdateSocketServer {
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -122,8 +123,8 @@ async fn handle_client(
                 break;
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!("Client lagged, skipped {} messages", skipped);
-                continue;
+                warn!("Client lagged, skipped {} messages — disconnecting for resync", skipped);
+                break;
             }
         };
 

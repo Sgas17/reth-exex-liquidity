@@ -198,7 +198,10 @@ impl LiquidityExEx {
                 update: PoolUpdate::V3Liquidity {
                     tick_lower,
                     tick_upper,
-                    liquidity_delta: amount as i128, // Mint is positive
+                    liquidity_delta: i128::try_from(amount).unwrap_or_else(|_| {
+                        warn!(amount, "V3 Mint liquidity overflows i128, clamping");
+                        i128::MAX
+                    }),
                 },
             }),
 
@@ -219,7 +222,12 @@ impl LiquidityExEx {
                 update: PoolUpdate::V3Liquidity {
                     tick_lower,
                     tick_upper,
-                    liquidity_delta: -(amount as i128), // Burn is negative
+                    liquidity_delta: i128::try_from(amount)
+                        .map(|v| -v)
+                        .unwrap_or_else(|_| {
+                            warn!(amount, "V3 Burn liquidity overflows i128, clamping");
+                            i128::MIN
+                        }),
                 },
             }),
 
