@@ -72,6 +72,18 @@ pub fn u256_to_decimal(raw: U256, decimals: u8) -> Decimal {
 /// Acts as a resync mechanism if individual publishes are lost.
 const FULL_SNAPSHOT_INTERVAL: u64 = 50;
 
+/// Max retry attempts for a failed NATS publish before giving up on that message.
+const PUBLISH_MAX_RETRIES: u32 = 2;
+
+/// Delay between publish retries.
+const PUBLISH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Max attempts to resubscribe to the whitelist NATS subject before disabling.
+const WHITELIST_RESUB_MAX_RETRIES: u32 = 5;
+
+/// Backoff base for whitelist resubscribe retries (doubles each attempt).
+const WHITELIST_RESUB_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Build a full snapshot of all tracked token balances.
 fn build_full_snapshot(
     chain_id: &str,
@@ -95,6 +107,28 @@ fn build_full_snapshot(
         balances: entries,
         ts: now_ms(),
     }
+}
+
+/// Publish to NATS with retry. Returns true on success.
+async fn publish_with_retry(
+    client: &async_nats::Client,
+    subject: &str,
+    payload: Vec<u8>,
+) -> bool {
+    for attempt in 0..=PUBLISH_MAX_RETRIES {
+        match client.publish(subject.to_string(), payload.clone().into()).await {
+            Ok(()) => return true,
+            Err(e) => {
+                if attempt < PUBLISH_MAX_RETRIES {
+                    debug!(error = %e, attempt = attempt + 1, "NATS publish failed, retrying");
+                    tokio::time::sleep(PUBLISH_RETRY_DELAY).await;
+                } else {
+                    warn!(error = %e, attempts = PUBLISH_MAX_RETRIES + 1, "NATS publish failed after all retries");
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Run the balance monitor ExEx.
@@ -212,20 +246,14 @@ where
 
                     let payload = serde_json::to_vec(&snapshot)
                         .expect("ChainBalanceSnapshot serializes");
-                    if let Err(e) = nats_client
-                        .publish(nats_subject.clone(), payload.into())
-                        .await
-                    {
-                        warn!(error = %e, "failed to publish balance snapshot");
-                    } else {
+                    if publish_with_retry(&nats_client, &nats_subject, payload).await {
                         updates_published += changed.len() as u64;
+                        debug!(
+                            changed = changed.len(),
+                            block = notification_tip_block(&notification),
+                            "published balance snapshot"
+                        );
                     }
-
-                    debug!(
-                        changed = changed.len(),
-                        block = notification_tip_block(&notification),
-                        "published balance snapshot"
-                    );
                 }
 
                 // Acknowledge processed height.
@@ -236,17 +264,13 @@ where
 
                 blocks_processed += 1;
 
-                // Periodic full snapshot: resync mechanism for missed publishes.
+                // Periodic full snapshot as heartbeat — ensures hedger has
+                // current balances even if individual per-block publishes were lost.
                 if blocks_processed % FULL_SNAPSHOT_INTERVAL == 0 && tracker.len() > 0 {
                     let snapshot = build_full_snapshot(&chain_id, &tracker, &balances);
                     let payload = serde_json::to_vec(&snapshot)
                         .expect("ChainBalanceSnapshot serializes");
-                    if let Err(e) = nats_client
-                        .publish(nats_subject.clone(), payload.into())
-                        .await
-                    {
-                        warn!(error = %e, "failed to publish periodic full snapshot");
-                    } else {
+                    if publish_with_retry(&nats_client, &nats_subject, payload).await {
                         debug!(
                             tokens = tracker.len(),
                             block = notification_tip_block(&notification),
@@ -296,17 +320,32 @@ where
                     }
                     None => {
                         // Subscription closed (NATS disconnect / server restart).
-                        warn!("whitelist subscription closed, attempting resubscribe");
-                        match nats_client.subscribe(whitelist_subject.clone()).await {
-                            Ok(new_sub) => {
-                                whitelist_sub = Some(new_sub);
-                                info!("whitelist subscription restored");
+                        // Retry with exponential backoff before giving up.
+                        warn!("whitelist subscription closed, attempting resubscribe with backoff");
+                        let mut resubscribed = false;
+                        for attempt in 0..WHITELIST_RESUB_MAX_RETRIES {
+                            let delay = WHITELIST_RESUB_BASE_DELAY * 2u32.saturating_pow(attempt);
+                            tokio::time::sleep(delay).await;
+                            match nats_client.subscribe(whitelist_subject.clone()).await {
+                                Ok(new_sub) => {
+                                    whitelist_sub = Some(new_sub);
+                                    info!(attempts = attempt + 1, "whitelist subscription restored");
+                                    resubscribed = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        attempt = attempt + 1,
+                                        max = WHITELIST_RESUB_MAX_RETRIES,
+                                        "whitelist resubscribe attempt failed"
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "failed to resubscribe to whitelist, token discovery disabled");
-                                // Drop the sub. The `if` guard disables this branch.
-                                whitelist_sub = None;
-                            }
+                        }
+                        if !resubscribed {
+                            warn!("exhausted whitelist resubscribe retries, token discovery disabled");
+                            whitelist_sub = None;
                         }
                     }
                 }
