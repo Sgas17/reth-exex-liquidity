@@ -62,6 +62,7 @@ pub enum Protocol {
     UniswapV2,
     UniswapV3,
     UniswapV4,
+    Ekubo,
 }
 
 /// Update type - which event triggered this update
@@ -108,6 +109,31 @@ pub enum PoolUpdate {
         tick_lower: i32,
         tick_upper: i32,
         liquidity_delta: i128,
+    },
+
+    /// Ekubo Swap Update (from anonymous log0 on Core contract).
+    ///
+    /// sqrtRatio is Ekubo's native uint96 stored as U256 — NOT Q64.96.
+    /// Downstream Ekubo swap math reads it as u128.
+    EkuboSwap {
+        sqrt_ratio: U256,
+        liquidity: u128,
+        tick: i32,
+    },
+
+    /// Ekubo Liquidity Update (PositionUpdated event).
+    ///
+    /// Unlike V3/V4, Ekubo does not emit separate Mint/Burn events.
+    /// PositionUpdated carries tick bounds (packed in positionId),
+    /// `liquidityDelta`, and the full post-state (sqrtRatio, tick, liquidity).
+    EkuboLiquidity {
+        tick_lower: i32,
+        tick_upper: i32,
+        liquidity_delta: i128,
+        /// Post-state from stateAfter — Ekubo native uint96, NOT Q64.96.
+        sqrt_ratio: U256,
+        liquidity: u128,
+        tick: i32,
     },
 }
 

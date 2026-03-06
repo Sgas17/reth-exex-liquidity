@@ -159,6 +159,40 @@ mod v4 {
 use v4::{ModifyLiquidity as UniswapV4ModifyLiquidity, Swap as UniswapV4Swap};
 
 // ============================================================================
+// EKUBO EVENTS
+// ============================================================================
+// Ekubo Core (0x00000000000014aA86C5d3c41765bb24e11bd701) emits:
+//   - Swaps: anonymous log0 (no topics), 116 bytes packed data
+//   - PositionUpdated: standard event with signature
+
+mod ekubo {
+    use super::*;
+
+    sol! {
+        /// PositionUpdated(address locker, bytes32 poolId, bytes32 positionId,
+        ///                 int128 liquidityDelta, bytes32 balanceUpdate, bytes32 stateAfter)
+        #[derive(Debug)]
+        event PositionUpdated(
+            address locker,
+            bytes32 poolId,
+            bytes32 positionId,
+            int128 liquidityDelta,
+            bytes32 balanceUpdate,
+            bytes32 stateAfter
+        );
+    }
+}
+
+use ekubo::PositionUpdated as EkuboPositionUpdated;
+
+/// Ekubo Core contract address on Ethereum mainnet.
+pub const EKUBO_CORE: Address = Address::new([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0xaA,
+    0x86, 0xC5, 0xd3, 0xc4, 0x17, 0x65, 0xbB, 0x24,
+    0xe1, 0x1b, 0xd7, 0x01,
+]);
+
+// ============================================================================
 // EVENT DECODING LOGIC
 // ============================================================================
 
@@ -211,6 +245,25 @@ pub enum DecodedEvent {
         tick_lower: i32,
         tick_upper: i32,
         liquidity_delta: i128,
+    },
+    /// Ekubo swap decoded from anonymous log0.
+    EkuboSwap {
+        pool_id: [u8; 32],
+        /// Ekubo native uint96 sqrtRatio (NOT Q64.96).
+        sqrt_ratio: U256,
+        liquidity: u128,
+        tick: i32,
+    },
+    /// Ekubo liquidity change from PositionUpdated event.
+    /// Tick bounds extracted from positionId: salt(24B) | tickLower(4B) | tickUpper(4B).
+    EkuboPositionUpdated {
+        pool_id: [u8; 32],
+        tick_lower: i32,
+        tick_upper: i32,
+        liquidity_delta: i128,
+        sqrt_ratio: U256,
+        liquidity: u128,
+        tick: i32,
     },
 }
 
@@ -327,6 +380,74 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
                     tick_lower: event.tickLower.as_i32(),
                     tick_upper: event.tickUpper.as_i32(),
                     liquidity_delta,
+                });
+            }
+        }
+    }
+
+    // ── Ekubo events ──────────────────────────────────────────────────────
+    // Ekubo Core uses anonymous log0 for swaps and standard events for liquidity.
+
+    if log.address == EKUBO_CORE {
+        // Anonymous swap log0: no topics, exactly 116 bytes data.
+        // Layout: locker(20) | poolId(32) | balanceUpdate(32) | stateAfter(32)
+        if log.topics().is_empty() && log.data.data.len() == 116 {
+            let data = &log.data.data;
+
+            let mut pool_id = [0u8; 32];
+            pool_id.copy_from_slice(&data[20..52]);
+
+            // stateAfter (bytes 84..116): sqrtRatio(uint96) | tick(int32) | liquidity(uint128)
+            let state = &data[84..116];
+            // sqrtRatio: top 12 bytes (96 bits) of the 32-byte word
+            let sqrt_ratio = U256::from_be_bytes::<32>({
+                let mut buf = [0u8; 32];
+                buf[20..32].copy_from_slice(&state[0..12]);
+                buf
+            });
+            // tick: bytes 12..16 (int32, sign-extended)
+            let tick = i32::from_be_bytes(state[12..16].try_into().unwrap());
+            // liquidity: bytes 16..32 (uint128)
+            let liquidity = u128::from_be_bytes(state[16..32].try_into().unwrap());
+
+            return Some(DecodedEvent::EkuboSwap {
+                pool_id,
+                sqrt_ratio,
+                liquidity,
+                tick,
+            });
+        }
+
+        // PositionUpdated: standard event with signature
+        if !log.topics().is_empty() && log.topics()[0] == EkuboPositionUpdated::SIGNATURE_HASH {
+            if let Ok(event) = EkuboPositionUpdated::decode_log_data(&log.data) {
+                let pool_id: [u8; 32] = event.poolId.into();
+
+                // Decode positionId: salt(24B) | tickLower(4B) | tickUpper(4B)
+                let pos_bytes: [u8; 32] = event.positionId.into();
+                let tick_lower =
+                    i32::from_be_bytes(pos_bytes[24..28].try_into().unwrap());
+                let tick_upper =
+                    i32::from_be_bytes(pos_bytes[28..32].try_into().unwrap());
+
+                // Decode stateAfter packed bytes32: sqrtRatio(12B) | tick(4B) | liquidity(16B)
+                let state_bytes: [u8; 32] = event.stateAfter.into();
+                let sqrt_ratio = U256::from_be_bytes::<32>({
+                    let mut buf = [0u8; 32];
+                    buf[20..32].copy_from_slice(&state_bytes[0..12]);
+                    buf
+                });
+                let tick = i32::from_be_bytes(state_bytes[12..16].try_into().unwrap());
+                let liquidity = u128::from_be_bytes(state_bytes[16..32].try_into().unwrap());
+
+                return Some(DecodedEvent::EkuboPositionUpdated {
+                    pool_id,
+                    tick_lower,
+                    tick_upper,
+                    liquidity_delta: event.liquidityDelta,
+                    sqrt_ratio,
+                    liquidity,
+                    tick,
                 });
             }
         }

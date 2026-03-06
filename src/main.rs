@@ -284,6 +284,65 @@ impl LiquidityExEx {
                     },
                 })
             }
+
+            // ============================================================================
+            // EKUBO EVENTS
+            // ============================================================================
+            DecodedEvent::EkuboSwap {
+                pool_id,
+                sqrt_ratio,
+                liquidity,
+                tick,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::PoolId(pool_id),
+                protocol: Protocol::Ekubo,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::EkuboSwap {
+                    sqrt_ratio,
+                    liquidity,
+                    tick,
+                },
+            }),
+
+            DecodedEvent::EkuboPositionUpdated {
+                pool_id,
+                tick_lower,
+                tick_upper,
+                liquidity_delta,
+                sqrt_ratio,
+                liquidity,
+                tick,
+            } => {
+                let update_type = if liquidity_delta > 0 {
+                    UpdateType::Mint
+                } else {
+                    UpdateType::Burn
+                };
+
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::PoolId(pool_id),
+                    protocol: Protocol::Ekubo,
+                    update_type,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::EkuboLiquidity {
+                        tick_lower,
+                        tick_upper,
+                        liquidity_delta,
+                        sqrt_ratio,
+                        liquidity,
+                        tick,
+                    },
+                })
+            }
         }
     }
 
@@ -371,6 +430,12 @@ impl LiquidityExEx {
             | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
                 pool_tracker.is_tracked_pool_id(pool_id)
             }
+
+            // Ekubo events: check pool_id
+            DecodedEvent::EkuboSwap { pool_id, .. }
+            | DecodedEvent::EkuboPositionUpdated { pool_id, .. } => {
+                pool_tracker.is_tracked_pool_id(pool_id)
+            }
         };
 
         // Log when events are filtered out to help with debugging
@@ -390,6 +455,13 @@ impl LiquidityExEx {
                 | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
                     debug!(
                         "Filtered V4 event from untracked pool_id: {:?}",
+                        hex::encode(pool_id)
+                    );
+                }
+                DecodedEvent::EkuboSwap { pool_id, .. }
+                | DecodedEvent::EkuboPositionUpdated { pool_id, .. } => {
+                    debug!(
+                        "Filtered Ekubo event from untracked pool_id: {:?}",
                         hex::encode(pool_id)
                     );
                 }
@@ -920,7 +992,7 @@ fn maybe_record_slot0_resync_pool(
 
     let needs_resync = matches!(
         update.update,
-        PoolUpdate::V3Swap { .. } | PoolUpdate::V4Swap { .. }
+        PoolUpdate::V3Swap { .. } | PoolUpdate::V4Swap { .. } | PoolUpdate::EkuboSwap { .. }
     );
 
     if !needs_resync {
