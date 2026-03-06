@@ -35,8 +35,9 @@ pub struct DecodedPoolCreation {
     pub factory: Address,
     pub token0: Address,
     pub token1: Address,
-    /// Fee in hundredths of a bip (V2: 3000, V3/V4: from event)
-    pub fee: Option<i32>,
+    /// Fee in hundredths of a bip (V2: 3000, V3/V4: from event).
+    /// Ekubo: raw u64 0.64 fixed-point fee stored as i64.
+    pub fee: Option<i64>,
     /// Tick spacing (V3/V4 only)
     pub tick_spacing: Option<i32>,
     /// Protocol-specific JSON data (V4 hooks address, etc.)
@@ -57,7 +58,7 @@ pub fn decode_pair_created(log: &Log) -> Option<DecodedPoolCreation> {
         factory: log.address,
         token0: decoded.data.token0,
         token1: decoded.data.token1,
-        fee: Some(3000), // V2 fixed 0.3% fee
+        fee: Some(3000i64), // V2 fixed 0.3% fee
         tick_spacing: None,
         additional_data: None,
     })
@@ -77,7 +78,7 @@ pub fn decode_pool_created(log: &Log) -> Option<DecodedPoolCreation> {
         factory: log.address,
         token0: decoded.data.token0,
         token1: decoded.data.token1,
-        fee: Some(decoded.data.fee.to::<i32>()),
+        fee: Some(decoded.data.fee.to::<i64>()),
         tick_spacing: Some(decoded.data.tickSpacing.as_i32()),
         additional_data: None,
     })
@@ -101,7 +102,7 @@ pub fn decode_initialize(log: &Log) -> Option<DecodedPoolCreation> {
         factory: log.address,
         token0: decoded.data.currency0,
         token1: decoded.data.currency1,
-        fee: Some(decoded.data.fee.to::<i32>()),
+        fee: Some(decoded.data.fee.to::<i64>()),
         tick_spacing: Some(decoded.data.tickSpacing.as_i32()),
         additional_data: Some(serde_json::json!({
             "hooks_address": to_lowercase_hex(&decoded.data.hooks),
@@ -172,7 +173,7 @@ pub fn decode_ekubo_pool_initialized(log: &Log) -> Option<DecodedPoolCreation> {
         token1: key.token1,
         // Store fee as basis points approximation for DB compatibility.
         // Exact fee is in additional_data.fee_0_64.
-        fee: i32::try_from(fee_u64 >> 46).ok(), // rough bps: fee * 10000 / 2^64 ≈ fee >> 46 * ~0.57
+        fee: i64::try_from(fee_u64).ok(), // raw u64 0.64 fixed-point fee
         tick_spacing,
         additional_data: Some(extra),
     })
