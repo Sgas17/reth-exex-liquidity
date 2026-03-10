@@ -343,6 +343,92 @@ impl LiquidityExEx {
                     },
                 })
             }
+
+            // ============================================================================
+            // CURVE STABLESWAP-NG EVENTS
+            // ============================================================================
+            DecodedEvent::CurveSwap {
+                pool,
+                sold_id,
+                tokens_sold,
+                bought_id,
+                tokens_bought,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveStable,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::CurveSwap {
+                    sold_id,
+                    tokens_sold,
+                    bought_id,
+                    tokens_bought,
+                },
+            }),
+
+            DecodedEvent::CurveLiquidityChange { pool } => {
+                // Liquidity events don't carry enough info for delta tracking.
+                // Signal the arena to re-scrape this pool's balances from storage.
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::CurveStable,
+                    update_type: UpdateType::Mint, // Generic — arena re-scrapes regardless
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::CurveLiquidity {
+                        effective_balances: vec![], // Empty — arena will re-scrape
+                    },
+                })
+            }
+
+            DecodedEvent::CurveRampA {
+                pool,
+                old_a,
+                new_a,
+                initial_time,
+                future_time,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveStable,
+                update_type: UpdateType::Swap, // No specific type for param changes
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::CurveRampA {
+                    initial_a: old_a,
+                    future_a: new_a,
+                    initial_a_time: initial_time,
+                    future_a_time: future_time,
+                },
+            }),
+
+            DecodedEvent::CurveApplyNewFee {
+                pool,
+                fee,
+                offpeg_fee_multiplier,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveStable,
+                update_type: UpdateType::Swap, // No specific type for param changes
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::CurveFeeUpdate {
+                    fee,
+                    offpeg_fee_multiplier,
+                },
+            }),
         }
     }
 
@@ -436,6 +522,14 @@ impl LiquidityExEx {
             | DecodedEvent::EkuboPositionUpdated { pool_id, .. } => {
                 pool_tracker.is_tracked_pool_id(pool_id)
             }
+
+            // Curve events: check pool address (individual contracts, like V2/V3)
+            DecodedEvent::CurveSwap { pool, .. }
+            | DecodedEvent::CurveLiquidityChange { pool, .. }
+            | DecodedEvent::CurveRampA { pool, .. }
+            | DecodedEvent::CurveApplyNewFee { pool, .. } => {
+                pool_tracker.is_tracked_address(pool)
+            }
         };
 
         // Log when events are filtered out to help with debugging
@@ -464,6 +558,12 @@ impl LiquidityExEx {
                         "Filtered Ekubo event from untracked pool_id: {:?}",
                         hex::encode(pool_id)
                     );
+                }
+                DecodedEvent::CurveSwap { pool, .. }
+                | DecodedEvent::CurveLiquidityChange { pool, .. }
+                | DecodedEvent::CurveRampA { pool, .. }
+                | DecodedEvent::CurveApplyNewFee { pool, .. } => {
+                    debug!("Filtered Curve event from untracked pool: {:?}", pool);
                 }
             }
         }

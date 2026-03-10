@@ -63,6 +63,7 @@ pub enum Protocol {
     UniswapV3,
     UniswapV4,
     Ekubo,
+    CurveStable,
 }
 
 /// Update type - which event triggered this update
@@ -134,6 +135,36 @@ pub enum PoolUpdate {
         sqrt_ratio: U256,
         liquidity: u128,
         tick: i32,
+    },
+
+    /// Curve StableSwap-NG TokenExchange event.
+    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
+    /// sends `tokens_bought` of coin[bought_id].
+    CurveSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+    },
+
+    /// Curve StableSwap-NG liquidity event (AddLiquidity / RemoveLiquidity / etc).
+    /// Carries the full effective balances after the event (re-scraped from storage).
+    CurveLiquidity {
+        effective_balances: Vec<u128>,
+    },
+
+    /// Curve StableSwap-NG RampA event.
+    CurveRampA {
+        initial_a: u64,
+        future_a: u64,
+        initial_a_time: u64,
+        future_a_time: u64,
+    },
+
+    /// Curve StableSwap-NG ApplyNewFee event.
+    CurveFeeUpdate {
+        fee: u64,
+        offpeg_fee_multiplier: u64,
     },
 }
 

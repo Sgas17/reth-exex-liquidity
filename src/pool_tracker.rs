@@ -56,6 +56,7 @@ pub struct PoolTracker {
     v3_count: usize,
     v4_count: usize,
     ekubo_count: usize,
+    curve_stable_count: usize,
 }
 
 impl PoolTracker {
@@ -71,6 +72,7 @@ impl PoolTracker {
             v3_count: 0,
             v4_count: 0,
             ekubo_count: 0,
+            curve_stable_count: 0,
         }
     }
 
@@ -129,11 +131,12 @@ impl PoolTracker {
         }
 
         info!(
-            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo pools (total: {})",
+            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo, {} Curve pools (total: {})",
             self.v2_count,
             self.v3_count,
             self.v4_count,
             self.ekubo_count,
+            self.curve_stable_count,
             self.pools_by_address.len() + self.pools_by_id.len()
         );
     }
@@ -195,6 +198,7 @@ impl PoolTracker {
                 Protocol::UniswapV3 => self.v3_count += 1,
                 Protocol::UniswapV4 => self.v4_count += 1,
                 Protocol::Ekubo => self.ekubo_count += 1,
+                Protocol::CurveStable => self.curve_stable_count += 1,
             }
 
             added += 1;
@@ -219,6 +223,7 @@ impl PoolTracker {
                             Protocol::UniswapV3 => self.v3_count -= 1,
                             Protocol::UniswapV4 => self.v4_count -= 1,
                             Protocol::Ekubo => self.ekubo_count -= 1,
+                            Protocol::CurveStable => self.curve_stable_count -= 1,
                         }
 
                         removed += 1;
@@ -234,6 +239,7 @@ impl PoolTracker {
                             Protocol::UniswapV3 => self.v3_count -= 1,
                             Protocol::UniswapV4 => self.v4_count -= 1,
                             Protocol::Ekubo => self.ekubo_count -= 1,
+                            Protocol::CurveStable => self.curve_stable_count -= 1,
                         }
 
                         removed += 1;
