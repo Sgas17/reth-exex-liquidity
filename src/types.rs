@@ -64,6 +64,7 @@ pub enum Protocol {
     UniswapV4,
     Ekubo,
     CurveStable,
+    CurveTwoCrypto,
 }
 
 /// Update type - which event triggered this update
@@ -165,6 +166,41 @@ pub enum PoolUpdate {
     CurveFeeUpdate {
         fee: u64,
         offpeg_fee_multiplier: u64,
+    },
+
+    /// Curve TwoCryptoNG TokenExchange event.
+    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
+    /// sends `tokens_bought` of coin[bought_id].
+    /// `packed_price_scale` carries the updated price_scale from the event.
+    TwoCryptoSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+        packed_price_scale: U256,
+    },
+
+    /// Curve TwoCryptoNG liquidity event (AddLiquidity / RemoveLiquidity / etc).
+    /// Carries the full balances after the event (re-scraped from storage).
+    TwoCryptoLiquidity {
+        balances: [u128; 2],
+    },
+
+    /// Curve TwoCryptoNG RampAgamma event.
+    TwoCryptoRampAgamma {
+        initial_a: u64,
+        future_a: u64,
+        initial_gamma: u128,
+        future_gamma: u128,
+        initial_time: u64,
+        future_time: u64,
+    },
+
+    /// Curve TwoCryptoNG NewParameters event.
+    TwoCryptoNewParameters {
+        mid_fee: u64,
+        out_fee: u64,
+        fee_gamma: u128,
     },
 }
 

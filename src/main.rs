@@ -429,6 +429,98 @@ impl LiquidityExEx {
                     offpeg_fee_multiplier,
                 },
             }),
+
+            // ============================================================================
+            // CURVE TWOCRYPTO-NG EVENTS
+            // ============================================================================
+            DecodedEvent::TwoCryptoSwap {
+                pool,
+                sold_id,
+                tokens_sold,
+                bought_id,
+                tokens_bought,
+                packed_price_scale,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveTwoCrypto,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::TwoCryptoSwap {
+                    sold_id,
+                    tokens_sold,
+                    bought_id,
+                    tokens_bought,
+                    packed_price_scale,
+                },
+            }),
+
+            DecodedEvent::TwoCryptoLiquidityChange { pool } => {
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::CurveTwoCrypto,
+                    update_type: UpdateType::Mint,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::TwoCryptoLiquidity {
+                        balances: [0; 2], // Empty — arena will re-scrape
+                    },
+                })
+            }
+
+            DecodedEvent::TwoCryptoRampAgamma {
+                pool,
+                initial_a,
+                future_a,
+                initial_gamma,
+                future_gamma,
+                initial_time,
+                future_time,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveTwoCrypto,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::TwoCryptoRampAgamma {
+                    initial_a,
+                    future_a,
+                    initial_gamma,
+                    future_gamma,
+                    initial_time,
+                    future_time,
+                },
+            }),
+
+            DecodedEvent::TwoCryptoNewParameters {
+                pool,
+                mid_fee,
+                out_fee,
+                fee_gamma,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveTwoCrypto,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::TwoCryptoNewParameters {
+                    mid_fee,
+                    out_fee,
+                    fee_gamma,
+                },
+            }),
         }
     }
 
@@ -523,11 +615,19 @@ impl LiquidityExEx {
                 pool_tracker.is_tracked_pool_id(pool_id)
             }
 
-            // Curve events: check pool address (individual contracts, like V2/V3)
+            // Curve StableSwap events: check pool address
             DecodedEvent::CurveSwap { pool, .. }
             | DecodedEvent::CurveLiquidityChange { pool, .. }
             | DecodedEvent::CurveRampA { pool, .. }
             | DecodedEvent::CurveApplyNewFee { pool, .. } => {
+                pool_tracker.is_tracked_address(pool)
+            }
+
+            // Curve TwoCrypto events: check pool address
+            DecodedEvent::TwoCryptoSwap { pool, .. }
+            | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
+            | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
+            | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
                 pool_tracker.is_tracked_address(pool)
             }
         };
@@ -563,7 +663,13 @@ impl LiquidityExEx {
                 | DecodedEvent::CurveLiquidityChange { pool, .. }
                 | DecodedEvent::CurveRampA { pool, .. }
                 | DecodedEvent::CurveApplyNewFee { pool, .. } => {
-                    debug!("Filtered Curve event from untracked pool: {:?}", pool);
+                    debug!("Filtered CurveStable event from untracked pool: {:?}", pool);
+                }
+                DecodedEvent::TwoCryptoSwap { pool, .. }
+                | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
+                | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
+                | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
+                    debug!("Filtered CurveTwoCrypto event from untracked pool: {:?}", pool);
                 }
             }
         }
