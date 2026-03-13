@@ -259,6 +259,8 @@ pub enum ControlMessage {
         stream_seq: u64,
         block_number: u64,
         block_timestamp: u64,
+        /// EIP-1559 base fee in wei. Always present post-London.
+        base_fee_per_gas: u64,
         /// If true, this block's events are reverts (from ChainReorged or ChainReverted)
         is_revert: bool,
     },
@@ -294,6 +296,11 @@ pub enum ControlMessage {
     ReorgComplete {
         stream_seq: u64,
         final_tip_block: u64,
+        /// Pools that require slot0 resync after the reorg.
+        ///
+        /// Kept for compatibility with the main ExEx schema. Overrides are still
+        /// emitted explicitly as `Slot0Override` updates.
+        slot0_resync_required: Vec<PoolIdentifier>,
     },
 }
 
@@ -339,6 +346,7 @@ mod tests {
             stream_seq: 42,
             block_number: 1000,
             block_timestamp: 123,
+            base_fee_per_gas: 1_000_000_000,
             is_revert: false,
         };
 
@@ -350,6 +358,7 @@ mod tests {
         let msg = ControlMessage::ReorgComplete {
             stream_seq: 7,
             final_tip_block: 12345,
+            slot0_resync_required: vec![PoolIdentifier::PoolId([1u8; 32])],
         };
 
         let encoded = bincode::serialize(&msg).expect("serialize");
@@ -359,9 +368,11 @@ mod tests {
             ControlMessage::ReorgComplete {
                 stream_seq,
                 final_tip_block,
+                slot0_resync_required,
             } => {
                 assert_eq!(stream_seq, 7);
                 assert_eq!(final_tip_block, 12345);
+                assert_eq!(slot0_resync_required.len(), 1);
             }
             other => panic!("unexpected decoded variant: {other:?}"),
         }

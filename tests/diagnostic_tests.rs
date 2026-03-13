@@ -60,6 +60,9 @@ fn simulate_event_processing(log: &Log, pool_tracker: &PoolTracker) -> EventProc
         DecodedEvent::V4Swap { pool_id, .. } | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
             pool_tracker.is_tracked_pool_id(pool_id)
         }
+
+        // Other protocols are not exercised by these diagnostics.
+        _ => false,
     };
 
     EventProcessingResult {
@@ -250,7 +253,7 @@ fn test_diagnostic_v3_event_processing() {
         address: pool_addr,
         data: LogData::new_unchecked(
             vec![Swap::SIGNATURE_HASH, B256::ZERO, B256::ZERO],
-            vec![0u8; 224].into(),
+            vec![0u8; 160].into(),
         ),
     };
 
@@ -308,7 +311,8 @@ fn test_diagnostic_v4_event_processing() {
             int128 amount1,
             uint160 sqrtPriceX96,
             uint128 liquidity,
-            int24 tick
+            int24 tick,
+            uint24 fee
         );
     }
 
@@ -316,7 +320,7 @@ fn test_diagnostic_v4_event_processing() {
         address: UNISWAP_V4_POOL_MANAGER,
         data: LogData::new_unchecked(
             vec![Swap::SIGNATURE_HASH, B256::from(pool_id), B256::ZERO],
-            vec![0u8; 224].into(),
+            vec![0u8; 192].into(),
         ),
     };
 
@@ -388,7 +392,8 @@ fn test_diagnostic_v4_wrong_pool_id() {
             int128 amount1,
             uint160 sqrtPriceX96,
             uint128 liquidity,
-            int24 tick
+            int24 tick,
+            uint24 fee
         );
     }
 
@@ -400,7 +405,7 @@ fn test_diagnostic_v4_wrong_pool_id() {
                 B256::from(untracked_pool_id), // Different pool ID!
                 B256::ZERO,
             ],
-            vec![0u8; 224].into(),
+            vec![0u8; 192].into(),
         ),
     };
 

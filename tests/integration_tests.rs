@@ -3,7 +3,7 @@
 // These tests verify the complete event processing pipeline to help debug
 // why events might not be output for watched pools.
 
-use alloy_primitives::{address, Address, Log, LogData, B256, U256};
+use alloy_primitives::{address, Address, I256, Log, LogData, B256, U256};
 use alloy_sol_types::SolEvent;
 use reth_exex_liquidity::{
     events::{decode_log, DecodedEvent},
@@ -276,7 +276,7 @@ mod event_decoding_and_filtering {
                     B256::ZERO, // sender
                     B256::ZERO, // recipient
                 ],
-                vec![0u8; 224].into(),
+                vec![0u8; 160].into(),
             ),
         }
     }
@@ -293,7 +293,8 @@ mod event_decoding_and_filtering {
                 int128 amount1,
                 uint160 sqrtPriceX96,
                 uint128 liquidity,
-                int24 tick
+                int24 tick,
+                uint24 fee
             );
         }
 
@@ -305,7 +306,7 @@ mod event_decoding_and_filtering {
                     B256::from(pool_id),
                     B256::ZERO, // sender
                 ],
-                vec![0u8; 224].into(),
+                vec![0u8; 192].into(),
             ),
         }
     }
@@ -533,9 +534,9 @@ mod message_creation {
             tx_index: 0,
             log_index: 0,
             is_revert: false,
-            update: PoolUpdate::V2Reserves {
-                reserve0: U256::from(1000),
-                reserve1: U256::from(500),
+            update: PoolUpdate::V2Swap {
+                amount0: I256::try_from(1000i64).unwrap(),
+                amount1: I256::try_from(-500i64).unwrap(),
             },
         };
 
@@ -546,11 +547,11 @@ mod message_creation {
         assert_eq!(message.update_type, UpdateType::Swap);
 
         match message.update {
-            PoolUpdate::V2Reserves { reserve0, reserve1 } => {
-                assert_eq!(reserve0, U256::from(1000));
-                assert_eq!(reserve1, U256::from(500));
+            PoolUpdate::V2Swap { amount0, amount1 } => {
+                assert_eq!(amount0, I256::try_from(1000i64).unwrap());
+                assert_eq!(amount1, I256::try_from(-500i64).unwrap());
             }
-            _ => panic!("Expected V2Reserves"),
+            _ => panic!("Expected V2Swap"),
         }
     }
 
@@ -626,8 +627,10 @@ mod block_boundaries {
     fn test_block_boundary_messages() {
         // Test BeginBlock message creation
         let begin_block = ControlMessage::BeginBlock {
+            stream_seq: 1,
             block_number: 12345,
             block_timestamp: 1234567890,
+            base_fee_per_gas: 1_000_000_000,
             is_revert: false,
         };
 
@@ -636,6 +639,7 @@ mod block_boundaries {
                 block_number,
                 block_timestamp,
                 is_revert,
+                ..
             } => {
                 assert_eq!(block_number, 12345);
                 assert_eq!(block_timestamp, 1234567890);
@@ -646,6 +650,7 @@ mod block_boundaries {
 
         // Test EndBlock message creation
         let end_block = ControlMessage::EndBlock {
+            stream_seq: 1,
             block_number: 12345,
             num_updates: 5,
         };
@@ -654,6 +659,7 @@ mod block_boundaries {
             ControlMessage::EndBlock {
                 block_number,
                 num_updates,
+                ..
             } => {
                 assert_eq!(block_number, 12345);
                 assert_eq!(num_updates, 5);
@@ -666,8 +672,10 @@ mod block_boundaries {
     fn test_revert_block_message() {
         // Test BeginBlock with revert flag
         let begin_block_revert = ControlMessage::BeginBlock {
+            stream_seq: 2,
             block_number: 12345,
             block_timestamp: 1234567890,
+            base_fee_per_gas: 1_000_000_000,
             is_revert: true,
         };
 
@@ -694,9 +702,9 @@ mod serialization {
             tx_index: 0,
             log_index: 0,
             is_revert: false,
-            update: PoolUpdate::V2Reserves {
-                reserve0: U256::from(1000),
-                reserve1: U256::from(500),
+            update: PoolUpdate::V2Swap {
+                amount0: I256::try_from(1000i64).unwrap(),
+                amount1: I256::try_from(-500i64).unwrap(),
             },
         };
 
@@ -716,8 +724,10 @@ mod serialization {
     #[test]
     fn test_control_message_serialization() {
         let msg = ControlMessage::BeginBlock {
+            stream_seq: 3,
             block_number: 12345,
             block_timestamp: 1234567890,
+            base_fee_per_gas: 1_000_000_000,
             is_revert: false,
         };
 
