@@ -34,7 +34,7 @@ pub struct PoolUpdateMessage {
 }
 
 /// Pool identifier - can be address (V2/V3) or bytes32 (V4)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PoolIdentifier {
     Address(Address),
     PoolId([u8; 32]), // V4 uses bytes32 poolId
@@ -57,7 +57,7 @@ impl PoolIdentifier {
 }
 
 /// Protocol type
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Protocol {
     UniswapV2,
     UniswapV3,
@@ -205,6 +205,15 @@ pub enum PoolUpdate {
         out_fee: u64,
         fee_gamma: u128,
     },
+
+    /// Definitive slot0 state read from storage after a reorg.
+    /// Replaces the `slot0_resync_required` mechanism — the ExEx reads the
+    /// correct post-reorg state directly and sends it to the arena.
+    Slot0Override {
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
+    },
 }
 
 /// Pool metadata from whitelist
@@ -280,13 +289,11 @@ pub enum ControlMessage {
     },
 
     /// Reorg boundary: emitted exactly once after the final EndBlock for that reorg batch.
+    /// Slot0 overrides for affected V3/V4/Ekubo pools are sent as `Slot0Override`
+    /// pool updates before this message.
     ReorgComplete {
         stream_seq: u64,
         final_tip_block: u64,
-        /// Pools that require slot0 resync after the reorg.
-        ///
-        /// Emitted deterministically from reverted V3/V4 swap events.
-        slot0_resync_required: Vec<PoolIdentifier>,
     },
 }
 
@@ -343,7 +350,6 @@ mod tests {
         let msg = ControlMessage::ReorgComplete {
             stream_seq: 7,
             final_tip_block: 12345,
-            slot0_resync_required: vec![PoolIdentifier::PoolId([1u8; 32])],
         };
 
         let encoded = bincode::serialize(&msg).expect("serialize");
@@ -353,11 +359,9 @@ mod tests {
             ControlMessage::ReorgComplete {
                 stream_seq,
                 final_tip_block,
-                slot0_resync_required,
             } => {
                 assert_eq!(stream_seq, 7);
                 assert_eq!(final_tip_block, 12345);
-                assert_eq!(slot0_resync_required.len(), 1);
             }
             other => panic!("unexpected decoded variant: {other:?}"),
         }
