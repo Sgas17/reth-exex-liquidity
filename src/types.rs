@@ -62,6 +62,7 @@ pub enum Protocol {
     UniswapV2,
     UniswapV3,
     UniswapV4,
+    Fluid,
 }
 
 /// Update type - which event triggered this update
@@ -108,6 +109,16 @@ pub enum PoolUpdate {
         tick_lower: i32,
         tick_upper: i32,
         liquidity_delta: i128,
+    },
+
+    /// Fluid DEX operate signal.
+    ///
+    /// Emitted when a tracked Fluid pool calls `operate()` on the Liquidity
+    /// Layer, indicating its reserves changed. The arena subscriber reacts
+    /// by fetching fresh reserves from the DexReservesResolver.
+    FluidOperate {
+        /// The token that was operated on.
+        token: Address,
     },
 }
 

@@ -284,6 +284,21 @@ impl LiquidityExEx {
                     },
                 })
             }
+
+            // ============================================================================
+            // FLUID DEX EVENTS
+            // ============================================================================
+            DecodedEvent::FluidOperate { pool, token } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::Fluid,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::FluidOperate { token },
+            }),
         }
     }
 
@@ -371,6 +386,12 @@ impl LiquidityExEx {
             | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
                 pool_tracker.is_tracked_pool_id(pool_id)
             }
+
+            // Fluid LogOperate: emitted by Liquidity Layer, `pool` is the
+            // DEX pool address extracted from the indexed `user` topic.
+            DecodedEvent::FluidOperate { pool, .. } => {
+                pool_tracker.is_tracked_fluid_pool(pool)
+            }
         };
 
         // Log when events are filtered out to help with debugging
@@ -392,6 +413,9 @@ impl LiquidityExEx {
                         "Filtered V4 event from untracked pool_id: {:?}",
                         hex::encode(pool_id)
                     );
+                }
+                DecodedEvent::FluidOperate { pool, .. } => {
+                    debug!("Filtered Fluid LogOperate from untracked pool: {:?}", pool);
                 }
             }
         }

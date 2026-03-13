@@ -60,6 +60,9 @@ fn simulate_event_processing(log: &Log, pool_tracker: &PoolTracker) -> EventProc
         DecodedEvent::V4Swap { pool_id, .. } | DecodedEvent::V4ModifyLiquidity { pool_id, .. } => {
             pool_tracker.is_tracked_pool_id(pool_id)
         }
+
+        // Fluid LogOperate: check if pool is a tracked Fluid pool
+        DecodedEvent::FluidOperate { pool, .. } => pool_tracker.is_tracked_fluid_pool(pool),
     };
 
     EventProcessingResult {

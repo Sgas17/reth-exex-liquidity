@@ -19,6 +19,11 @@ use tracing::{info, warn};
 /// Deployed: https://etherscan.io/address/0x000000000004444c5dc75cb358380d2e3de08a90
 pub const UNISWAP_V4_POOL_MANAGER: Address = address!("000000000004444c5dc75cb358380d2e3de08a90");
 
+/// Fluid Liquidity Layer singleton address (Ethereum Mainnet).
+/// All LogOperate events from Fluid DEX pools are emitted from this address.
+/// Deployed: https://etherscan.io/address/0x52Aa899454998Be5b000Ad077a46Bbe360F4e497
+pub const FLUID_LIQUIDITY_LAYER: Address = address!("52Aa899454998Be5b000Ad077a46Bbe360F4e497");
+
 /// Differential whitelist update operations
 #[derive(Debug, Clone)]
 pub enum WhitelistUpdate {
@@ -54,6 +59,7 @@ pub struct PoolTracker {
     v2_count: usize,
     v3_count: usize,
     v4_count: usize,
+    fluid_count: usize,
 }
 
 impl PoolTracker {
@@ -68,6 +74,7 @@ impl PoolTracker {
             v2_count: 0,
             v3_count: 0,
             v4_count: 0,
+            fluid_count: 0,
         }
     }
 
@@ -126,10 +133,11 @@ impl PoolTracker {
         }
 
         info!(
-            "Whitelist now tracking: {} V2, {} V3, {} V4 pools (total: {})",
+            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Fluid pools (total: {})",
             self.v2_count,
             self.v3_count,
             self.v4_count,
+            self.fluid_count,
             self.pools_by_address.len() + self.pools_by_id.len()
         );
     }
@@ -176,9 +184,19 @@ impl PoolTracker {
                 Protocol::UniswapV2 => self.v2_count += 1,
                 Protocol::UniswapV3 => self.v3_count += 1,
                 Protocol::UniswapV4 => self.v4_count += 1,
+                Protocol::Fluid => self.fluid_count += 1,
             }
 
             added += 1;
+        }
+
+        // Ensure Liquidity Layer address is tracked when any Fluid pools exist
+        if self.fluid_count > 0 && !self.tracked_addresses.contains(&FLUID_LIQUIDITY_LAYER) {
+            self.tracked_addresses.insert(FLUID_LIQUIDITY_LAYER);
+            info!(
+                "🔧 Added Fluid Liquidity Layer to tracked addresses for LogOperate events: {:?}",
+                FLUID_LIQUIDITY_LAYER
+            );
         }
 
         info!("Added {} new pools to whitelist", added);
@@ -199,6 +217,7 @@ impl PoolTracker {
                             Protocol::UniswapV2 => self.v2_count -= 1,
                             Protocol::UniswapV3 => self.v3_count -= 1,
                             Protocol::UniswapV4 => self.v4_count -= 1,
+                            Protocol::Fluid => self.fluid_count -= 1,
                         }
 
                         removed += 1;
@@ -213,6 +232,7 @@ impl PoolTracker {
                             Protocol::UniswapV2 => self.v2_count -= 1,
                             Protocol::UniswapV3 => self.v3_count -= 1,
                             Protocol::UniswapV4 => self.v4_count -= 1,
+                            Protocol::Fluid => self.fluid_count -= 1,
                         }
 
                         removed += 1;
@@ -236,6 +256,7 @@ impl PoolTracker {
         self.v2_count = 0;
         self.v3_count = 0;
         self.v4_count = 0;
+        self.fluid_count = 0;
 
         // Add new pools
         self.add_pools(pools);
@@ -276,6 +297,14 @@ impl PoolTracker {
         &self.tracked_pool_ids
     }
 
+    /// Check if a pool address is a tracked Fluid pool.
+    pub fn is_tracked_fluid_pool(&self, address: &Address) -> bool {
+        self.pools_by_address
+            .get(address)
+            .map(|p| p.protocol == Protocol::Fluid)
+            .unwrap_or(false)
+    }
+
     /// Get statistics
     pub fn stats(&self) -> PoolTrackerStats {
         PoolTrackerStats {
@@ -283,6 +312,7 @@ impl PoolTracker {
             v2_pools: self.v2_count,
             v3_pools: self.v3_count,
             v4_pools: self.v4_count,
+            fluid_pools: self.fluid_count,
         }
     }
 
@@ -298,6 +328,7 @@ pub struct PoolTrackerStats {
     pub v2_pools: usize,
     pub v3_pools: usize,
     pub v4_pools: usize,
+    pub fluid_pools: usize,
 }
 
 impl Default for PoolTracker {
@@ -398,5 +429,54 @@ mod tests {
         // Should only count once
         assert_eq!(tracker.stats().total_pools, 1);
         assert_eq!(tracker.stats().v2_pools, 1);
+    }
+
+    #[test]
+    fn test_fluid_pool_tracking() {
+        let mut tracker = PoolTracker::new();
+
+        let fluid_addr = Address::from([0xAA; 20]);
+        let v2_addr = Address::from([0xBB; 20]);
+
+        let fluid_pool = create_test_pool(fluid_addr, Protocol::Fluid);
+        let v2_pool = create_test_pool(v2_addr, Protocol::UniswapV2);
+
+        tracker.queue_update(WhitelistUpdate::Add(vec![fluid_pool, v2_pool]));
+
+        assert_eq!(tracker.stats().fluid_pools, 1);
+        assert_eq!(tracker.stats().v2_pools, 1);
+        assert_eq!(tracker.stats().total_pools, 2);
+
+        // Fluid pool should be tracked by address
+        assert!(tracker.is_tracked_address(&fluid_addr));
+        assert!(tracker.is_tracked_fluid_pool(&fluid_addr));
+
+        // V2 pool should be tracked but NOT as Fluid
+        assert!(tracker.is_tracked_address(&v2_addr));
+        assert!(!tracker.is_tracked_fluid_pool(&v2_addr));
+
+        // Liquidity Layer singleton should be auto-added for LogOperate events
+        assert!(
+            tracker.is_tracked_address(&FLUID_LIQUIDITY_LAYER),
+            "Liquidity Layer address should be tracked when Fluid pools exist"
+        );
+    }
+
+    #[test]
+    fn test_fluid_pool_remove() {
+        let mut tracker = PoolTracker::new();
+
+        let fluid_addr = Address::from([0xCC; 20]);
+        let fluid_pool = create_test_pool(fluid_addr, Protocol::Fluid);
+
+        tracker.queue_update(WhitelistUpdate::Add(vec![fluid_pool]));
+        assert_eq!(tracker.stats().fluid_pools, 1);
+
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(
+            fluid_addr,
+        )]));
+
+        assert_eq!(tracker.stats().fluid_pools, 0);
+        assert!(!tracker.is_tracked_fluid_pool(&fluid_addr));
     }
 }

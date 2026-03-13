@@ -159,6 +159,36 @@ mod v4 {
 use v4::{ModifyLiquidity as UniswapV4ModifyLiquidity, Swap as UniswapV4Swap};
 
 // ============================================================================
+// FLUID DEX EVENTS (from Liquidity Layer singleton)
+// ============================================================================
+
+mod fluid {
+    use super::*;
+
+    sol! {
+        /// LogOperate — emitted by the Fluid Liquidity Layer when any protocol
+        /// (DEX pool, fToken, Vault) calls `operate()`.
+        ///
+        /// For DEX swaps the `user` is the Fluid pool address.
+        /// We only need user + token as a "pool was touched" signal; the
+        /// arena subscriber fetches fresh reserves from the DexReservesResolver.
+        #[derive(Debug)]
+        event LogOperate(
+            address indexed user,
+            address indexed token,
+            int256 supplyAmount,
+            int256 borrowAmount,
+            address withdrawTo,
+            address borrowTo,
+            uint256 totalAmounts,
+            uint256 exchangePricesAndConfig
+        );
+    }
+}
+
+use fluid::LogOperate as FluidLogOperate;
+
+// ============================================================================
 // EVENT DECODING LOGIC
 // ============================================================================
 
@@ -211,6 +241,12 @@ pub enum DecodedEvent {
         tick_lower: i32,
         tick_upper: i32,
         liquidity_delta: i128,
+    },
+    /// Fluid Liquidity Layer `LogOperate` — signals a tracked Fluid DEX
+    /// pool changed reserves. `user` = pool address, `token` = asset involved.
+    FluidOperate {
+        pool: Address,
+        token: Address,
     },
 }
 
@@ -289,6 +325,16 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
             tick_lower: event.data.tickLower.as_i32(),
             tick_upper: event.data.tickUpper.as_i32(),
             amount: event.data.amount,
+        });
+    }
+
+    // Try Fluid LogOperate - emitted by the Liquidity Layer singleton.
+    // topics[0] = signature, topics[1] = user (pool), topics[2] = token
+    if let Ok(event) = FluidLogOperate::decode_log(log) {
+        let (_, user, token) = event.topics();
+        return Some(DecodedEvent::FluidOperate {
+            pool: Address(*user),
+            token: Address(*token),
         });
     }
 
@@ -398,6 +444,66 @@ mod tests {
             UniswapV4ModifyLiquidity::SIGNATURE_HASH.to_string(),
             "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
         );
+
+        // Fluid LogOperate signature
+        // LogOperate(address,address,int256,int256,address,address,uint256,uint256)
+        println!(
+            "FluidLogOperate: {}",
+            FluidLogOperate::SIGNATURE_HASH
+        );
+        // Verify it's a valid keccak256 hash (not zero)
+        assert_ne!(
+            FluidLogOperate::SIGNATURE_HASH,
+            alloy_primitives::B256::ZERO,
+            "FluidLogOperate signature should not be zero"
+        );
+    }
+
+    #[test]
+    fn test_decode_fluid_log_operate() {
+        // Simulate a LogOperate event from the Fluid Liquidity Layer
+        let liquidity_layer = Address::from([0x52; 20]); // simplified
+        let pool_addr = Address::from([0xAA; 20]);
+        let token_addr = Address::from([0xBB; 20]);
+
+        // Build topic entries: topics[1] = user (pool), topics[2] = token
+        let user_topic = {
+            let mut b = [0u8; 32];
+            b[12..].copy_from_slice(pool_addr.as_slice());
+            alloy_primitives::B256::from(b)
+        };
+        let token_topic = {
+            let mut b = [0u8; 32];
+            b[12..].copy_from_slice(token_addr.as_slice());
+            alloy_primitives::B256::from(b)
+        };
+
+        // data: int256 supplyAmount, int256 borrowAmount,
+        //       address withdrawTo, address borrowTo,
+        //       uint256 totalAmounts, uint256 exchangePricesAndConfig
+        // = 6 x 32 bytes = 192 bytes
+        let log = Log {
+            address: liquidity_layer,
+            data: LogData::new_unchecked(
+                vec![
+                    FluidLogOperate::SIGNATURE_HASH,
+                    user_topic,
+                    token_topic,
+                ],
+                vec![0u8; 192].into(),
+            ),
+        };
+
+        let decoded = decode_log(&log);
+        assert!(
+            matches!(decoded, Some(DecodedEvent::FluidOperate { .. })),
+            "Should decode as FluidOperate"
+        );
+
+        if let Some(DecodedEvent::FluidOperate { pool, token }) = decoded {
+            assert_eq!(pool, pool_addr);
+            assert_eq!(token, token_addr);
+        }
     }
 
     #[test]
