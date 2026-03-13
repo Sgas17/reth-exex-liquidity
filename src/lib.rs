@@ -5,6 +5,7 @@
 pub mod balance_monitor;
 pub mod swap_monitor;
 pub mod events;
+pub mod fluid_decoder;
 pub mod nats_client;
 pub mod pool_tracker;
 pub mod socket;
