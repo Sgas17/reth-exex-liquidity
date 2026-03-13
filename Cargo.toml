@@ -6,13 +6,13 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Reth ExEx framework (v1.11.1 — two critical fixes over v1.11.0)
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1", features = ["serde"] }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.1" }
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["serde"] }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 
 # Alloy for type-safe event decoding (versions matched to reth v1.11.0)
 alloy-consensus = { version = "1.6.3", default-features = false }
