@@ -1011,10 +1011,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     new.blocks().len()
                 );
 
-                // Process each block with block boundaries
-                for (block, receipts) in new.blocks_and_receipts() {
+                // Process each block with block boundaries.
+                // Storage enrichment (`D` for Curve crypto pools) is only applied on
+                // the final block in the notification batch. Consumers only read after
+                // arena processing completes, so per-intermediate-block `D` accuracy
+                // is intentionally skipped to reduce state reads.
+                let total_new_blocks = new.blocks().len();
+                for (block_idx, (block, receipts)) in new.blocks_and_receipts().enumerate() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
+                    let enrich_storage_for_block = block_idx + 1 == total_new_blocks;
 
                     // 🔒 Begin block - lock whitelist updates until block completes
                     {
@@ -1067,7 +1073,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
-                                enrich_with_storage(&mut update_msg, ctx.provider());
+                                if enrich_storage_for_block {
+                                    enrich_with_storage(&mut update_msg, ctx.provider());
+                                }
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -1222,11 +1230,15 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
                 }
 
-                // Step 2: Process new blocks
+                // Step 2: Process new blocks.
+                // Same policy as ChainCommitted: only enrich storage-derived fields
+                // on the final block in this batch.
                 info!("Step 2: Processing {} new blocks", new.blocks().len());
-                for (block, receipts) in new.blocks_and_receipts() {
+                let total_new_blocks = new.blocks().len();
+                for (block_idx, (block, receipts)) in new.blocks_and_receipts().enumerate() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
+                    let enrich_storage_for_block = block_idx + 1 == total_new_blocks;
 
                     // 🔒 Begin block
                     {
@@ -1271,7 +1283,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
-                                enrich_with_storage(&mut update_msg, ctx.provider());
+                                if enrich_storage_for_block {
+                                    enrich_with_storage(&mut update_msg, ctx.provider());
+                                }
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
