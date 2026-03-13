@@ -63,6 +63,8 @@ pub enum Protocol {
     UniswapV3,
     UniswapV4,
     Ekubo,
+    CurveStable,
+    CurveTwoCrypto,
 }
 
 /// Update type - which event triggered this update
@@ -136,10 +138,77 @@ pub enum PoolUpdate {
         tick: i32,
     },
 
+    /// Curve StableSwap-NG TokenExchange event.
+    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
+    /// sends `tokens_bought` of coin[bought_id].
+    CurveSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+    },
+
+    /// Curve StableSwap-NG liquidity event (AddLiquidity / RemoveLiquidity / etc).
+    /// Carries the full effective balances after the event (re-scraped from storage).
+    CurveLiquidity {
+        effective_balances: Vec<u128>,
+    },
+
+    /// Curve StableSwap-NG RampA event.
+    CurveRampA {
+        initial_a: u64,
+        future_a: u64,
+        initial_a_time: u64,
+        future_a_time: u64,
+    },
+
+    /// Curve StableSwap-NG ApplyNewFee event.
+    CurveFeeUpdate {
+        fee: u64,
+        offpeg_fee_multiplier: u64,
+    },
+
+    /// Curve TwoCryptoNG TokenExchange event.
+    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
+    /// sends `tokens_bought` of coin[bought_id].
+    /// `packed_price_scale` carries the updated price_scale from the event.
+    /// `d` is read from pool storage (slot 14) after the swap — avoids
+    /// newton_D recomputation on the arena side.
+    TwoCryptoSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+        packed_price_scale: U256,
+        d: U256,
+    },
+
+    /// Curve TwoCryptoNG liquidity event (AddLiquidity / RemoveLiquidity / etc).
+    /// Carries the full balances after the event (re-scraped from storage).
+    TwoCryptoLiquidity {
+        balances: [u128; 2],
+    },
+
+    /// Curve TwoCryptoNG RampAgamma event.
+    TwoCryptoRampAgamma {
+        initial_a: u64,
+        future_a: u64,
+        initial_gamma: u128,
+        future_gamma: u128,
+        initial_time: u64,
+        future_time: u64,
+    },
+
+    /// Curve TwoCryptoNG NewParameters event.
+    TwoCryptoNewParameters {
+        mid_fee: u64,
+        out_fee: u64,
+        fee_gamma: u128,
+    },
+
     /// Definitive slot0 state read from storage after a reorg.
-    ///
-    /// Emitted as a synthetic update after reorg processing so consumers can
-    /// update pool state without active on-demand rescrapes.
+    /// Replaces the `slot0_resync_required` mechanism — the ExEx reads the
+    /// correct post-reorg state directly and sends it to the arena.
     Slot0Override {
         sqrt_price_x96: U256,
         liquidity: u128,
@@ -222,12 +291,15 @@ pub enum ControlMessage {
     },
 
     /// Reorg boundary: emitted exactly once after the final EndBlock for that reorg batch.
+    /// Slot0 overrides for affected V3/V4/Ekubo pools are sent as `Slot0Override`
+    /// pool updates before this message.
     ReorgComplete {
         stream_seq: u64,
         final_tip_block: u64,
         /// Pools that require slot0 resync after the reorg.
         ///
-        /// Emitted deterministically from reverted V3/V4 swap events.
+        /// Kept for compatibility with the main ExEx schema. Overrides are still
+        /// emitted explicitly as `Slot0Override` updates.
         slot0_resync_required: Vec<PoolIdentifier>,
     },
 }

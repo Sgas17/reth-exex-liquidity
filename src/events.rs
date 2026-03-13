@@ -165,6 +165,186 @@ use v4::{ModifyLiquidity as UniswapV4ModifyLiquidity, Swap as UniswapV4Swap};
 //   - Swaps: anonymous log0 (no topics), 116 bytes packed data
 //   - PositionUpdated: standard event with signature
 
+// ============================================================================
+// CURVE STABLESWAP-NG EVENTS
+// ============================================================================
+// TokenExchange is emitted by each individual pool contract (not a singleton).
+// AddLiquidity / RemoveLiquidity are handled by re-scraping balances.
+// RampA and ApplyNewFee are rare parameter-change events.
+
+mod curve {
+    use super::*;
+
+    sol! {
+        /// TokenExchange(address buyer, int128 sold_id, uint256 tokens_sold, int128 bought_id, uint256 tokens_bought)
+        #[derive(Debug)]
+        event TokenExchange(
+            address indexed buyer,
+            int128 sold_id,
+            uint256 tokens_sold,
+            int128 bought_id,
+            uint256 tokens_bought
+        );
+
+        /// AddLiquidity(address provider, uint256[] token_amounts, uint256[] fees, uint256 invariant, uint256 token_supply)
+        /// NOTE: DynArray args in Vyper ABI are encoded as dynamic arrays.
+        /// We only need the event signature for detection; balances are re-scraped.
+        #[derive(Debug)]
+        event AddLiquidity(
+            address indexed provider,
+            uint256[] token_amounts,
+            uint256[] fees,
+            uint256 invariant,
+            uint256 token_supply
+        );
+
+        /// RemoveLiquidity(address provider, uint256[] token_amounts, uint256[] fees, uint256 token_supply)
+        #[derive(Debug)]
+        event RemoveLiquidity(
+            address indexed provider,
+            uint256[] token_amounts,
+            uint256[] fees,
+            uint256 token_supply
+        );
+
+        /// RemoveLiquidityOne(address provider, int128 token_id, uint256 token_amount, uint256 coin_amount, uint256 token_supply)
+        #[derive(Debug)]
+        event RemoveLiquidityOne(
+            address indexed provider,
+            int128 token_id,
+            uint256 token_amount,
+            uint256 coin_amount,
+            uint256 token_supply
+        );
+
+        /// RemoveLiquidityImbalance(address provider, uint256[] token_amounts, uint256[] fees, uint256 invariant, uint256 token_supply)
+        #[derive(Debug)]
+        event RemoveLiquidityImbalance(
+            address indexed provider,
+            uint256[] token_amounts,
+            uint256[] fees,
+            uint256 invariant,
+            uint256 token_supply
+        );
+
+        /// RampA(uint256 old_A, uint256 new_A, uint256 initial_time, uint256 future_time)
+        #[derive(Debug)]
+        event RampA(
+            uint256 old_A,
+            uint256 new_A,
+            uint256 initial_time,
+            uint256 future_time
+        );
+
+        /// ApplyNewFee(uint256 fee, uint256 offpeg_fee_multiplier)
+        #[derive(Debug)]
+        event ApplyNewFee(
+            uint256 fee,
+            uint256 offpeg_fee_multiplier
+        );
+    }
+}
+
+use curve::{
+    AddLiquidity as CurveAddLiquidity,
+    ApplyNewFee as CurveApplyNewFee,
+    RampA as CurveRampA,
+    RemoveLiquidity as CurveRemoveLiquidity,
+    RemoveLiquidityImbalance as CurveRemoveLiquidityImbalance,
+    RemoveLiquidityOne as CurveRemoveLiquidityOne,
+    TokenExchange as CurveTokenExchange,
+};
+
+// ============================================================================
+// CURVE TWOCRYPTO-NG EVENTS
+// ============================================================================
+// TwoCryptoNG uses uint256 indices (not int128), and has additional fields.
+// Event signatures are different from StableSwap-NG.
+
+mod twocrypto {
+    use super::*;
+
+    sol! {
+        /// TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold,
+        ///               uint256 bought_id, uint256 tokens_bought, uint256 fee, uint256 packed_price_scale)
+        #[derive(Debug)]
+        event TokenExchange(
+            address indexed buyer,
+            uint256 sold_id,
+            uint256 tokens_sold,
+            uint256 bought_id,
+            uint256 tokens_bought,
+            uint256 fee,
+            uint256 packed_price_scale
+        );
+
+        /// AddLiquidity(address indexed provider, uint256[2] token_amounts,
+        ///              uint256 fee, uint256 token_supply, uint256 packed_price_scale)
+        #[derive(Debug)]
+        event AddLiquidity(
+            address indexed provider,
+            uint256[2] token_amounts,
+            uint256 fee,
+            uint256 token_supply,
+            uint256 packed_price_scale
+        );
+
+        /// RemoveLiquidity(address indexed provider, uint256[2] token_amounts, uint256 token_supply)
+        #[derive(Debug)]
+        event RemoveLiquidity(
+            address indexed provider,
+            uint256[2] token_amounts,
+            uint256 token_supply
+        );
+
+        /// RemoveLiquidityOne(address indexed provider, uint256 token_id,
+        ///                    uint256 token_amount, uint256 approx_fee, uint256 packed_price_scale)
+        #[derive(Debug)]
+        event RemoveLiquidityOne(
+            address indexed provider,
+            uint256 token_id,
+            uint256 token_amount,
+            uint256 approx_fee,
+            uint256 packed_price_scale
+        );
+
+        /// NewParameters(uint256 mid_fee, uint256 out_fee, uint256 fee_gamma,
+        ///               uint256 allowed_extra_profit, uint256 adjustment_step,
+        ///               uint256 ma_time, uint256 xcp_profit_a)
+        #[derive(Debug)]
+        event NewParameters(
+            uint256 mid_fee,
+            uint256 out_fee,
+            uint256 fee_gamma,
+            uint256 allowed_extra_profit,
+            uint256 adjustment_step,
+            uint256 ma_time,
+            uint256 xcp_profit_a
+        );
+
+        /// RampAgamma(uint256 initial_A, uint256 future_A, uint256 initial_gamma,
+        ///            uint256 future_gamma, uint256 initial_time, uint256 future_time)
+        #[derive(Debug)]
+        event RampAgamma(
+            uint256 initial_A,
+            uint256 future_A,
+            uint256 initial_gamma,
+            uint256 future_gamma,
+            uint256 initial_time,
+            uint256 future_time
+        );
+    }
+}
+
+use twocrypto::{
+    AddLiquidity as TwoCryptoAddLiquidity,
+    NewParameters as TwoCryptoNewParameters,
+    RampAgamma as TwoCryptoRampAgamma,
+    RemoveLiquidity as TwoCryptoRemoveLiquidity,
+    RemoveLiquidityOne as TwoCryptoRemoveLiquidityOne,
+    TokenExchange as TwoCryptoTokenExchange,
+};
+
 mod ekubo {
     use super::*;
 
@@ -264,6 +444,63 @@ pub enum DecodedEvent {
         sqrt_ratio: U256,
         liquidity: u128,
         tick: i32,
+    },
+    /// Curve StableSwap-NG TokenExchange event.
+    CurveSwap {
+        pool: Address,
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+    },
+    /// Curve liquidity event (AddLiquidity, RemoveLiquidity, etc).
+    /// We don't decode the amounts — balances will be re-scraped from storage.
+    CurveLiquidityChange {
+        pool: Address,
+    },
+    /// Curve RampA parameter change.
+    CurveRampA {
+        pool: Address,
+        old_a: u64,
+        new_a: u64,
+        initial_time: u64,
+        future_time: u64,
+    },
+    /// Curve ApplyNewFee event.
+    CurveApplyNewFee {
+        pool: Address,
+        fee: u64,
+        offpeg_fee_multiplier: u64,
+    },
+    /// TwoCryptoNG TokenExchange event.
+    TwoCryptoSwap {
+        pool: Address,
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+        packed_price_scale: U256,
+    },
+    /// TwoCryptoNG liquidity event (AddLiquidity, RemoveLiquidity, RemoveLiquidityOne).
+    TwoCryptoLiquidityChange {
+        pool: Address,
+    },
+    /// TwoCryptoNG RampAgamma parameter change.
+    TwoCryptoRampAgamma {
+        pool: Address,
+        initial_a: u64,
+        future_a: u64,
+        initial_gamma: u128,
+        future_gamma: u128,
+        initial_time: u64,
+        future_time: u64,
+    },
+    /// TwoCryptoNG NewParameters event.
+    TwoCryptoNewParameters {
+        pool: Address,
+        mid_fee: u64,
+        out_fee: u64,
+        fee_gamma: u128,
     },
 }
 
@@ -383,6 +620,102 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
                 });
             }
         }
+    }
+
+    // ── Curve StableSwap-NG events ───────────────────────────────────────
+    // TokenExchange carries the swap data directly.
+    // Liquidity events (Add/Remove/etc) just trigger a re-scrape.
+    // RampA and ApplyNewFee are rare but must be tracked.
+
+    if let Ok(event) = CurveTokenExchange::decode_log(log) {
+        return Some(DecodedEvent::CurveSwap {
+            pool,
+            sold_id: event.data.sold_id as u8,
+            tokens_sold: event.data.tokens_sold.saturating_to::<u128>(),
+            bought_id: event.data.bought_id as u8,
+            tokens_bought: event.data.tokens_bought.saturating_to::<u128>(),
+        });
+    }
+
+    if let Ok(_event) = CurveAddLiquidity::decode_log(log) {
+        return Some(DecodedEvent::CurveLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = CurveRemoveLiquidity::decode_log(log) {
+        return Some(DecodedEvent::CurveLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = CurveRemoveLiquidityOne::decode_log(log) {
+        return Some(DecodedEvent::CurveLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = CurveRemoveLiquidityImbalance::decode_log(log) {
+        return Some(DecodedEvent::CurveLiquidityChange { pool });
+    }
+
+    if let Ok(event) = CurveRampA::decode_log(log) {
+        return Some(DecodedEvent::CurveRampA {
+            pool,
+            old_a: event.data.old_A.saturating_to::<u64>(),
+            new_a: event.data.new_A.saturating_to::<u64>(),
+            initial_time: event.data.initial_time.saturating_to::<u64>(),
+            future_time: event.data.future_time.saturating_to::<u64>(),
+        });
+    }
+
+    if let Ok(event) = CurveApplyNewFee::decode_log(log) {
+        return Some(DecodedEvent::CurveApplyNewFee {
+            pool,
+            fee: event.data.fee.saturating_to::<u64>(),
+            offpeg_fee_multiplier: event.data.offpeg_fee_multiplier.saturating_to::<u64>(),
+        });
+    }
+
+    // ── Curve TwoCryptoNG events ─────────────────────────────────────────
+    // Different event signatures from StableSwap-NG (uint256 indices, extra fields).
+
+    if let Ok(event) = TwoCryptoTokenExchange::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoSwap {
+            pool,
+            sold_id: event.data.sold_id.saturating_to::<u8>(),
+            tokens_sold: event.data.tokens_sold.saturating_to::<u128>(),
+            bought_id: event.data.bought_id.saturating_to::<u8>(),
+            tokens_bought: event.data.tokens_bought.saturating_to::<u128>(),
+            packed_price_scale: event.data.packed_price_scale,
+        });
+    }
+
+    if let Ok(_event) = TwoCryptoAddLiquidity::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = TwoCryptoRemoveLiquidity::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = TwoCryptoRemoveLiquidityOne::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoLiquidityChange { pool });
+    }
+
+    if let Ok(event) = TwoCryptoRampAgamma::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoRampAgamma {
+            pool,
+            initial_a: event.data.initial_A.saturating_to::<u64>(),
+            future_a: event.data.future_A.saturating_to::<u64>(),
+            initial_gamma: event.data.initial_gamma.saturating_to::<u128>(),
+            future_gamma: event.data.future_gamma.saturating_to::<u128>(),
+            initial_time: event.data.initial_time.saturating_to::<u64>(),
+            future_time: event.data.future_time.saturating_to::<u64>(),
+        });
+    }
+
+    if let Ok(event) = TwoCryptoNewParameters::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoNewParameters {
+            pool,
+            mid_fee: event.data.mid_fee.saturating_to::<u64>(),
+            out_fee: event.data.out_fee.saturating_to::<u64>(),
+            fee_gamma: event.data.fee_gamma.saturating_to::<u128>(),
+        });
     }
 
     // ── Ekubo events ──────────────────────────────────────────────────────

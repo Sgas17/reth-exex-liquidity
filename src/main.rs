@@ -26,9 +26,9 @@ use nats_client::WhitelistNatsClient;
 use futures::{StreamExt, TryStreamExt};
 use pool_tracker::PoolTracker;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth::providers::StateProviderFactory;
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
+use reth_provider::StateProviderFactory;
 use socket::PoolUpdateSocketServer;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -345,6 +345,185 @@ impl LiquidityExEx {
                     },
                 })
             }
+
+            // ============================================================================
+            // CURVE STABLESWAP-NG EVENTS
+            // ============================================================================
+            DecodedEvent::CurveSwap {
+                pool,
+                sold_id,
+                tokens_sold,
+                bought_id,
+                tokens_bought,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveStable,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::CurveSwap {
+                    sold_id,
+                    tokens_sold,
+                    bought_id,
+                    tokens_bought,
+                },
+            }),
+
+            DecodedEvent::CurveLiquidityChange { pool } => {
+                // Liquidity events don't carry enough info for delta tracking.
+                // Signal the arena to re-scrape this pool's balances from storage.
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::CurveStable,
+                    update_type: UpdateType::Mint, // Generic — arena re-scrapes regardless
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::CurveLiquidity {
+                        effective_balances: vec![], // Empty — arena will re-scrape
+                    },
+                })
+            }
+
+            DecodedEvent::CurveRampA {
+                pool,
+                old_a,
+                new_a,
+                initial_time,
+                future_time,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveStable,
+                update_type: UpdateType::Swap, // No specific type for param changes
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::CurveRampA {
+                    initial_a: old_a,
+                    future_a: new_a,
+                    initial_a_time: initial_time,
+                    future_a_time: future_time,
+                },
+            }),
+
+            DecodedEvent::CurveApplyNewFee {
+                pool,
+                fee,
+                offpeg_fee_multiplier,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveStable,
+                update_type: UpdateType::Swap, // No specific type for param changes
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::CurveFeeUpdate {
+                    fee,
+                    offpeg_fee_multiplier,
+                },
+            }),
+
+            // ============================================================================
+            // CURVE TWOCRYPTO-NG EVENTS
+            // ============================================================================
+            DecodedEvent::TwoCryptoSwap {
+                pool,
+                sold_id,
+                tokens_sold,
+                bought_id,
+                tokens_bought,
+                packed_price_scale,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveTwoCrypto,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::TwoCryptoSwap {
+                    sold_id,
+                    tokens_sold,
+                    bought_id,
+                    tokens_bought,
+                    packed_price_scale,
+                    d: U256::ZERO, // Enriched from storage after creation
+                },
+            }),
+
+            DecodedEvent::TwoCryptoLiquidityChange { pool } => {
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::CurveTwoCrypto,
+                    update_type: UpdateType::Mint,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::TwoCryptoLiquidity {
+                        balances: [0; 2], // Empty — arena will re-scrape
+                    },
+                })
+            }
+
+            DecodedEvent::TwoCryptoRampAgamma {
+                pool,
+                initial_a,
+                future_a,
+                initial_gamma,
+                future_gamma,
+                initial_time,
+                future_time,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveTwoCrypto,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::TwoCryptoRampAgamma {
+                    initial_a,
+                    future_a,
+                    initial_gamma,
+                    future_gamma,
+                    initial_time,
+                    future_time,
+                },
+            }),
+
+            DecodedEvent::TwoCryptoNewParameters {
+                pool,
+                mid_fee,
+                out_fee,
+                fee_gamma,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(pool),
+                protocol: Protocol::CurveTwoCrypto,
+                update_type: UpdateType::Swap,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::TwoCryptoNewParameters {
+                    mid_fee,
+                    out_fee,
+                    fee_gamma,
+                },
+            }),
         }
     }
 
@@ -440,6 +619,22 @@ impl LiquidityExEx {
             | DecodedEvent::EkuboPositionUpdated { pool_id, .. } => {
                 pool_tracker.is_tracked_pool_id(pool_id)
             }
+
+            // Curve StableSwap events: check pool address
+            DecodedEvent::CurveSwap { pool, .. }
+            | DecodedEvent::CurveLiquidityChange { pool, .. }
+            | DecodedEvent::CurveRampA { pool, .. }
+            | DecodedEvent::CurveApplyNewFee { pool, .. } => {
+                pool_tracker.is_tracked_address(pool)
+            }
+
+            // Curve TwoCrypto events: check pool address
+            DecodedEvent::TwoCryptoSwap { pool, .. }
+            | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
+            | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
+            | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
+                pool_tracker.is_tracked_address(pool)
+            }
         };
 
         // Log when events are filtered out to help with debugging
@@ -469,6 +664,18 @@ impl LiquidityExEx {
                         hex::encode(pool_id)
                     );
                 }
+                DecodedEvent::CurveSwap { pool, .. }
+                | DecodedEvent::CurveLiquidityChange { pool, .. }
+                | DecodedEvent::CurveRampA { pool, .. }
+                | DecodedEvent::CurveApplyNewFee { pool, .. } => {
+                    debug!("Filtered CurveStable event from untracked pool: {:?}", pool);
+                }
+                DecodedEvent::TwoCryptoSwap { pool, .. }
+                | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
+                | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
+                | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
+                    debug!("Filtered CurveTwoCrypto event from untracked pool: {:?}", pool);
+                }
             }
         }
 
@@ -476,7 +683,10 @@ impl LiquidityExEx {
     }
 }
 
-/// Read a single storage slot from latest state.
+/// Curve pool storage slot for D (TwoCrypto slot 14, Tricrypto slot 14).
+const CURVE_D_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
+
+/// Read a single storage slot from the state at a given block.
 ///
 /// Returns `U256::ZERO` if the slot is empty or the read fails.
 fn read_storage_slot<P: StateProviderFactory>(
@@ -485,7 +695,7 @@ fn read_storage_slot<P: StateProviderFactory>(
     slot: U256,
 ) -> U256 {
     use alloy_primitives::B256;
-
+    use reth_provider::StateProvider;
     let slot_key: B256 = B256::from(slot);
     match provider.latest() {
         Ok(state) => match state.storage(address, slot_key.into()) {
@@ -500,6 +710,25 @@ fn read_storage_slot<P: StateProviderFactory>(
             warn!("Failed to get latest state provider: {}", e);
             U256::ZERO
         }
+    }
+}
+
+/// Enrich a pool update message with storage-derived fields.
+///
+/// For Curve TwoCrypto/Tricrypto swap events, reads D from storage (slot 14)
+/// to avoid newton_D recomputation on the arena side.
+fn enrich_with_storage<P: StateProviderFactory>(
+    msg: &mut PoolUpdateMessage,
+    provider: &P,
+) {
+    match &mut msg.update {
+        PoolUpdate::TwoCryptoSwap { d, .. } => {
+            if let Some(address) = msg.pool_id.as_address() {
+                *d = read_storage_slot(provider, address, CURVE_D_SLOT);
+            }
+        }
+        // Future: PoolUpdate::TricryptoSwap { d, .. } => { ... }
+        _ => {}
     }
 }
 
@@ -530,6 +759,7 @@ fn decode_slot0_packed(value: U256) -> (U256, i32) {
 fn decode_ekubo_state_packed(value: U256) -> (U256, i32, u128) {
     let bytes = value.to_be_bytes::<32>();
 
+    // [0..12] = sqrtRatio (96 bits), [12..16] = tick (int32), [16..32] = liquidity (128 bits)
     let sqrt_ratio = {
         let mut buf = [0u8; 16];
         buf[4..16].copy_from_slice(&bytes[0..12]);
@@ -549,7 +779,6 @@ fn decode_ekubo_state_packed(value: U256) -> (U256, i32, u128) {
 fn v4_pool_base_slot(pool_id: &[u8; 32]) -> U256 {
     use alloy_primitives::{B256, keccak256};
     use alloy_sol_types::SolValue;
-
     let encoded = (B256::from_slice(pool_id), V4_POOLS_SLOT).abi_encode();
     U256::from_be_bytes(*keccak256(&encoded))
 }
@@ -576,6 +805,7 @@ fn read_v4_slot0<P: StateProviderFactory>(
     pool_id: &[u8; 32],
 ) -> Option<(U256, i32, u128)> {
     let base = v4_pool_base_slot(pool_id);
+    // slot0 at base + 0, liquidity at base + 3
     let slot0_key = U256::from_be_bytes(base.to_be_bytes::<32>());
     let liquidity_key = slot0_key + U256::from(3);
 
@@ -596,7 +826,6 @@ fn read_ekubo_state<P: StateProviderFactory>(
     pool_id: &[u8; 32],
 ) -> Option<(U256, i32, u128)> {
     use alloy_primitives::B256;
-
     let state_slot = U256::from_be_bytes(*B256::from_slice(pool_id));
     let state_raw = read_storage_slot(provider, ekubo_core, state_slot);
     if state_raw.is_zero() {
@@ -607,6 +836,9 @@ fn read_ekubo_state<P: StateProviderFactory>(
 }
 
 /// Send Slot0Override messages for all affected pools after a reorg.
+///
+/// Reads definitive post-reorg state from `latest()` storage and sends
+/// override messages, replacing the old `slot0_resync_required` mechanism.
 fn send_slot0_overrides<P: StateProviderFactory>(
     provider: &P,
     affected_pools: &HashSet<(PoolIdentifier, Protocol)>,
@@ -615,18 +847,22 @@ fn send_slot0_overrides<P: StateProviderFactory>(
     block_number: u64,
     block_timestamp: u64,
 ) {
-    use events::EKUBO_CORE;
     use pool_tracker::UNISWAP_V4_POOL_MANAGER;
+    use events::EKUBO_CORE;
 
     let mut overrides_sent = 0u32;
 
     for (pool_id, protocol) in affected_pools {
         let slot0 = match (pool_id, protocol) {
-            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => read_v3_slot0(provider, *addr),
+            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => {
+                read_v3_slot0(provider, *addr)
+            }
             (PoolIdentifier::PoolId(id), Protocol::UniswapV4) => {
                 read_v4_slot0(provider, UNISWAP_V4_POOL_MANAGER, id)
             }
-            (PoolIdentifier::PoolId(id), Protocol::Ekubo) => read_ekubo_state(provider, EKUBO_CORE, id),
+            (PoolIdentifier::PoolId(id), Protocol::Ekubo) => {
+                read_ekubo_state(provider, EKUBO_CORE, id)
+            }
             _ => continue,
         };
 
@@ -638,10 +874,10 @@ fn send_slot0_overrides<P: StateProviderFactory>(
         let update_msg = PoolUpdateMessage {
             pool_id: pool_id.clone(),
             protocol: *protocol,
-            update_type: UpdateType::Swap,
+            update_type: UpdateType::Swap, // Reuses swap path in arena
             block_number,
             block_timestamp,
-            tx_index: u64::MAX,
+            tx_index: u64::MAX, // Sentinel: synthetic override, not from a real tx
             log_index: u64::MAX,
             is_revert: false,
             update: PoolUpdate::Slot0Override {
@@ -672,6 +908,34 @@ fn record_affected_slot0_pool(
     if dominated_by_slot0 {
         affected.insert((event.pool_id.clone(), event.protocol));
     }
+}
+
+/// Compatibility bridge for the legacy `ReorgComplete.slot0_resync_required` field.
+///
+/// We still emit explicit `Slot0Override` updates, but keep this list populated so
+/// consumers expecting the main ExEx schema continue to work.
+fn build_slot0_resync_required(
+    affected: &HashSet<(PoolIdentifier, Protocol)>,
+) -> Vec<PoolIdentifier> {
+    let mut ids: Vec<PoolIdentifier> = affected
+        .iter()
+        .filter_map(|(pool_id, protocol)| {
+            matches!(protocol, Protocol::UniswapV3 | Protocol::UniswapV4 | Protocol::Ekubo)
+                .then_some(pool_id.clone())
+        })
+        .collect();
+
+    ids.sort_by_key(|id| match id {
+        PoolIdentifier::Address(addr) => format!("a:{}", hex::encode(addr)),
+        PoolIdentifier::PoolId(pid) => format!("p:{}", hex::encode(pid)),
+    });
+    ids.dedup_by(|a, b| std::mem::discriminant(a) == std::mem::discriminant(b) && match (a, b) {
+        (PoolIdentifier::Address(a1), PoolIdentifier::Address(a2)) => a1 == a2,
+        (PoolIdentifier::PoolId(p1), PoolIdentifier::PoolId(p2)) => p1 == p2,
+        _ => false,
+    });
+
+    ids
 }
 
 /// Main ExEx entry point
@@ -779,11 +1043,17 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     new.blocks().len()
                 );
 
-                // Process each block with block boundaries
-                for (block, receipts) in new.blocks_and_receipts() {
+                // Process each block with block boundaries.
+                // Storage enrichment (`D` for Curve crypto pools) is only applied on
+                // the final block in the notification batch. Consumers only read after
+                // arena processing completes, so per-intermediate-block `D` accuracy
+                // is intentionally skipped to reduce state reads.
+                let total_new_blocks = new.blocks().len();
+                for (block_idx, (block, receipts)) in new.blocks_and_receipts().enumerate() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
                     let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
+                    let enrich_storage_for_block = block_idx + 1 == total_new_blocks;
 
                     // 🔒 Begin block - lock whitelist updates until block completes
                     {
@@ -833,7 +1103,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
 
                             // Create and send update
-                            if let Some(update_msg) = exex.create_pool_update(
+                            if let Some(mut update_msg) = exex.create_pool_update(
                                 decoded_event,
                                 block_number,
                                 block_timestamp,
@@ -842,6 +1112,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
+                                if enrich_storage_for_block {
+                                    enrich_with_storage(&mut update_msg, ctx.provider());
+                                }
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -916,7 +1189,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                 exex.send_reorg_start(&mut stream_seq, old_range.clone(), new_range.clone());
 
-                let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
                 let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
 
                 // Step 1: Revert old blocks
@@ -979,10 +1251,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                     &update_msg,
                                     &mut affected_slot0_pools,
                                 );
-                                maybe_record_slot0_resync_pool(
-                                    &update_msg,
-                                    &mut slot0_resync_required,
-                                );
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -1008,12 +1276,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
                 }
 
-                // Step 2: Process new blocks
+                // Step 2: Process new blocks.
+                // Same policy as ChainCommitted: only enrich storage-derived fields
+                // on the final block in this batch.
                 info!("Step 2: Processing {} new blocks", new.blocks().len());
-                for (block, receipts) in new.blocks_and_receipts() {
+                let total_new_blocks = new.blocks().len();
+                for (block_idx, (block, receipts)) in new.blocks_and_receipts().enumerate() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
                     let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
+                    let enrich_storage_for_block = block_idx + 1 == total_new_blocks;
 
                     // 🔒 Begin block
                     {
@@ -1055,7 +1327,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
 
                             // Create and send update
-                            if let Some(update_msg) = exex.create_pool_update(
+                            if let Some(mut update_msg) = exex.create_pool_update(
                                 decoded_event,
                                 block_number,
                                 block_timestamp,
@@ -1064,6 +1336,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
+                                if enrich_storage_for_block {
+                                    enrich_with_storage(&mut update_msg, ctx.provider());
+                                }
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -1092,6 +1367,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     exex.blocks_processed += 1;
                 }
 
+                // Send definitive slot0 overrides from latest() state
                 send_slot0_overrides(
                     ctx.provider(),
                     &affected_slot0_pools,
@@ -1100,9 +1376,12 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     final_tip_block,
                     new.blocks().values().last().map(|b| b.timestamp()).unwrap_or(0),
                 );
-
-                sort_pool_identifiers_deterministically(&mut slot0_resync_required);
-                exex.send_reorg_complete(&mut stream_seq, final_tip_block, slot0_resync_required);
+                let slot0_resync_required = build_slot0_resync_required(&affected_slot0_pools);
+                exex.send_reorg_complete(
+                    &mut stream_seq,
+                    final_tip_block,
+                    slot0_resync_required,
+                );
 
                 info!("✅ Reorg handled successfully");
             }
@@ -1129,7 +1408,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     },
                 );
 
-                let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
                 let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
 
                 for (block, receipts) in old.blocks_and_receipts() {
@@ -1185,10 +1463,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                     &update_msg,
                                     &mut affected_slot0_pools,
                                 );
-                                maybe_record_slot0_resync_pool(
-                                    &update_msg,
-                                    &mut slot0_resync_required,
-                                );
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -1214,17 +1488,21 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
                 }
 
+                // Send definitive slot0 overrides from latest() state
                 send_slot0_overrides(
                     ctx.provider(),
                     &affected_slot0_pools,
                     &exex,
                     &mut stream_seq,
                     final_tip_block,
-                    0,
+                    0, // No new blocks in ChainReverted
                 );
-
-                sort_pool_identifiers_deterministically(&mut slot0_resync_required);
-                exex.send_reorg_complete(&mut stream_seq, final_tip_block, slot0_resync_required);
+                let slot0_resync_required = build_slot0_resync_required(&affected_slot0_pools);
+                exex.send_reorg_complete(
+                    &mut stream_seq,
+                    final_tip_block,
+                    slot0_resync_required,
+                );
 
                 info!("✅ Revert handled successfully");
             }
@@ -1238,52 +1516,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
     }
 
     Ok(())
-}
-
-fn maybe_record_slot0_resync_pool(
-    update: &PoolUpdateMessage,
-    slot0_resync_required: &mut Vec<PoolIdentifier>,
-) {
-    if !update.is_revert {
-        return;
-    }
-
-    let needs_resync = matches!(
-        update.update,
-        PoolUpdate::V3Swap { .. } | PoolUpdate::V4Swap { .. } | PoolUpdate::EkuboSwap { .. }
-    );
-
-    if !needs_resync {
-        return;
-    }
-
-    if slot0_resync_required
-        .iter()
-        .any(|existing| pool_identifier_eq(existing, &update.pool_id))
-    {
-        return;
-    }
-
-    slot0_resync_required.push(update.pool_id.clone());
-}
-
-fn pool_identifier_eq(lhs: &PoolIdentifier, rhs: &PoolIdentifier) -> bool {
-    match (lhs, rhs) {
-        (PoolIdentifier::Address(a), PoolIdentifier::Address(b)) => a == b,
-        (PoolIdentifier::PoolId(a), PoolIdentifier::PoolId(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn sort_pool_identifiers_deterministically(pool_ids: &mut [PoolIdentifier]) {
-    pool_ids.sort_by_key(pool_identifier_sort_key);
-}
-
-fn pool_identifier_sort_key(pool_id: &PoolIdentifier) -> String {
-    match pool_id {
-        PoolIdentifier::Address(addr) => format!("a:{}", hex::encode(addr.0)),
-        PoolIdentifier::PoolId(id) => format!("p:{}", hex::encode(id)),
-    }
 }
 
 #[inline]
