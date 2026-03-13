@@ -19,16 +19,18 @@ mod transfers;
 mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
-use alloy_primitives::{I256, U256};
+use alloy_primitives::{Address, I256, U256};
 use events::{decode_log, DecodedEvent};
 use nats_client::WhitelistNatsClient;
 // Removed: use eyre::Result; (unused import)
 use futures::{StreamExt, TryStreamExt};
 use pool_tracker::PoolTracker;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
+use reth::providers::StateProviderFactory;
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
 use socket::PoolUpdateSocketServer;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -351,6 +353,7 @@ impl LiquidityExEx {
         stream_seq: &mut u64,
         block_number: u64,
         block_timestamp: u64,
+        base_fee_per_gas: u64,
         is_revert: bool,
     ) {
         let seq = next_stream_seq(stream_seq);
@@ -358,6 +361,7 @@ impl LiquidityExEx {
             stream_seq: seq,
             block_number,
             block_timestamp,
+            base_fee_per_gas,
             is_revert,
         }) {
             warn!("Failed to send BeginBlock: {}", e);
@@ -472,6 +476,204 @@ impl LiquidityExEx {
     }
 }
 
+/// Read a single storage slot from latest state.
+///
+/// Returns `U256::ZERO` if the slot is empty or the read fails.
+fn read_storage_slot<P: StateProviderFactory>(
+    provider: &P,
+    address: Address,
+    slot: U256,
+) -> U256 {
+    use alloy_primitives::B256;
+
+    let slot_key: B256 = B256::from(slot);
+    match provider.latest() {
+        Ok(state) => match state.storage(address, slot_key.into()) {
+            Ok(Some(value)) => value,
+            Ok(None) => U256::ZERO,
+            Err(e) => {
+                warn!("Failed to read storage slot {} for {:?}: {}", slot, address, e);
+                U256::ZERO
+            }
+        },
+        Err(e) => {
+            warn!("Failed to get latest state provider: {}", e);
+            U256::ZERO
+        }
+    }
+}
+
+/// V3 storage slots.
+const V3_SLOT0: U256 = U256::from_limbs([0, 0, 0, 0]);
+const V3_LIQUIDITY: U256 = U256::from_limbs([4, 0, 0, 0]);
+
+/// V4 PoolManager mapping slot (pools mapping at slot 6).
+const V4_POOLS_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+
+/// Decode V3/V4 packed slot0: sqrtPriceX96 (bits 0-159), tick (bits 160-183, signed int24).
+fn decode_slot0_packed(value: U256) -> (U256, i32) {
+    let sqrt_price_mask = (U256::from(1u128) << 160) - U256::from(1u128);
+    let sqrt_price_x96 = value & sqrt_price_mask;
+
+    let tick_u256: U256 = (value >> 160) & U256::from(0xFFFFFFu32);
+    let tick_raw: u32 = tick_u256.to();
+    let tick = if tick_raw & 0x800000 != 0 {
+        (tick_raw | 0xFF000000) as i32
+    } else {
+        tick_raw as i32
+    };
+
+    (sqrt_price_x96, tick)
+}
+
+/// Decode Ekubo packed state: sqrtRatio (bits 0-95), tick (bits 96-127), liquidity (bits 128-255).
+fn decode_ekubo_state_packed(value: U256) -> (U256, i32, u128) {
+    let bytes = value.to_be_bytes::<32>();
+
+    let sqrt_ratio = {
+        let mut buf = [0u8; 16];
+        buf[4..16].copy_from_slice(&bytes[0..12]);
+        U256::from(u128::from_be_bytes(buf))
+    };
+    let tick = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let liquidity = u128::from_be_bytes({
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&bytes[16..32]);
+        buf
+    });
+
+    (sqrt_ratio, tick, liquidity)
+}
+
+/// Compute V4 pool base slot: keccak256(abi.encode(poolId, 6)).
+fn v4_pool_base_slot(pool_id: &[u8; 32]) -> U256 {
+    use alloy_primitives::{B256, keccak256};
+    use alloy_sol_types::SolValue;
+
+    let encoded = (B256::from_slice(pool_id), V4_POOLS_SLOT).abi_encode();
+    U256::from_be_bytes(*keccak256(&encoded))
+}
+
+/// Read slot0 override for a V3 pool from latest state.
+fn read_v3_slot0<P: StateProviderFactory>(
+    provider: &P,
+    address: Address,
+) -> Option<(U256, i32, u128)> {
+    let slot0_raw = read_storage_slot(provider, address, V3_SLOT0);
+    if slot0_raw.is_zero() {
+        return None;
+    }
+    let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
+    let liquidity_raw = read_storage_slot(provider, address, V3_LIQUIDITY);
+    let liquidity = liquidity_raw.to::<u128>();
+    Some((sqrt_price_x96, tick, liquidity))
+}
+
+/// Read slot0 override for a V4 pool from latest state.
+fn read_v4_slot0<P: StateProviderFactory>(
+    provider: &P,
+    pool_manager: Address,
+    pool_id: &[u8; 32],
+) -> Option<(U256, i32, u128)> {
+    let base = v4_pool_base_slot(pool_id);
+    let slot0_key = U256::from_be_bytes(base.to_be_bytes::<32>());
+    let liquidity_key = slot0_key + U256::from(3);
+
+    let slot0_raw = read_storage_slot(provider, pool_manager, slot0_key);
+    if slot0_raw.is_zero() {
+        return None;
+    }
+    let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
+    let liquidity_raw = read_storage_slot(provider, pool_manager, liquidity_key);
+    let liquidity = liquidity_raw.to::<u128>();
+    Some((sqrt_price_x96, tick, liquidity))
+}
+
+/// Read state for an Ekubo pool from latest state.
+fn read_ekubo_state<P: StateProviderFactory>(
+    provider: &P,
+    ekubo_core: Address,
+    pool_id: &[u8; 32],
+) -> Option<(U256, i32, u128)> {
+    use alloy_primitives::B256;
+
+    let state_slot = U256::from_be_bytes(*B256::from_slice(pool_id));
+    let state_raw = read_storage_slot(provider, ekubo_core, state_slot);
+    if state_raw.is_zero() {
+        return None;
+    }
+    let (sqrt_ratio, tick, liquidity) = decode_ekubo_state_packed(state_raw);
+    Some((sqrt_ratio, tick, liquidity))
+}
+
+/// Send Slot0Override messages for all affected pools after a reorg.
+fn send_slot0_overrides<P: StateProviderFactory>(
+    provider: &P,
+    affected_pools: &HashSet<(PoolIdentifier, Protocol)>,
+    exex: &LiquidityExEx,
+    stream_seq: &mut u64,
+    block_number: u64,
+    block_timestamp: u64,
+) {
+    use events::EKUBO_CORE;
+    use pool_tracker::UNISWAP_V4_POOL_MANAGER;
+
+    let mut overrides_sent = 0u32;
+
+    for (pool_id, protocol) in affected_pools {
+        let slot0 = match (pool_id, protocol) {
+            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => read_v3_slot0(provider, *addr),
+            (PoolIdentifier::PoolId(id), Protocol::UniswapV4) => {
+                read_v4_slot0(provider, UNISWAP_V4_POOL_MANAGER, id)
+            }
+            (PoolIdentifier::PoolId(id), Protocol::Ekubo) => read_ekubo_state(provider, EKUBO_CORE, id),
+            _ => continue,
+        };
+
+        let Some((sqrt_price_x96, tick, liquidity)) = slot0 else {
+            warn!("Failed to read slot0 for {:?} during reorg override", pool_id);
+            continue;
+        };
+
+        let update_msg = PoolUpdateMessage {
+            pool_id: pool_id.clone(),
+            protocol: *protocol,
+            update_type: UpdateType::Swap,
+            block_number,
+            block_timestamp,
+            tx_index: u64::MAX,
+            log_index: u64::MAX,
+            is_revert: false,
+            update: PoolUpdate::Slot0Override {
+                sqrt_price_x96,
+                liquidity,
+                tick,
+            },
+        };
+
+        exex.send_pool_update(stream_seq, update_msg);
+        overrides_sent += 1;
+    }
+
+    if overrides_sent > 0 {
+        info!("Sent {} slot0 overrides after reorg", overrides_sent);
+    }
+}
+
+/// Record a V3/V4/Ekubo swap pool affected by a reorg (for slot0 override).
+fn record_affected_slot0_pool(
+    event: &PoolUpdateMessage,
+    affected: &mut HashSet<(PoolIdentifier, Protocol)>,
+) {
+    let dominated_by_slot0 = matches!(
+        event.update,
+        PoolUpdate::V3Swap { .. } | PoolUpdate::V4Swap { .. } | PoolUpdate::EkuboSwap { .. }
+    );
+    if dominated_by_slot0 {
+        affected.insert((event.pool_id.clone(), event.protocol));
+    }
+}
+
 /// Main ExEx entry point
 async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
     info!("🚀 Liquidity ExEx starting");
@@ -581,6 +783,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
+                    let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
 
                     // 🔒 Begin block - lock whitelist updates until block completes
                     {
@@ -588,7 +791,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, false);
+                    exex.send_begin_block(
+                        &mut stream_seq,
+                        block_number,
+                        block_timestamp,
+                        base_fee_per_gas,
+                        false,
+                    );
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
@@ -708,12 +917,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 exex.send_reorg_start(&mut stream_seq, old_range.clone(), new_range.clone());
 
                 let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
+                let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
 
                 // Step 1: Revert old blocks
                 info!("Step 1: Reverting {} old blocks", old.blocks().len());
                 for (block, receipts) in old.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
+                    let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
 
                     // 🔒 Begin block
                     {
@@ -721,7 +932,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, true);
+                    exex.send_begin_block(
+                        &mut stream_seq,
+                        block_number,
+                        block_timestamp,
+                        base_fee_per_gas,
+                        true,
+                    );
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_reverted = 0;
@@ -758,6 +975,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 true,
                                 &pool_tracker,
                             ) {
+                                record_affected_slot0_pool(
+                                    &update_msg,
+                                    &mut affected_slot0_pools,
+                                );
                                 maybe_record_slot0_resync_pool(
                                     &update_msg,
                                     &mut slot0_resync_required,
@@ -792,6 +1013,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
+                    let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
 
                     // 🔒 Begin block
                     {
@@ -799,7 +1021,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, false);
+                    exex.send_begin_block(
+                        &mut stream_seq,
+                        block_number,
+                        block_timestamp,
+                        base_fee_per_gas,
+                        false,
+                    );
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
@@ -864,6 +1092,15 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     exex.blocks_processed += 1;
                 }
 
+                send_slot0_overrides(
+                    ctx.provider(),
+                    &affected_slot0_pools,
+                    &exex,
+                    &mut stream_seq,
+                    final_tip_block,
+                    new.blocks().values().last().map(|b| b.timestamp()).unwrap_or(0),
+                );
+
                 sort_pool_identifiers_deterministically(&mut slot0_resync_required);
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block, slot0_resync_required);
 
@@ -893,10 +1130,12 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 );
 
                 let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
+                let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
 
                 for (block, receipts) in old.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
+                    let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
 
                     // 🔒 Begin block
                     {
@@ -904,7 +1143,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         pool_tracker.begin_block();
                     }
 
-                    exex.send_begin_block(&mut stream_seq, block_number, block_timestamp, true);
+                    exex.send_begin_block(
+                        &mut stream_seq,
+                        block_number,
+                        block_timestamp,
+                        base_fee_per_gas,
+                        true,
+                    );
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_reverted = 0;
@@ -936,6 +1181,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 true,
                                 &pool_tracker,
                             ) {
+                                record_affected_slot0_pool(
+                                    &update_msg,
+                                    &mut affected_slot0_pools,
+                                );
                                 maybe_record_slot0_resync_pool(
                                     &update_msg,
                                     &mut slot0_resync_required,
@@ -964,6 +1213,15 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         );
                     }
                 }
+
+                send_slot0_overrides(
+                    ctx.provider(),
+                    &affected_slot0_pools,
+                    &exex,
+                    &mut stream_seq,
+                    final_tip_block,
+                    0,
+                );
 
                 sort_pool_identifiers_deterministically(&mut slot0_resync_required);
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block, slot0_resync_required);

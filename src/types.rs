@@ -34,7 +34,7 @@ pub struct PoolUpdateMessage {
 }
 
 /// Pool identifier - can be address (V2/V3) or bytes32 (V4)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PoolIdentifier {
     Address(Address),
     PoolId([u8; 32]), // V4 uses bytes32 poolId
@@ -57,7 +57,7 @@ impl PoolIdentifier {
 }
 
 /// Protocol type
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Protocol {
     UniswapV2,
     UniswapV3,
@@ -135,6 +135,16 @@ pub enum PoolUpdate {
         liquidity: u128,
         tick: i32,
     },
+
+    /// Definitive slot0 state read from storage after a reorg.
+    ///
+    /// Emitted as a synthetic update after reorg processing so consumers can
+    /// update pool state without active on-demand rescrapes.
+    Slot0Override {
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
+    },
 }
 
 /// Pool metadata from whitelist
@@ -180,6 +190,8 @@ pub enum ControlMessage {
         stream_seq: u64,
         block_number: u64,
         block_timestamp: u64,
+        /// EIP-1559 base fee in wei. Always present post-London.
+        base_fee_per_gas: u64,
         /// If true, this block's events are reverts (from ChainReorged or ChainReverted)
         is_revert: bool,
     },
@@ -262,6 +274,7 @@ mod tests {
             stream_seq: 42,
             block_number: 1000,
             block_timestamp: 123,
+            base_fee_per_gas: 1_000_000_000,
             is_revert: false,
         };
 
