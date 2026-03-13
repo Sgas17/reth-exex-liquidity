@@ -39,14 +39,15 @@ const X33: u128 = 0x1FFFFFFFF;
 const X40: u128 = 0xFF_FFFFFFFF;
 const X64: u128 = 0xFFFFFFFF_FFFFFFFF;
 
-// LiquiditySlotsLink bit positions for exchange price slot
-const BITS_EXCHANGE_PRICES_SUPPLY_EXCHANGE_PRICE: u32 = 0;
-const BITS_EXCHANGE_PRICES_BORROW_EXCHANGE_PRICE: u32 = 64;
-const BITS_EXCHANGE_PRICES_SUPPLY_RATIO: u32 = 128;
-const BITS_EXCHANGE_PRICES_BORROW_RATIO: u32 = 143;
-const BITS_EXCHANGE_PRICES_LAST_TIMESTAMP: u32 = 158;
-const BITS_EXCHANGE_PRICES_FEE: u32 = 191;
-const BITS_EXCHANGE_PRICES_UTILIZATION: u32 = 205;
+// LiquiditySlotsLink bit positions for exchangePricesAndConfig slot
+const BITS_EXCHANGE_PRICES_BORROW_RATE: u32 = 0;        // 16 bits
+const BITS_EXCHANGE_PRICES_FEE: u32 = 16;               // 14 bits
+const BITS_EXCHANGE_PRICES_UTILIZATION: u32 = 30;        // 14 bits
+const BITS_EXCHANGE_PRICES_LAST_TIMESTAMP: u32 = 58;     // 33 bits
+const BITS_EXCHANGE_PRICES_SUPPLY_EXCHANGE_PRICE: u32 = 91;  // 64 bits
+const BITS_EXCHANGE_PRICES_BORROW_EXCHANGE_PRICE: u32 = 155; // 64 bits
+const BITS_EXCHANGE_PRICES_SUPPLY_RATIO: u32 = 219;      // 15 bits
+const BITS_EXCHANGE_PRICES_BORROW_RATIO: u32 = 234;      // 15 bits
 
 // LiquiditySlotsLink bit positions for user supply/borrow
 const BITS_USER_SUPPLY_AMOUNT: u32 = 1; // starts at bit 1 (bit 0 is interest mode flag)
@@ -181,7 +182,7 @@ pub fn calc_exchange_prices(
         return (supply_exchange_price, borrow_exchange_price);
     }
 
-    let borrow_rate = extract_u128(exchange_prices_and_config, 0, X16); // bits 0..15
+    let borrow_rate = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_BORROW_RATE, X16);
 
     let last_timestamp = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_LAST_TIMESTAMP, X33);
     let seconds_since = (current_timestamp as u128).saturating_sub(last_timestamp);
@@ -608,10 +609,7 @@ mod tests {
     /// Storage slots captured from mainnet. Expected values from
     /// `DexReservesResolver.getPoolReservesAdjusted(0x0B1a...C9e7)`.
     ///
-    /// Currently ignored: magnitude mismatch in intermediate values needs
-    /// debugging against Solidity with known-good intermediates.
     #[test]
-    #[ignore = "WIP: magnitude calibration against on-chain values"]
     fn test_decode_pool1_wsteth_eth() {
         let slots = FluidStorageSlots {
             dex_variables: U256::from_str_radix(
