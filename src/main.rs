@@ -19,7 +19,7 @@ mod transfers;
 mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
-use alloy_primitives::{I256, U256};
+use alloy_primitives::{Address, I256, U256};
 use events::{decode_log, DecodedEvent};
 use nats_client::WhitelistNatsClient;
 // Removed: use eyre::Result; (unused import)
@@ -28,6 +28,7 @@ use pool_tracker::PoolTracker;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
+use reth_provider::StateProviderFactory;
 use socket::PoolUpdateSocketServer;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -455,6 +456,7 @@ impl LiquidityExEx {
                     bought_id,
                     tokens_bought,
                     packed_price_scale,
+                    d: U256::ZERO, // Enriched from storage after creation
                 },
             }),
 
@@ -678,6 +680,57 @@ impl LiquidityExEx {
     }
 }
 
+/// Curve pool storage slot for D (TwoCrypto slot 14, Tricrypto slot 14).
+const CURVE_D_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
+
+/// Read a single storage slot from the state at a given block.
+///
+/// Returns `U256::ZERO` if the slot is empty or the read fails.
+fn read_storage_slot<P: StateProviderFactory>(
+    provider: &P,
+    block_number: u64,
+    address: Address,
+    slot: U256,
+) -> U256 {
+    use alloy_primitives::B256;
+    use reth_provider::StateProvider;
+    let slot_key: B256 = B256::from(slot);
+    match provider.history_by_block_number(block_number) {
+        Ok(state) => match state.storage(address, slot_key.into()) {
+            Ok(Some(value)) => value,
+            Ok(None) => U256::ZERO,
+            Err(e) => {
+                warn!("Failed to read storage slot {} for {:?} at block {}: {}", slot, address, block_number, e);
+                U256::ZERO
+            }
+        },
+        Err(e) => {
+            warn!("Failed to get state provider at block {}: {}", block_number, e);
+            U256::ZERO
+        }
+    }
+}
+
+/// Enrich a pool update message with storage-derived fields.
+///
+/// For Curve TwoCrypto/Tricrypto swap events, reads D from storage (slot 14)
+/// to avoid newton_D recomputation on the arena side.
+fn enrich_with_storage<P: StateProviderFactory>(
+    msg: &mut PoolUpdateMessage,
+    provider: &P,
+    block_number: u64,
+) {
+    match &mut msg.update {
+        PoolUpdate::TwoCryptoSwap { d, .. } => {
+            if let Some(address) = msg.pool_id.as_address() {
+                *d = read_storage_slot(provider, block_number, address, CURVE_D_SLOT);
+            }
+        }
+        // Future: PoolUpdate::TricryptoSwap { d, .. } => { ... }
+        _ => {}
+    }
+}
+
 /// Main ExEx entry point
 async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
     info!("🚀 Liquidity ExEx starting");
@@ -830,7 +883,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
 
                             // Create and send update
-                            if let Some(update_msg) = exex.create_pool_update(
+                            if let Some(mut update_msg) = exex.create_pool_update(
                                 decoded_event,
                                 block_number,
                                 block_timestamp,
@@ -839,6 +892,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
+                                enrich_with_storage(&mut update_msg, ctx.provider(), block_number);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -1033,7 +1087,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
 
                             // Create and send update
-                            if let Some(update_msg) = exex.create_pool_update(
+                            if let Some(mut update_msg) = exex.create_pool_update(
                                 decoded_event,
                                 block_number,
                                 block_timestamp,
@@ -1042,6 +1096,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 false,
                                 &pool_tracker,
                             ) {
+                                enrich_with_storage(&mut update_msg, ctx.provider(), block_number);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;

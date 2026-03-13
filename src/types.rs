@@ -172,12 +172,15 @@ pub enum PoolUpdate {
     /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
     /// sends `tokens_bought` of coin[bought_id].
     /// `packed_price_scale` carries the updated price_scale from the event.
+    /// `d` is read from pool storage (slot 14) after the swap — avoids
+    /// newton_D recomputation on the arena side.
     TwoCryptoSwap {
         sold_id: u8,
         tokens_sold: u128,
         bought_id: u8,
         tokens_bought: u128,
         packed_price_scale: U256,
+        d: U256,
     },
 
     /// Curve TwoCryptoNG liquidity event (AddLiquidity / RemoveLiquidity / etc).
