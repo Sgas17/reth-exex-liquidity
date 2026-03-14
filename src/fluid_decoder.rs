@@ -1027,4 +1027,150 @@ mod tests {
             expected
         );
     }
+
+    // ── RPC helpers for integration tests ────────────────────────────────
+
+    async fn rpc_request(rpc_url: &str, body: &serde_json::Value) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body_str = body.to_string();
+        let stripped = rpc_url.trim_start_matches("http://").trim_start_matches("https://");
+        let (host_port, path) = stripped.split_once('/').unwrap_or((stripped, ""));
+        let path = if path.is_empty() { "/" } else { &format!("/{path}") };
+        let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8545"));
+        let port: u16 = port_str.parse().unwrap_or(8545);
+        let mut stream = tokio::net::TcpStream::connect(format!("{host}:{port}")).await.unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+            body_str.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        let json_start = response_str.find('{').expect("no JSON in response");
+        let json_body: serde_json::Value = serde_json::from_str(&response_str[json_start..]).unwrap();
+        let result_hex = json_body["result"].as_str().unwrap_or_else(|| panic!("RPC error: {json_body}"));
+        hex::decode(result_hex.trim_start_matches("0x")).unwrap()
+    }
+
+    async fn rpc_pause() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    async fn get_storage_at(rpc_url: &str, addr: Address, slot: U256, block: u64) -> U256 {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getStorageAt",
+            "params": [format!("{addr:?}"), format!("0x{slot:x}"), format!("0x{block:x}")],
+            "id": 1
+        });
+        let bytes = rpc_request(rpc_url, &body).await;
+        U256::from_be_slice(&bytes)
+    }
+
+    async fn eth_call_at(rpc_url: &str, to: Address, calldata: &[u8], block: u64) -> Vec<u8> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": format!("{to:?}"), "data": format!("0x{}", hex::encode(calldata))}, format!("0x{block:x}")],
+            "id": 1
+        });
+        rpc_request(rpc_url, &body).await
+    }
+
+    /// End-to-end validation: decode reserves from raw storage slots and compare
+    /// against the pool's `getCollateralReserves()` at the same block.
+    ///
+    /// Uses pool 5 (USDC/ETH) which has gm < 1e27 (no inversion branch).
+    /// Pool 1 (wstETH/ETH) uses an oracle center price hook which our decoder
+    /// approximates from storage, so it's tested separately with wider tolerance.
+    #[tokio::test]
+    #[ignore = "requires local reth node on localhost:8545"]
+    async fn test_decoder_vs_pool_e2e() {
+        use alloy_sol_types::{SolCall as _, SolValue};
+
+        let rpc = "http://localhost:8545";
+        let block: u64 = 24657500;
+        let timestamp: u64 = 1773512747;
+
+        // Pool 5: USDC/ETH — gm < 1e27, no inversion, no oracle hook
+        let pool_addr = Address::from_slice(
+            &hex::decode("2886a01a0645390872a9eb99dAe1283664b0c524").unwrap(),
+        );
+        let config = FluidPoolConfig::resolve(pool_addr, rpc).await.unwrap();
+        rpc_pause().await;
+
+        // Read 8 storage slots at block
+        let reads = config.storage_reads();
+        let mut values = [U256::ZERO; 8];
+        for (i, (addr, slot)) in reads.iter().enumerate() {
+            values[i] = get_storage_at(rpc, *addr, *slot, block).await;
+            rpc_pause().await;
+        }
+        let slots = config.to_storage_slots(&values);
+
+        // Decode via our Rust implementation
+        let decoded = decode_fluid_reserves(&slots, &config, timestamp)
+            .expect("decoder should succeed for pool 5");
+
+        // Call pool's getCollateralReserves() directly at same block.
+        // We need to first get prices+exchange prices via getPricesAndExchangePrices().
+        // The pool reverts with the data — but we can't catch reverts via raw eth_call.
+        // Instead, use the resolver's getDexCollateralReserves which calls the pool.
+        //
+        // The resolver scales output by denomPrec/numPrec. We undo that scaling.
+        sol! {
+            struct ColReserves {
+                uint256 token0RealReserves;
+                uint256 token1RealReserves;
+                uint256 token0ImaginaryReserves;
+                uint256 token1ImaginaryReserves;
+            }
+        }
+
+        // Call pool's getCollateralReserves directly would require getting
+        // exchange prices first, which requires a try/catch. Use the resolver
+        // getDexCollateralReserves() instead, which handles this internally.
+        // Note: resolver output is scaled by precision. We compare scaled values.
+        let resolver = Address::from_slice(
+            &hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap(),
+        );
+        rpc_pause().await;
+        // getDexCollateralReserves(address) selector
+        let mut calldata = hex::decode("957755e6").unwrap();
+        calldata.extend_from_slice(&[0u8; 12]); // pad address to 32 bytes
+        calldata.extend_from_slice(pool_addr.as_slice());
+        let return_bytes = eth_call_at(rpc, resolver, &calldata, block).await;
+        let onchain = ColReserves::abi_decode(&return_bytes)
+            .expect("ABI decode should succeed");
+
+        let u = |v: U256| -> u128 { v.to::<u128>() };
+        // The resolver scales pool output by denom/num to get token-native amounts.
+        // Our decoder keeps the internal scale (with num/denom applied).
+        // To compare: scale on-chain values UP by num/denom to match our decoder.
+        let n0 = config.token0_numerator_precision;
+        let d0 = config.token0_denominator_precision;
+        let n1 = config.token1_numerator_precision;
+        let d1 = config.token1_denominator_precision;
+        let rescale = |onchain_val: u128, num: u128, denom: u128| -> u128 {
+            onchain_val * num / denom
+        };
+
+        println!("=== Pool 5 (USDC/ETH) ===");
+        println!("  col.t0_real  on-chain: {} → rescaled: {}", onchain.token0RealReserves, rescale(u(onchain.token0RealReserves), n0, d0));
+        println!("  col.t0_real  decoder:  {}", decoded.col_token0_real_reserves);
+        println!("  col.t1_real  on-chain: {} → rescaled: {}", onchain.token1RealReserves, rescale(u(onchain.token1RealReserves), n1, d1));
+        println!("  col.t1_real  decoder:  {}", decoded.col_token1_real_reserves);
+        println!("  col.t0_imag  on-chain: {} → rescaled: {}", onchain.token0ImaginaryReserves, rescale(u(onchain.token0ImaginaryReserves), n0, d0));
+        println!("  col.t0_imag  decoder:  {}", decoded.col_token0_imaginary_reserves);
+        println!("  col.t1_imag  on-chain: {} → rescaled: {}", onchain.token1ImaginaryReserves, rescale(u(onchain.token1ImaginaryReserves), n1, d1));
+        println!("  col.t1_imag  decoder:  {}", decoded.col_token1_imaginary_reserves);
+
+        check_within_pct(decoded.col_token0_real_reserves, rescale(u(onchain.token0RealReserves), n0, d0), 1, "col_t0_real");
+        check_within_pct(decoded.col_token1_real_reserves, rescale(u(onchain.token1RealReserves), n1, d1), 1, "col_t1_real");
+        check_within_pct(decoded.col_token0_imaginary_reserves, rescale(u(onchain.token0ImaginaryReserves), n0, d0), 1, "col_t0_imag");
+        check_within_pct(decoded.col_token1_imaginary_reserves, rescale(u(onchain.token1ImaginaryReserves), n1, d1), 1, "col_t1_imag");
+
+        println!("\n✅ Pool 5 collateral reserves match within 1%");
+    }
 }
