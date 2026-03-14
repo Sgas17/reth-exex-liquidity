@@ -63,18 +63,18 @@ Rough per-block cost assuming typical event counts:
 
 If latency becomes a problem, in priority order:
 
-1. **Skip unchanged pools**: Only decode Fluid pools that emitted
-   `LogOperate` in the current block. Already planned.
-2. **Batch socket writes**: Coalesce all updates into a single
+1. **Batch socket writes**: Coalesce all updates into a single
    `write_all` per block instead of per-event.
-3. **Precompute slot addresses**: Cache the 8 Liquidity Layer slot
-   addresses per pool at registration time (already in `FluidPoolConfig`).
-4. **Drop low-value protocols**: If a protocol's pools rarely produce
+2. **Drop low-value protocols**: If a protocol's pools rarely produce
    profitable arbs, remove it from the whitelist to skip its events entirely.
-5. **Parallel decode**: Fluid decodes are independent per pool —
+3. **Parallel decode**: Fluid decodes are independent per pool —
    could use `rayon` if > 10 pools change in one block.
-6. **SIMD / branchless BigMath**: The `from_big_number` and `isqrt` hot
+4. **SIMD / branchless BigMath**: The `from_big_number` and `isqrt` hot
    paths could be optimized, but at 8 µs total they're not the bottleneck.
+
+> **Already baked in**: Fluid pools are only decoded when they emit
+> `LogOperate` — unchanged pools cost zero. Slot addresses are cached
+> in `FluidPoolConfig` at registration time.
 
 ---
 
