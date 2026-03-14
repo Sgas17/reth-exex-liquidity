@@ -5,6 +5,7 @@
 // 2. Block-synchronized updates - changes applied between blocks to prevent event loss
 // 3. Pending update queue - whitelist changes queued and applied atomically
 
+use crate::fluid_decoder::FluidPoolConfig;
 use crate::types::{PoolIdentifier, PoolMetadata, Protocol};
 use alloy_primitives::{address, Address};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -49,6 +50,10 @@ pub struct PoolTracker {
     /// Set of tracked pool IDs for fast lookup
     tracked_pool_ids: HashSet<[u8; 32]>,
 
+    /// Fluid pool configs — cached immutable constants from `constantsView()`.
+    /// Keyed by pool address. Populated at registration time via RPC.
+    fluid_configs: HashMap<Address, FluidPoolConfig>,
+
     /// Pending whitelist updates (applied between blocks)
     pending_updates: VecDeque<WhitelistUpdate>,
 
@@ -69,6 +74,7 @@ impl PoolTracker {
             pools_by_id: HashMap::new(),
             tracked_addresses: HashSet::new(),
             tracked_pool_ids: HashSet::new(),
+            fluid_configs: HashMap::new(),
             pending_updates: VecDeque::new(),
             in_block: false,
             v2_count: 0,
@@ -212,6 +218,11 @@ impl PoolTracker {
                     if let Some(pool) = self.pools_by_address.remove(&addr) {
                         self.tracked_addresses.remove(&addr);
 
+                        // Clean up Fluid config if applicable
+                        if pool.protocol == Protocol::Fluid {
+                            self.fluid_configs.remove(&addr);
+                        }
+
                         // Update counts
                         match pool.protocol {
                             Protocol::UniswapV2 => self.v2_count -= 1,
@@ -253,6 +264,7 @@ impl PoolTracker {
         self.pools_by_id.clear();
         self.tracked_addresses.clear();
         self.tracked_pool_ids.clear();
+        self.fluid_configs.clear();
         self.v2_count = 0;
         self.v3_count = 0;
         self.v4_count = 0;
@@ -303,6 +315,27 @@ impl PoolTracker {
             .get(address)
             .map(|p| p.protocol == Protocol::Fluid)
             .unwrap_or(false)
+    }
+
+    /// Check if a Fluid pool has its config resolved (slot addresses cached).
+    pub fn has_fluid_config(&self, address: &Address) -> bool {
+        self.fluid_configs.contains_key(address)
+    }
+
+    /// Register a Fluid pool's immutable config (slot addresses + precision).
+    /// Called once per pool at registration time after RPC resolution.
+    pub fn register_fluid_config(&mut self, config: FluidPoolConfig) {
+        info!(
+            pool = %config.pool_address,
+            liquidity = %config.liquidity_address,
+            "Registered Fluid pool config"
+        );
+        self.fluid_configs.insert(config.pool_address, config);
+    }
+
+    /// Get a Fluid pool's cached config for storage reads + decoding.
+    pub fn fluid_config(&self, pool: &Address) -> Option<&FluidPoolConfig> {
+        self.fluid_configs.get(pool)
     }
 
     /// Get statistics

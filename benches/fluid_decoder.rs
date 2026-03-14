@@ -51,7 +51,28 @@ fn pool1_slots() -> FluidStorageSlots {
 }
 
 fn pool1_config() -> FluidPoolConfig {
+    use alloy_primitives::address;
     FluidPoolConfig {
+        pool_address: address!("0B1a513ee24972DAEf112bC777a5610d4325C9e7"),
+        liquidity_address: address!("52Aa899454998Be5b000Ad077a46Bbe360F4e497"),
+        exchange_price_token0_slot: U256::from_str_radix(
+            "c24eaceff5753c99066a839532d708a8661af7a9b01d44d0cd915c53969eb725", 16,
+        ).unwrap(),
+        exchange_price_token1_slot: U256::from_str_radix(
+            "a1829a9003092132f585b6ccdd167c19fe9774dbdea4260287e8a8e8ca8185d7", 16,
+        ).unwrap(),
+        supply_token0_slot: U256::from_str_radix(
+            "a893c3ab5c5189a9bd276b29d25998250798d4f72dbb029d43e23884b0119a5a", 16,
+        ).unwrap(),
+        supply_token1_slot: U256::from_str_radix(
+            "236696efd8534ce144b358082d303ba190cad0c8d37e9f4802b2a5198019379b", 16,
+        ).unwrap(),
+        borrow_token0_slot: U256::from_str_radix(
+            "2cd14670f8a9e59d7c072449b534cc4ec6d89953cf20c518ba36d7fbdd468baf", 16,
+        ).unwrap(),
+        borrow_token1_slot: U256::from_str_radix(
+            "d943cec1dfc617bf9515058376abfab0217f98cce018735f02efd4abd3453ad8", 16,
+        ).unwrap(),
         token0_numerator_precision: 1,
         token0_denominator_precision: 1_000_000,
         token1_numerator_precision: 1,

@@ -10,6 +10,7 @@
 
 mod balance_monitor;
 mod events;
+mod fluid_decoder;
 mod nats_client;
 mod pool_creations;
 mod pool_tracker;

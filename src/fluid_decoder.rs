@@ -9,7 +9,8 @@
 //!
 //! These slot addresses are immutable constants per pool, obtained once via `constantsView()`.
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
+use alloy_sol_types::{sol, SolCall, SolValue};
 
 // ============================================================================
 // CONSTANTS (matching Solidity)
@@ -74,13 +75,159 @@ pub struct FluidReserves {
     pub fee: u128, // from dexVariables2 bits 2..18
 }
 
-/// Per-pool immutable configuration (obtained once from `constantsView()`).
+/// Per-pool immutable configuration (obtained once from `constantsView()` + `constantsView2()`).
+///
+/// All fields are constants baked into the pool's bytecode — they never change.
+/// Slot addresses point into the Liquidity Layer's storage for this specific pool.
 #[derive(Debug, Clone)]
 pub struct FluidPoolConfig {
+    /// Pool contract address (for reading slots 0 and 1).
+    pub pool_address: Address,
+    /// Liquidity Layer address (for reading exchange price / supply / borrow slots).
+    pub liquidity_address: Address,
+
+    // ── Liquidity Layer slot keys (bytes32) ──────────────────────────────
+    pub exchange_price_token0_slot: U256,
+    pub exchange_price_token1_slot: U256,
+    pub supply_token0_slot: U256,
+    pub supply_token1_slot: U256,
+    pub borrow_token0_slot: U256,
+    pub borrow_token1_slot: U256,
+
+    // ── Precision multipliers from constantsView2() ─────────────────────
     pub token0_numerator_precision: u128,
     pub token0_denominator_precision: u128,
     pub token1_numerator_precision: u128,
     pub token1_denominator_precision: u128,
+}
+
+impl FluidPoolConfig {
+    /// The 8 storage reads needed to decode reserves, as (address, slot) pairs.
+    pub fn storage_reads(&self) -> [(Address, U256); 8] {
+        [
+            (self.pool_address, U256::from(0)),                     // dexVariables
+            (self.pool_address, U256::from(1)),                     // dexVariables2
+            (self.liquidity_address, self.exchange_price_token0_slot),
+            (self.liquidity_address, self.exchange_price_token1_slot),
+            (self.liquidity_address, self.supply_token0_slot),
+            (self.liquidity_address, self.supply_token1_slot),
+            (self.liquidity_address, self.borrow_token0_slot),
+            (self.liquidity_address, self.borrow_token1_slot),
+        ]
+    }
+
+    /// Build a `FluidStorageSlots` from 8 raw U256 values (in the same order as `storage_reads()`).
+    pub fn to_storage_slots(&self, values: &[U256; 8]) -> FluidStorageSlots {
+        FluidStorageSlots {
+            dex_variables: values[0],
+            dex_variables2: values[1],
+            exchange_price_token0: values[2],
+            exchange_price_token1: values[3],
+            supply_token0: values[4],
+            supply_token1: values[5],
+            borrow_token0: values[6],
+            borrow_token1: values[7],
+        }
+    }
+}
+
+// ============================================================================
+// ABI DEFINITIONS FOR POOL CONFIG RESOLUTION
+// ============================================================================
+
+sol! {
+    /// `constantsView()` return struct from FluidDexT1.
+    /// Returns immutable pool constants including Liquidity Layer slot addresses.
+    /// Field order must match the Solidity struct exactly for ABI decoding.
+    #[derive(Debug)]
+    struct ConstantsView {
+        uint256 dexId;
+        address liquidity;
+        address factory;
+        ConstantsViewImplementations implementations;
+        address deployerContract;
+        address token0;
+        address token1;
+        bytes32 supplyToken0Slot;
+        bytes32 borrowToken0Slot;
+        bytes32 supplyToken1Slot;
+        bytes32 borrowToken1Slot;
+        bytes32 exchangePriceToken0Slot;
+        bytes32 exchangePriceToken1Slot;
+        uint256 oracleMapping;
+    }
+
+    #[derive(Debug)]
+    struct ConstantsViewImplementations {
+        address shift;
+        address admin;
+        address colOperations;
+        address debtOperations;
+        address perfectOperationsAndSwapOut;
+    }
+
+    /// `constantsView2()` return struct.
+    #[derive(Debug)]
+    struct ConstantsView2 {
+        uint256 token0NumeratorPrecision;
+        uint256 token0DenominatorPrecision;
+        uint256 token1NumeratorPrecision;
+        uint256 token1DenominatorPrecision;
+    }
+
+    /// ABI for calling `constantsView()` and `constantsView2()`.
+    #[derive(Debug)]
+    interface IFluidDexT1 {
+        function constantsView() external view returns (ConstantsView memory constantsView_);
+        function constantsView2() external view returns (ConstantsView2 memory constantsView2_);
+    }
+}
+
+/// Build `FluidPoolConfig` from raw ABI return data of `constantsView()` and `constantsView2()`.
+///
+/// Call this once per pool at registration time:
+/// ```ignore
+/// let cv_calldata = IFluidDexT1::constantsViewCall {}.abi_encode();
+/// let cv2_calldata = IFluidDexT1::constantsView2Call {}.abi_encode();
+/// // ... send calls, get return bytes ...
+/// let config = FluidPoolConfig::from_abi(pool_addr, &cv_returndata, &cv2_returndata)?;
+/// ```
+impl FluidPoolConfig {
+    /// ABI-encoded calldata for `constantsView()`.
+    pub fn constants_view_calldata() -> Vec<u8> {
+        IFluidDexT1::constantsViewCall {}.abi_encode()
+    }
+
+    /// ABI-encoded calldata for `constantsView2()`.
+    pub fn constants_view2_calldata() -> Vec<u8> {
+        IFluidDexT1::constantsView2Call {}.abi_encode()
+    }
+
+    /// Parse ABI return data from both `constantsView()` and `constantsView2()`
+    /// into a `FluidPoolConfig`.
+    pub fn from_abi(
+        pool_address: Address,
+        constants_view_returndata: &[u8],
+        constants_view2_returndata: &[u8],
+    ) -> Result<Self, alloy_sol_types::Error> {
+        let cv = ConstantsView::abi_decode(constants_view_returndata)?;
+        let cv2 = ConstantsView2::abi_decode(constants_view2_returndata)?;
+
+        Ok(Self {
+            pool_address,
+            liquidity_address: cv.liquidity,
+            exchange_price_token0_slot: U256::from_be_bytes(cv.exchangePriceToken0Slot.0),
+            exchange_price_token1_slot: U256::from_be_bytes(cv.exchangePriceToken1Slot.0),
+            supply_token0_slot: U256::from_be_bytes(cv.supplyToken0Slot.0),
+            supply_token1_slot: U256::from_be_bytes(cv.supplyToken1Slot.0),
+            borrow_token0_slot: U256::from_be_bytes(cv.borrowToken0Slot.0),
+            borrow_token1_slot: U256::from_be_bytes(cv.borrowToken1Slot.0),
+            token0_numerator_precision: u128_from_u256(cv2.token0NumeratorPrecision),
+            token0_denominator_precision: u128_from_u256(cv2.token0DenominatorPrecision),
+            token1_numerator_precision: u128_from_u256(cv2.token1NumeratorPrecision),
+            token1_denominator_precision: u128_from_u256(cv2.token1DenominatorPrecision),
+        })
+    }
 }
 
 /// Raw storage inputs needed for reserve computation.
@@ -654,12 +801,7 @@ mod tests {
             .unwrap(),
         };
 
-        let config = FluidPoolConfig {
-            token0_numerator_precision: 1,
-            token0_denominator_precision: 1_000_000,
-            token1_numerator_precision: 1,
-            token1_denominator_precision: 1_000_000,
-        };
+        let config = pool1_config();
 
         // Timestamp when slots were read (from latest block)
         let timestamp = 1773437867u64;
@@ -707,6 +849,97 @@ mod tests {
         println!("  col_t1_imag: {}", r.col_token1_imaginary_reserves);
         println!("  debt_t0_imag: {}", r.debt_token0_imaginary_reserves);
         println!("  debt_t1_imag: {}", r.debt_token1_imaginary_reserves);
+    }
+
+    /// Pool 1 (wstETH/ETH) config constructed from known constantsView() values.
+    fn pool1_config() -> FluidPoolConfig {
+        let pool = Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
+        FluidPoolConfig {
+            pool_address: pool,
+            liquidity_address: Address::from_slice(&hex::decode("52Aa899454998Be5b000Ad077a46Bbe360F4e497").unwrap()),
+            exchange_price_token0_slot: U256::from_be_bytes(
+                hex_bytes32("c24eaceff5753c99066a839532d708a8661af7a9b01d44d0cd915c53969eb725"),
+            ),
+            exchange_price_token1_slot: U256::from_be_bytes(
+                hex_bytes32("a1829a9003092132f585b6ccdd167c19fe9774dbdea4260287e8a8e8ca8185d7"),
+            ),
+            supply_token0_slot: U256::from_be_bytes(
+                hex_bytes32("a893c3ab5c5189a9bd276b29d25998250798d4f72dbb029d43e23884b0119a5a"),
+            ),
+            supply_token1_slot: U256::from_be_bytes(
+                hex_bytes32("236696efd8534ce144b358082d303ba190cad0c8d37e9f4802b2a5198019379b"),
+            ),
+            borrow_token0_slot: U256::from_be_bytes(
+                hex_bytes32("2cd14670f8a9e59d7c072449b534cc4ec6d89953cf20c518ba36d7fbdd468baf"),
+            ),
+            borrow_token1_slot: U256::from_be_bytes(
+                hex_bytes32("d943cec1dfc617bf9515058376abfab0217f98cce018735f02efd4abd3453ad8"),
+            ),
+            token0_numerator_precision: 1,
+            token0_denominator_precision: 1_000_000,
+            token1_numerator_precision: 1,
+            token1_denominator_precision: 1_000_000,
+        }
+    }
+
+    fn hex_bytes32(s: &str) -> [u8; 32] {
+        let bytes = hex::decode(s).unwrap();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        arr
+    }
+
+    /// Test that `from_abi` correctly parses raw returndata from pool 1.
+    #[test]
+    fn test_from_abi_pool1() {
+        let pool = Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
+
+        // Raw returndata from `cast call $POOL constantsView()`
+        let cv_returndata = hex::decode(
+            "000000000000000000000000000000000000000000000000000000000000000100000000000000000000000052aa899454998be5b000ad077a46bbe360f4e49700000000000000000000000091716c4eda1fb55e84bf8b4c7085f84285c190850000000000000000000000005b6b500981d7faa8c83be20514ea8067fbd42304000000000000000000000000363b7bbe35e5fbfd9f9ec976eb64b4c52d931ecc0000000000000000000000002f9b396255e681574d26fe466de93a9dff2567a6000000000000000000000000f7c62a231088c2babb32282bcf14e63db3484b82000000000000000000000000a512bdd83f9a81e2fbc4e24b54b9f5c642d5e0250000000000000000000000004ec7b668baf70d4a4b0fc7941a7708a07b6d45be0000000000000000000000007f39c581f595b53c5cb19bd0b3f8da6c935e2ca0000000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeea893c3ab5c5189a9bd276b29d25998250798d4f72dbb029d43e23884b0119a5a2cd14670f8a9e59d7c072449b534cc4ec6d89953cf20c518ba36d7fbdd468baf236696efd8534ce144b358082d303ba190cad0c8d37e9f4802b2a5198019379bd943cec1dfc617bf9515058376abfab0217f98cce018735f02efd4abd3453ad8c24eaceff5753c99066a839532d708a8661af7a9b01d44d0cd915c53969eb725a1829a9003092132f585b6ccdd167c19fe9774dbdea4260287e8a8e8ca8185d70000000000000000000000000000000000000000000000000000000000000400"
+        ).unwrap();
+
+        // Raw returndata from `cast call $POOL constantsView2()`
+        let cv2_returndata = hex::decode(
+            "000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000f4240000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000f4240"
+        ).unwrap();
+
+        let config = FluidPoolConfig::from_abi(pool, &cv_returndata, &cv2_returndata)
+            .expect("from_abi should succeed");
+
+        let expected = pool1_config();
+        assert_eq!(config.pool_address, expected.pool_address);
+        assert_eq!(config.liquidity_address, expected.liquidity_address);
+        assert_eq!(config.exchange_price_token0_slot, expected.exchange_price_token0_slot);
+        assert_eq!(config.exchange_price_token1_slot, expected.exchange_price_token1_slot);
+        assert_eq!(config.supply_token0_slot, expected.supply_token0_slot);
+        assert_eq!(config.supply_token1_slot, expected.supply_token1_slot);
+        assert_eq!(config.borrow_token0_slot, expected.borrow_token0_slot);
+        assert_eq!(config.borrow_token1_slot, expected.borrow_token1_slot);
+        assert_eq!(config.token0_numerator_precision, expected.token0_numerator_precision);
+        assert_eq!(config.token0_denominator_precision, expected.token0_denominator_precision);
+        assert_eq!(config.token1_numerator_precision, expected.token1_numerator_precision);
+        assert_eq!(config.token1_denominator_precision, expected.token1_denominator_precision);
+    }
+
+    /// Test that `storage_reads()` returns the correct addresses and slots.
+    #[test]
+    fn test_storage_reads() {
+        let config = pool1_config();
+        let reads = config.storage_reads();
+
+        // First two are pool slots 0 and 1
+        assert_eq!(reads[0].0, config.pool_address);
+        assert_eq!(reads[0].1, U256::from(0));
+        assert_eq!(reads[1].0, config.pool_address);
+        assert_eq!(reads[1].1, U256::from(1));
+
+        // Remaining 6 are Liquidity Layer slots
+        for i in 2..8 {
+            assert_eq!(reads[i].0, config.liquidity_address);
+        }
+        assert_eq!(reads[2].1, config.exchange_price_token0_slot);
+        assert_eq!(reads[7].1, config.borrow_token1_slot);
     }
 
     fn check_within_pct(actual: u128, expected: u128, pct: u128, label: &str) {
