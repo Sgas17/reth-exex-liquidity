@@ -749,6 +749,19 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
+                            // Fluid: detect touched pools during revert for resync
+                            if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
+                                if let Some(pool) = fluid_log_operate_pool(log) {
+                                    if pool_tracker.is_tracked_fluid_pool(&pool) {
+                                        let pid = PoolIdentifier::Address(pool);
+                                        if !slot0_resync_required.iter().any(|e| pool_identifier_eq(e, &pid)) {
+                                            slot0_resync_required.push(pid);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             // Quick address filter (includes V2/V3 pools + PoolManager for V4)
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
@@ -806,7 +819,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
                 }
 
-                // Step 2: Process new blocks
+                // Step 2: Process new blocks (same as ChainCommitted, with Fluid batch decode)
                 info!("Step 2: Processing {} new blocks", new.blocks().len());
                 for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
@@ -822,10 +835,21 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_in_block = 0;
+                    let mut fluid_touched = HashSet::<Address>::new();
 
                     for (tx_index, receipt) in receipts.iter().enumerate() {
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
+
+                            // Fluid Liquidity Layer: pre-filter + collect touched pools
+                            if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
+                                if let Some(pool) = fluid_log_operate_pool(log) {
+                                    if pool_tracker.is_tracked_fluid_pool(&pool) {
+                                        fluid_touched.insert(pool);
+                                    }
+                                }
+                                continue;
+                            }
 
                             // Quick address filter (includes V2/V3 pools + PoolManager for V4)
                             if !pool_tracker.is_tracked_address(&log_address) {
@@ -839,8 +863,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             };
 
                             // Check if we should process this specific event
-                            // For V2/V3: checks pool address
-                            // For V4: checks pool_id from event data (NOT PoolManager address)
                             if !exex.should_process_event(&decoded_event, &pool_tracker) {
                                 continue;
                             }
@@ -859,6 +881,44 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                                 events_in_block += 1;
                                 exex.events_processed += 1;
+                            }
+                        }
+                    }
+
+                    // ── Fluid batch decode (same as ChainCommitted) ──────────
+                    for pool_addr in &fluid_touched {
+                        if let Some(config) = pool_tracker.fluid_config(pool_addr) {
+                            match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
+                                Some(reserves) => {
+                                    let update_msg = PoolUpdateMessage {
+                                        pool_id: PoolIdentifier::Address(*pool_addr),
+                                        protocol: Protocol::Fluid,
+                                        update_type: UpdateType::Swap,
+                                        block_number,
+                                        block_timestamp,
+                                        tx_index: 0,
+                                        log_index: 0,
+                                        is_revert: false,
+                                        update: PoolUpdate::FluidSwap {
+                                            col_token0_real: reserves.col_token0_real_reserves,
+                                            col_token1_real: reserves.col_token1_real_reserves,
+                                            col_token0_imaginary: reserves.col_token0_imaginary_reserves,
+                                            col_token1_imaginary: reserves.col_token1_imaginary_reserves,
+                                            debt_token0_real: reserves.debt_token0_real_reserves,
+                                            debt_token1_real: reserves.debt_token1_real_reserves,
+                                            debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
+                                            debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
+                                            center_price: reserves.center_price,
+                                            fee: reserves.fee,
+                                        },
+                                    };
+                                    exex.send_pool_update(&mut stream_seq, update_msg);
+                                    events_in_block += 1;
+                                    exex.events_processed += 1;
+                                }
+                                None => {
+                                    warn!(pool = %pool_addr, "Failed to decode Fluid reserves during reorg reapply");
+                                }
                             }
                         }
                     }
@@ -931,6 +991,19 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     for (tx_index, receipt) in receipts.iter().enumerate() {
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
+
+                            // Fluid: detect touched pools during revert for resync
+                            if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
+                                if let Some(pool) = fluid_log_operate_pool(log) {
+                                    if pool_tracker.is_tracked_fluid_pool(&pool) {
+                                        let pid = PoolIdentifier::Address(pool);
+                                        if !slot0_resync_required.iter().any(|e| pool_identifier_eq(e, &pid)) {
+                                            slot0_resync_required.push(pid);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
 
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
