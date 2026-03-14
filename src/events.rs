@@ -250,6 +250,33 @@ pub enum DecodedEvent {
     },
 }
 
+/// Check if a log is a Fluid `LogOperate` for a specific pool address
+/// using only indexed topics — no ABI decoding required.
+///
+/// `LogOperate(address indexed user, address indexed token, ...)`
+///   - topics[0] = event signature
+///   - topics[1] = user (pool address, left-padded to 32 bytes)
+///   - topics[2] = token
+#[inline]
+pub fn is_fluid_log_operate_for_pool(log: &Log, pool: &Address) -> bool {
+    let topics = log.topics();
+    topics.len() >= 2
+        && topics[0] == FluidLogOperate::SIGNATURE_HASH
+        && topics[1].as_slice()[12..] == pool.as_slice()[..]
+}
+
+/// Extract the pool address from a Fluid `LogOperate` log's indexed topic
+/// without full ABI decoding. Returns `None` if the log isn't a `LogOperate`.
+#[inline]
+pub fn fluid_log_operate_pool(log: &Log) -> Option<Address> {
+    let topics = log.topics();
+    if topics.len() >= 2 && topics[0] == FluidLogOperate::SIGNATURE_HASH {
+        Some(Address::from_slice(&topics[1].as_slice()[12..]))
+    } else {
+        None
+    }
+}
+
 /// Try to decode a log as any supported event type
 pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     let pool = log.address;

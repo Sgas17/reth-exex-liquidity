@@ -20,7 +20,7 @@ mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
 use alloy_primitives::{I256, U256};
-use events::{decode_log, DecodedEvent};
+use events::{decode_log, fluid_log_operate_pool, DecodedEvent};
 use nats_client::WhitelistNatsClient;
 // Removed: use eyre::Result; (unused import)
 use futures::{StreamExt, TryStreamExt};
@@ -553,13 +553,24 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             let log_address = log.address;
                             logs_checked += 1;
 
-                            // Quick address filter (includes V2/V3 pools + PoolManager for V4)
+                            // Quick address filter (includes V2/V3 pools + PoolManager for V4 + Liquidity Layer for Fluid)
                             if !pool_tracker.is_tracked_address(&log_address) {
                                 continue;
                             }
                             logs_matched_address += 1;
 
-                            // Decode event first
+                            // For Fluid Liquidity Layer: pre-filter by indexed pool
+                            // address in topics[1] before full ABI decode. The
+                            // Liquidity Layer emits LogOperate for ALL protocols
+                            // (fTokens, Vaults, etc.), not just our tracked DEX pools.
+                            if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
+                                match fluid_log_operate_pool(log) {
+                                    Some(pool) if pool_tracker.is_tracked_fluid_pool(&pool) => {}
+                                    _ => continue,
+                                }
+                            }
+
+                            // Decode event
                             let decoded_event = match decode_log(log) {
                                 Some(event) => {
                                     logs_decoded += 1;

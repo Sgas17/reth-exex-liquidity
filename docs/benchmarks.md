@@ -72,9 +72,15 @@ If latency becomes a problem, in priority order:
 4. **SIMD / branchless BigMath**: The `from_big_number` and `isqrt` hot
    paths could be optimized, but at 8 µs total they're not the bottleneck.
 
-> **Already baked in**: Fluid pools are only decoded when they emit
-> `LogOperate` — unchanged pools cost zero. Slot addresses are cached
-> in `FluidPoolConfig` at registration time.
+> **Already baked in**:
+> - Fluid pools are only decoded when they emit `LogOperate` —
+>   unchanged pools cost zero.
+> - Fluid `LogOperate` pre-filter: the Liquidity Layer emits
+>   `LogOperate` for every protocol (fTokens, Vaults, DEX pools).
+>   We check the indexed `user` topic (topics[1] = pool address)
+>   against tracked pools *before* ABI decoding — pure byte comparison,
+>   no deserialization. Only our ~44 DEX pools proceed to full decode.
+> - Slot addresses cached in `FluidPoolConfig` at registration time.
 
 ---
 

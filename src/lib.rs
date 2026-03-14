@@ -13,7 +13,7 @@ pub mod transfers;
 pub mod types;
 
 // Re-export commonly used items for testing
-pub use events::{decode_log, DecodedEvent};
+pub use events::{decode_log, fluid_log_operate_pool, is_fluid_log_operate_for_pool, DecodedEvent};
 pub use pool_tracker::{PoolTracker, WhitelistUpdate, FLUID_LIQUIDITY_LAYER, UNISWAP_V4_POOL_MANAGER};
 pub use types::{
     ControlMessage, PoolIdentifier, PoolMetadata, PoolUpdate, Protocol, ReorgRange, UpdateType,
