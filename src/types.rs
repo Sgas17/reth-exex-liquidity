@@ -111,14 +111,21 @@ pub enum PoolUpdate {
         liquidity_delta: i128,
     },
 
-    /// Fluid DEX operate signal.
+    /// Fluid DEX full reserve snapshot.
     ///
-    /// Emitted when a tracked Fluid pool calls `operate()` on the Liquidity
-    /// Layer, indicating its reserves changed. The arena subscriber reacts
-    /// by fetching fresh reserves from the DexReservesResolver.
-    FluidOperate {
-        /// The token that was operated on.
-        token: Address,
+    /// Emitted after decoding storage slots post-`LogOperate`. Contains
+    /// the complete reserve state — no further RPC calls needed by the arena.
+    FluidReserves {
+        center_price: u128,
+        fee: u128,
+        col_token0_real_reserves: u128,
+        col_token1_real_reserves: u128,
+        col_token0_imaginary_reserves: u128,
+        col_token1_imaginary_reserves: u128,
+        debt_token0_real_reserves: u128,
+        debt_token1_real_reserves: u128,
+        debt_token0_imaginary_reserves: u128,
+        debt_token1_imaginary_reserves: u128,
     },
 }
 

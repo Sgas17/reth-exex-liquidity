@@ -20,16 +20,18 @@ mod transfers;
 mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
-use alloy_primitives::{I256, U256};
+use alloy_primitives::{Address, I256, U256};
 use events::{decode_log, fluid_log_operate_pool, DecodedEvent};
+use fluid_decoder::FluidPoolConfig;
 use nats_client::WhitelistNatsClient;
-// Removed: use eyre::Result; (unused import)
 use futures::{StreamExt, TryStreamExt};
 use pool_tracker::PoolTracker;
+use reth::providers::StateProviderFactory;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
 use socket::PoolUpdateSocketServer;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -289,17 +291,9 @@ impl LiquidityExEx {
             // ============================================================================
             // FLUID DEX EVENTS
             // ============================================================================
-            DecodedEvent::FluidOperate { pool, token } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::Fluid,
-                update_type: UpdateType::Swap,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::FluidOperate { token },
-            }),
+            // FluidOperate is handled separately — the caller collects touched
+            // pools and batch-decodes reserves from storage after the log loop.
+            DecodedEvent::FluidOperate { .. } => None,
         }
     }
 
@@ -548,6 +542,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     let mut logs_checked = 0;
                     let mut logs_matched_address = 0;
                     let mut logs_decoded = 0;
+                    let mut fluid_touched: HashSet<Address> = HashSet::new();
 
                     for (tx_index, receipt) in receipts.iter().enumerate() {
                         for (log_index, log) in receipt.logs().iter().enumerate() {
@@ -566,7 +561,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             // (fTokens, Vaults, etc.), not just our tracked DEX pools.
                             if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
                                 match fluid_log_operate_pool(log) {
-                                    Some(pool) if pool_tracker.is_tracked_fluid_pool(&pool) => {}
+                                    Some(pool) if pool_tracker.is_tracked_fluid_pool(&pool) => {
+                                        // Collect touched pool — decode reserves after log loop
+                                        fluid_touched.insert(pool);
+                                        continue;
+                                    }
                                     _ => continue,
                                 }
                             }
@@ -602,6 +601,49 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 events_in_block += 1;
                                 exex.events_processed += 1;
                             }
+                        }
+                    }
+
+                    // ── Fluid batch decode ───────────────────────────────────
+                    // For each Fluid pool touched in this block, read 8 storage
+                    // slots from the state provider and decode reserves.
+                    for pool_addr in &fluid_touched {
+                        if let Some(config) = pool_tracker.fluid_config(pool_addr) {
+                            match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
+                                Some(reserves) => {
+                                    let update_msg = PoolUpdateMessage {
+                                        pool_id: PoolIdentifier::Address(*pool_addr),
+                                        protocol: Protocol::Fluid,
+                                        update_type: UpdateType::Swap,
+                                        block_number,
+                                        block_timestamp,
+                                        tx_index: 0,
+                                        log_index: 0,
+                                        is_revert: false,
+                                        update: PoolUpdate::FluidReserves {
+                                            center_price: reserves.center_price,
+                                            fee: reserves.fee,
+                                            col_token0_real_reserves: reserves.col_token0_real_reserves,
+                                            col_token1_real_reserves: reserves.col_token1_real_reserves,
+                                            col_token0_imaginary_reserves: reserves.col_token0_imaginary_reserves,
+                                            col_token1_imaginary_reserves: reserves.col_token1_imaginary_reserves,
+                                            debt_token0_real_reserves: reserves.debt_token0_real_reserves,
+                                            debt_token1_real_reserves: reserves.debt_token1_real_reserves,
+                                            debt_token0_imaginary_reserves: reserves.debt_token0_imaginary_reserves,
+                                            debt_token1_imaginary_reserves: reserves.debt_token1_imaginary_reserves,
+                                        },
+                                    };
+                                    exex.send_pool_update(&mut stream_seq, update_msg);
+                                    events_in_block += 1;
+                                    exex.events_processed += 1;
+                                    debug!(pool = %pool_addr, "Decoded Fluid reserves from storage");
+                                }
+                                None => {
+                                    warn!(pool = %pool_addr, "Failed to decode Fluid reserves from storage");
+                                }
+                            }
+                        } else {
+                            debug!(pool = %pool_addr, "Fluid pool touched but no config cached — skipping");
                         }
                     }
 
@@ -993,6 +1035,37 @@ fn pool_identifier_sort_key(pool_id: &PoolIdentifier) -> String {
 }
 
 #[inline]
+/// Read 8 storage slots from reth state provider and decode Fluid reserves.
+fn decode_fluid_pool<P: StateProviderFactory>(
+    provider: &P,
+    config: &FluidPoolConfig,
+    block_timestamp: u64,
+) -> Option<fluid_decoder::FluidReserves> {
+    let state = match provider.latest() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(pool = %config.pool_address, error = %e, "Failed to get state provider for Fluid decode");
+            return None;
+        }
+    };
+
+    let reads = config.storage_reads();
+    let mut values = [U256::ZERO; 8];
+    for (i, (addr, slot)) in reads.iter().enumerate() {
+        match state.storage(*addr, (*slot).into()) {
+            Ok(Some(v)) => values[i] = v,
+            Ok(None) => values[i] = U256::ZERO,
+            Err(e) => {
+                warn!(pool = %config.pool_address, slot = %slot, error = %e, "Failed to read Fluid storage slot");
+                return None;
+            }
+        }
+    }
+
+    let slots = config.to_storage_slots(&values);
+    fluid_decoder::decode_fluid_reserves(&slots, config, block_timestamp)
+}
+
 fn next_stream_seq(counter: &mut u64) -> u64 {
     *counter = counter.wrapping_add(1);
     *counter
