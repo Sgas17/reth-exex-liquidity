@@ -228,6 +228,60 @@ impl FluidPoolConfig {
             token1_denominator_precision: u128_from_u256(cv2.token1DenominatorPrecision),
         })
     }
+
+    /// Resolve a `FluidPoolConfig` by making `eth_call` RPCs to the pool contract.
+    ///
+    /// Calls `constantsView()` and `constantsView2()` via JSON-RPC to the given
+    /// endpoint. These return immutable constants, so this only needs to run once
+    /// per pool at registration time.
+    pub async fn resolve(pool_address: Address, rpc_url: &str) -> eyre::Result<Self> {
+        let cv_data = eth_call(rpc_url, pool_address, &Self::constants_view_calldata()).await?;
+        let cv2_data = eth_call(rpc_url, pool_address, &Self::constants_view2_calldata()).await?;
+        Self::from_abi(pool_address, &cv_data, &cv2_data).map_err(|e| eyre::eyre!("ABI decode: {e}"))
+    }
+}
+
+/// Minimal `eth_call` via raw JSON-RPC POST. No extra dependencies beyond tokio + serde.
+async fn eth_call(rpc_url: &str, to: Address, calldata: &[u8]) -> eyre::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let data_hex = format!("0x{}", hex::encode(calldata));
+    let to_hex = format!("{to:?}");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": to_hex, "data": data_hex}, "latest"],
+        "id": 1
+    });
+    let body_str = body.to_string();
+
+    // Parse URL: http://host:port/path
+    let stripped = rpc_url.trim_start_matches("http://").trim_start_matches("https://");
+    let (host_port, path) = stripped.split_once('/').unwrap_or((stripped, ""));
+    let path = if path.is_empty() { "/" } else { &format!("/{path}") };
+    let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8545"));
+    let port: u16 = port_str.parse().unwrap_or(8545);
+
+    let mut stream = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let response_str = String::from_utf8_lossy(&response);
+
+    // Extract JSON body after headers
+    let json_start = response_str.find('{').ok_or_else(|| eyre::eyre!("no JSON in response"))?;
+    let json_body: serde_json::Value = serde_json::from_str(&response_str[json_start..])?;
+
+    let result_hex = json_body["result"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("eth_call error: {}", json_body))?;
+
+    hex::decode(result_hex.trim_start_matches("0x")).map_err(|e| eyre::eyre!("hex decode: {e}"))
 }
 
 /// Raw storage inputs needed for reserve computation.
@@ -940,6 +994,23 @@ mod tests {
         }
         assert_eq!(reads[2].1, config.exchange_price_token0_slot);
         assert_eq!(reads[7].1, config.borrow_token1_slot);
+    }
+
+    /// Test `FluidPoolConfig::resolve()` against the live local node.
+    /// Requires reth running on localhost:8545.
+    #[tokio::test]
+    #[ignore = "requires local reth node on localhost:8545"]
+    async fn test_resolve_pool1() {
+        let pool = Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
+        let config = FluidPoolConfig::resolve(pool, "http://localhost:8545")
+            .await
+            .expect("resolve should succeed");
+
+        let expected = pool1_config();
+        assert_eq!(config.liquidity_address, expected.liquidity_address);
+        assert_eq!(config.supply_token0_slot, expected.supply_token0_slot);
+        assert_eq!(config.exchange_price_token0_slot, expected.exchange_price_token0_slot);
+        assert_eq!(config.token0_denominator_precision, 1_000_000);
     }
 
     fn check_within_pct(actual: u128, expected: u128, pct: u128, label: &str) {

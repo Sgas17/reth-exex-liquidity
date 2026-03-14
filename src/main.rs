@@ -461,6 +461,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     // Spawn task to handle whitelist updates with reconnect
                     let pool_tracker = exex.pool_tracker.clone();
                     let chain_for_task = chain.clone();
+                    let rpc_url = std::env::var("RPC_URL")
+                        .unwrap_or_else(|_| "http://localhost:8545".to_string());
                     tokio::spawn(async move {
                         let mut current_sub = subscriber;
                         loop {
@@ -469,7 +471,18 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                     Ok(whitelist_msg) => {
                                         match nats_client.convert_to_pool_update(whitelist_msg) {
                                             Ok(update) => {
+                                                // Extract Fluid pool addresses before queueing
+                                                let fluid_addrs = extract_fluid_addresses(&update);
                                                 pool_tracker.write().await.queue_update(update);
+
+                                                // Resolve configs for new Fluid pools
+                                                if !fluid_addrs.is_empty() {
+                                                    let pt = pool_tracker.clone();
+                                                    let rpc = rpc_url.clone();
+                                                    tokio::spawn(async move {
+                                                        resolve_fluid_configs(fluid_addrs, &rpc, pt).await;
+                                                    });
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!("Failed to convert whitelist message: {}", e);
@@ -1035,6 +1048,39 @@ fn pool_identifier_sort_key(pool_id: &PoolIdentifier) -> String {
 }
 
 #[inline]
+/// Extract Fluid pool addresses from a whitelist update.
+fn extract_fluid_addresses(update: &pool_tracker::WhitelistUpdate) -> Vec<Address> {
+    let pools = match update {
+        pool_tracker::WhitelistUpdate::Add(p) | pool_tracker::WhitelistUpdate::Replace(p) => p,
+        pool_tracker::WhitelistUpdate::Remove(_) => return vec![],
+    };
+    pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::Fluid)
+        .filter_map(|p| p.pool_id.as_address())
+        .collect()
+}
+
+/// Resolve `FluidPoolConfig` for a batch of pool addresses via RPC and register them.
+async fn resolve_fluid_configs(
+    addrs: Vec<Address>,
+    rpc_url: &str,
+    pool_tracker: Arc<RwLock<PoolTracker>>,
+) {
+    info!("Resolving Fluid configs for {} pools via RPC", addrs.len());
+    for addr in addrs {
+        match FluidPoolConfig::resolve(addr, rpc_url).await {
+            Ok(config) => {
+                info!(pool = %addr, liquidity = %config.liquidity_address, "✅ Fluid config resolved");
+                pool_tracker.write().await.register_fluid_config(config);
+            }
+            Err(e) => {
+                warn!(pool = %addr, error = %e, "❌ Failed to resolve Fluid config");
+            }
+        }
+    }
+}
+
 /// Read 8 storage slots from reth state provider and decode Fluid reserves.
 fn decode_fluid_pool<P: StateProviderFactory>(
     provider: &P,
