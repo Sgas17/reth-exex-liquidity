@@ -624,29 +624,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
                                 Some(reserves) => {
-                                    let update_msg = PoolUpdateMessage {
-                                        pool_id: PoolIdentifier::Address(*pool_addr),
-                                        protocol: Protocol::Fluid,
-                                        update_type: UpdateType::Swap,
-                                        block_number,
-                                        block_timestamp,
-                                        tx_index: 0,
-                                        log_index: 0,
-                                        is_revert: false,
-                                        update: PoolUpdate::FluidSwap {
-                                            col_token0_real: reserves.col_token0_real_reserves,
-                                            col_token1_real: reserves.col_token1_real_reserves,
-                                            col_token0_imaginary: reserves.col_token0_imaginary_reserves,
-                                            col_token1_imaginary: reserves.col_token1_imaginary_reserves,
-                                            debt_token0_real: reserves.debt_token0_real_reserves,
-                                            debt_token1_real: reserves.debt_token1_real_reserves,
-                                            debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
-                                            debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
-                                            center_price: reserves.center_price,
-                                            fee: reserves.fee,
-                                        },
-                                    };
-                                    exex.send_pool_update(&mut stream_seq, update_msg);
+                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, block_number, block_timestamp));
                                     events_in_block += 1;
                                     exex.events_processed += 1;
                                     debug!(pool = %pool_addr, "Decoded Fluid reserves from storage");
@@ -727,6 +705,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 exex.send_reorg_start(&mut stream_seq, old_range.clone(), new_range.clone());
 
                 let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
+                let mut reorg_fluid_touched = HashSet::<Address>::new();
 
                 // Step 1: Revert old blocks
                 info!("Step 1: Reverting {} old blocks", old.blocks().len());
@@ -749,14 +728,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
-                            // Fluid: detect touched pools during revert for resync
+                            // Fluid: collect touched pools — will decode from
+                            // post-reorg state after Step 2 (or after new-block
+                            // processing removes them from the set).
                             if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
                                 if let Some(pool) = fluid_log_operate_pool(log) {
                                     if pool_tracker.is_tracked_fluid_pool(&pool) {
-                                        let pid = PoolIdentifier::Address(pool);
-                                        if !slot0_resync_required.iter().any(|e| pool_identifier_eq(e, &pid)) {
-                                            slot0_resync_required.push(pid);
-                                        }
+                                        reorg_fluid_touched.insert(pool);
                                     }
                                 }
                                 continue;
@@ -890,29 +868,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
                                 Some(reserves) => {
-                                    let update_msg = PoolUpdateMessage {
-                                        pool_id: PoolIdentifier::Address(*pool_addr),
-                                        protocol: Protocol::Fluid,
-                                        update_type: UpdateType::Swap,
-                                        block_number,
-                                        block_timestamp,
-                                        tx_index: 0,
-                                        log_index: 0,
-                                        is_revert: false,
-                                        update: PoolUpdate::FluidSwap {
-                                            col_token0_real: reserves.col_token0_real_reserves,
-                                            col_token1_real: reserves.col_token1_real_reserves,
-                                            col_token0_imaginary: reserves.col_token0_imaginary_reserves,
-                                            col_token1_imaginary: reserves.col_token1_imaginary_reserves,
-                                            debt_token0_real: reserves.debt_token0_real_reserves,
-                                            debt_token1_real: reserves.debt_token1_real_reserves,
-                                            debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
-                                            debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
-                                            center_price: reserves.center_price,
-                                            fee: reserves.fee,
-                                        },
-                                    };
-                                    exex.send_pool_update(&mut stream_seq, update_msg);
+                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, block_number, block_timestamp));
                                     events_in_block += 1;
                                     exex.events_processed += 1;
                                 }
@@ -921,6 +877,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 }
                             }
                         }
+                        // Pool handled in new chain — don't re-decode after Step 2
+                        reorg_fluid_touched.remove(pool_addr);
                     }
 
                     drop(pool_tracker);
@@ -941,6 +899,28 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
 
                     exex.blocks_processed += 1;
+                }
+
+                // ── Fluid: decode pools touched in old blocks but not new ──
+                if !reorg_fluid_touched.is_empty() {
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    let tip_timestamp = new.blocks().values().last()
+                        .map(|b| b.timestamp())
+                        .unwrap_or_default();
+                    for pool_addr in &reorg_fluid_touched {
+                        if let Some(config) = pool_tracker.fluid_config(pool_addr) {
+                            match decode_fluid_pool(ctx.provider(), config, tip_timestamp) {
+                                Some(reserves) => {
+                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, final_tip_block, tip_timestamp));
+                                    debug!(pool = %pool_addr, "Decoded Fluid reserves post-reorg (not in new chain)");
+                                }
+                                None => {
+                                    warn!(pool = %pool_addr, "Failed to decode Fluid reserves post-reorg");
+                                }
+                            }
+                        }
+                    }
+                    drop(pool_tracker);
                 }
 
                 sort_pool_identifiers_deterministically(&mut slot0_resync_required);
@@ -972,6 +952,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 );
 
                 let mut slot0_resync_required: Vec<PoolIdentifier> = Vec::new();
+                let mut revert_fluid_touched = HashSet::<Address>::new();
 
                 for (block, receipts) in old.blocks_and_receipts() {
                     let block_number = block.number();
@@ -992,14 +973,12 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         for (log_index, log) in receipt.logs().iter().enumerate() {
                             let log_address = log.address;
 
-                            // Fluid: detect touched pools during revert for resync
+                            // Fluid: collect touched pools — decode from
+                            // post-revert state after the block loop.
                             if log_address == pool_tracker::FLUID_LIQUIDITY_LAYER {
                                 if let Some(pool) = fluid_log_operate_pool(log) {
                                     if pool_tracker.is_tracked_fluid_pool(&pool) {
-                                        let pid = PoolIdentifier::Address(pool);
-                                        if !slot0_resync_required.iter().any(|e| pool_identifier_eq(e, &pid)) {
-                                            slot0_resync_required.push(pid);
-                                        }
+                                        revert_fluid_touched.insert(pool);
                                     }
                                 }
                                 continue;
@@ -1055,6 +1034,29 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             block_number, events_reverted
                         );
                     }
+                }
+
+                // ── Fluid: decode touched pools from post-revert state ───
+                if !revert_fluid_touched.is_empty() {
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    // Provider reflects canonical state after revert
+                    let tip_timestamp = old.blocks().values().next()
+                        .map(|b| b.timestamp())
+                        .unwrap_or_default();
+                    for pool_addr in &revert_fluid_touched {
+                        if let Some(config) = pool_tracker.fluid_config(pool_addr) {
+                            match decode_fluid_pool(ctx.provider(), config, tip_timestamp) {
+                                Some(reserves) => {
+                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, final_tip_block, tip_timestamp));
+                                    debug!(pool = %pool_addr, "Decoded Fluid reserves post-revert");
+                                }
+                                None => {
+                                    warn!(pool = %pool_addr, "Failed to decode Fluid reserves post-revert");
+                                }
+                            }
+                        }
+                    }
+                    drop(pool_tracker);
                 }
 
                 sort_pool_identifiers_deterministically(&mut slot0_resync_required);
@@ -1121,6 +1123,37 @@ fn pool_identifier_sort_key(pool_id: &PoolIdentifier) -> String {
 }
 
 #[inline]
+/// Build a `PoolUpdateMessage` from decoded Fluid reserves.
+fn fluid_update_msg(
+    pool_addr: Address,
+    reserves: &fluid_decoder::FluidReserves,
+    block_number: u64,
+    block_timestamp: u64,
+) -> PoolUpdateMessage {
+    PoolUpdateMessage {
+        pool_id: PoolIdentifier::Address(pool_addr),
+        protocol: Protocol::Fluid,
+        update_type: UpdateType::Swap,
+        block_number,
+        block_timestamp,
+        tx_index: 0,
+        log_index: 0,
+        is_revert: false,
+        update: PoolUpdate::FluidSwap {
+            col_token0_real: reserves.col_token0_real_reserves,
+            col_token1_real: reserves.col_token1_real_reserves,
+            col_token0_imaginary: reserves.col_token0_imaginary_reserves,
+            col_token1_imaginary: reserves.col_token1_imaginary_reserves,
+            debt_token0_real: reserves.debt_token0_real_reserves,
+            debt_token1_real: reserves.debt_token1_real_reserves,
+            debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
+            debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
+            center_price: reserves.center_price,
+            fee: reserves.fee,
+        },
+    }
+}
+
 /// Extract Fluid pool addresses from a whitelist update.
 fn extract_fluid_addresses(update: &pool_tracker::WhitelistUpdate) -> Vec<Address> {
     let pools = match update {
