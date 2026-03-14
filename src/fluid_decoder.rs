@@ -1078,29 +1078,19 @@ mod tests {
         rpc_request(rpc_url, &body).await
     }
 
-    /// End-to-end validation: decode reserves from raw storage slots and compare
-    /// against the pool's `getCollateralReserves()` at the same block.
-    ///
-    /// Uses pool 5 (USDC/ETH) which has gm < 1e27 (no inversion branch).
-    /// Pool 1 (wstETH/ETH) uses an oracle center price hook which our decoder
-    /// approximates from storage, so it's tested separately with wider tolerance.
-    #[tokio::test]
-    #[ignore = "requires local reth node on localhost:8545"]
-    async fn test_decoder_vs_pool_e2e() {
-        use alloy_sol_types::{SolCall as _, SolValue};
+    // ── E2E helpers ───────────────────────────────────────────────────
 
-        let rpc = "http://localhost:8545";
-        let block: u64 = 24657500;
-        let timestamp: u64 = 1773512747;
-
-        // Pool 5: USDC/ETH — gm < 1e27, no inversion, no oracle hook
-        let pool_addr = Address::from_slice(
-            &hex::decode("2886a01a0645390872a9eb99dAe1283664b0c524").unwrap(),
-        );
+    /// Read storage slots and decode reserves for a pool at a specific block.
+    async fn decode_pool_at_block(
+        pool_hex: &str,
+        rpc: &str,
+        block: u64,
+        timestamp: u64,
+    ) -> (FluidPoolConfig, FluidReserves) {
+        let pool_addr = Address::from_slice(&hex::decode(pool_hex).unwrap());
         let config = FluidPoolConfig::resolve(pool_addr, rpc).await.unwrap();
         rpc_pause().await;
 
-        // Read 8 storage slots at block
         let reads = config.storage_reads();
         let mut values = [U256::ZERO; 8];
         for (i, (addr, slot)) in reads.iter().enumerate() {
@@ -1108,69 +1098,144 @@ mod tests {
             rpc_pause().await;
         }
         let slots = config.to_storage_slots(&values);
-
-        // Decode via our Rust implementation
         let decoded = decode_fluid_reserves(&slots, &config, timestamp)
-            .expect("decoder should succeed for pool 5");
+            .expect("decoder should succeed");
+        (config, decoded)
+    }
 
-        // Call pool's getCollateralReserves() directly at same block.
-        // We need to first get prices+exchange prices via getPricesAndExchangePrices().
-        // The pool reverts with the data — but we can't catch reverts via raw eth_call.
-        // Instead, use the resolver's getDexCollateralReserves which calls the pool.
-        //
-        // The resolver scales output by denomPrec/numPrec. We undo that scaling.
-        sol! {
-            struct ColReserves {
-                uint256 token0RealReserves;
-                uint256 token1RealReserves;
-                uint256 token0ImaginaryReserves;
-                uint256 token1ImaginaryReserves;
-            }
-        }
-
-        // Call pool's getCollateralReserves directly would require getting
-        // exchange prices first, which requires a try/catch. Use the resolver
-        // getDexCollateralReserves() instead, which handles this internally.
-        // Note: resolver output is scaled by precision. We compare scaled values.
+    /// Call resolver to get collateral reserves (4 u256 fields).
+    /// Returns (t0Real, t1Real, t0Imag, t1Imag) — pool's struct field order.
+    async fn resolver_collateral(pool_hex: &str, rpc: &str, block: u64) -> [u128; 4] {
+        let pool_addr = Address::from_slice(&hex::decode(pool_hex).unwrap());
         let resolver = Address::from_slice(
             &hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap(),
         );
+        // getDexCollateralReserves(address) = 0x957755e6
+        let mut cd = hex::decode("957755e6").unwrap();
+        cd.extend_from_slice(&[0u8; 12]);
+        cd.extend_from_slice(pool_addr.as_slice());
         rpc_pause().await;
-        // getDexCollateralReserves(address) selector
-        let mut calldata = hex::decode("957755e6").unwrap();
-        calldata.extend_from_slice(&[0u8; 12]); // pad address to 32 bytes
-        calldata.extend_from_slice(pool_addr.as_slice());
-        let return_bytes = eth_call_at(rpc, resolver, &calldata, block).await;
-        let onchain = ColReserves::abi_decode(&return_bytes)
-            .expect("ABI decode should succeed");
-
-        let u = |v: U256| -> u128 { v.to::<u128>() };
-        // The resolver scales pool output by denom/num to get token-native amounts.
-        // Our decoder keeps the internal scale (with num/denom applied).
-        // To compare: scale on-chain values UP by num/denom to match our decoder.
-        let n0 = config.token0_numerator_precision;
-        let d0 = config.token0_denominator_precision;
-        let n1 = config.token1_numerator_precision;
-        let d1 = config.token1_denominator_precision;
-        let rescale = |onchain_val: u128, num: u128, denom: u128| -> u128 {
-            onchain_val * num / denom
+        let ret = eth_call_at(rpc, resolver, &cd, block).await;
+        // Returns (t0Real, t1Real, t0Imag, t1Imag) — 4 × 32 bytes
+        let w = |i: usize| -> u128 {
+            U256::from_be_slice(&ret[i * 32..(i + 1) * 32]).to::<u128>()
         };
+        [w(0), w(1), w(2), w(3)]
+    }
 
-        println!("=== Pool 5 (USDC/ETH) ===");
-        println!("  col.t0_real  on-chain: {} → rescaled: {}", onchain.token0RealReserves, rescale(u(onchain.token0RealReserves), n0, d0));
-        println!("  col.t0_real  decoder:  {}", decoded.col_token0_real_reserves);
-        println!("  col.t1_real  on-chain: {} → rescaled: {}", onchain.token1RealReserves, rescale(u(onchain.token1RealReserves), n1, d1));
-        println!("  col.t1_real  decoder:  {}", decoded.col_token1_real_reserves);
-        println!("  col.t0_imag  on-chain: {} → rescaled: {}", onchain.token0ImaginaryReserves, rescale(u(onchain.token0ImaginaryReserves), n0, d0));
-        println!("  col.t0_imag  decoder:  {}", decoded.col_token0_imaginary_reserves);
-        println!("  col.t1_imag  on-chain: {} → rescaled: {}", onchain.token1ImaginaryReserves, rescale(u(onchain.token1ImaginaryReserves), n1, d1));
-        println!("  col.t1_imag  decoder:  {}", decoded.col_token1_imaginary_reserves);
+    /// Call resolver to get debt reserves (6 u256 fields).
+    /// Returns (t0Debt, t1Debt, t0Real, t1Real, t0Imag, t1Imag).
+    async fn resolver_debt(pool_hex: &str, rpc: &str, block: u64) -> [u128; 6] {
+        let pool_addr = Address::from_slice(&hex::decode(pool_hex).unwrap());
+        let resolver = Address::from_slice(
+            &hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap(),
+        );
+        // getDexDebtReserves(address) = 0x55181f11
+        let mut cd = hex::decode("55181f11").unwrap();
+        cd.extend_from_slice(&[0u8; 12]);
+        cd.extend_from_slice(pool_addr.as_slice());
+        rpc_pause().await;
+        let ret = eth_call_at(rpc, resolver, &cd, block).await;
+        let w = |i: usize| -> u128 {
+            U256::from_be_slice(&ret[i * 32..(i + 1) * 32]).to::<u128>()
+        };
+        [w(0), w(1), w(2), w(3), w(4), w(5)]
+    }
 
-        check_within_pct(decoded.col_token0_real_reserves, rescale(u(onchain.token0RealReserves), n0, d0), 1, "col_t0_real");
-        check_within_pct(decoded.col_token1_real_reserves, rescale(u(onchain.token1RealReserves), n1, d1), 1, "col_t1_real");
-        check_within_pct(decoded.col_token0_imaginary_reserves, rescale(u(onchain.token0ImaginaryReserves), n0, d0), 1, "col_t0_imag");
-        check_within_pct(decoded.col_token1_imaginary_reserves, rescale(u(onchain.token1ImaginaryReserves), n1, d1), 1, "col_t1_imag");
+    /// Rescale resolver value to internal decoder scale.
+    /// Resolver applies `× denom/num` to get token-native amounts.
+    /// Undoing: multiply by `num/denom`.
+    fn rescale(onchain: u128, num: u128, denom: u128) -> u128 {
+        onchain * num / denom
+    }
 
-        println!("\n✅ Pool 5 collateral reserves match within 1%");
+    /// Compare all 10 reserve fields (4 collateral + 6 debt) between
+    /// decoder output and resolver output, within `pct` tolerance.
+    fn compare_reserves(
+        label: &str,
+        decoded: &FluidReserves,
+        col: &[u128; 4],
+        debt: &[u128; 6],
+        n0: u128,
+        d0: u128,
+        n1: u128,
+        d1: u128,
+        pct: u128,
+    ) {
+        println!("\n=== {} collateral ===", label);
+        let pairs: [(&str, u128, u128); 4] = [
+            ("col.t0_real", decoded.col_token0_real_reserves, rescale(col[0], n0, d0)),
+            ("col.t1_real", decoded.col_token1_real_reserves, rescale(col[1], n1, d1)),
+            ("col.t0_imag", decoded.col_token0_imaginary_reserves, rescale(col[2], n0, d0)),
+            ("col.t1_imag", decoded.col_token1_imaginary_reserves, rescale(col[3], n1, d1)),
+        ];
+        for (name, actual, expected) in &pairs {
+            println!("  {:14} decoder={:>20}  on-chain={:>20}", name, actual, expected);
+            check_within_pct(*actual, *expected, pct, name);
+        }
+
+        println!("\n=== {} debt ===", label);
+        let debt_pairs: [(&str, u128, u128); 6] = [
+            ("debt.t0_debt", decoded.debt_token0_debt, rescale(debt[0], n0, d0)),
+            ("debt.t1_debt", decoded.debt_token1_debt, rescale(debt[1], n1, d1)),
+            ("debt.t0_real", decoded.debt_token0_real_reserves, rescale(debt[2], n0, d0)),
+            ("debt.t1_real", decoded.debt_token1_real_reserves, rescale(debt[3], n1, d1)),
+            ("debt.t0_imag", decoded.debt_token0_imaginary_reserves, rescale(debt[4], n0, d0)),
+            ("debt.t1_imag", decoded.debt_token1_imaginary_reserves, rescale(debt[5], n1, d1)),
+        ];
+        for (name, actual, expected) in &debt_pairs {
+            println!("  {:14} decoder={:>20}  on-chain={:>20}", name, actual, expected);
+            check_within_pct(*actual, *expected, pct, name);
+        }
+    }
+
+    // ── E2E tests ────────────────────────────────────────────────────
+
+    /// Pool 5 (USDC/ETH): gm < 1e27, no inversion, no oracle hook.
+    /// Tests both collateral and debt reserves.
+    #[tokio::test]
+    #[ignore = "requires local reth node on localhost:8545"]
+    async fn test_e2e_pool5_usdc_eth() {
+        let rpc = "http://localhost:8545";
+        let block: u64 = 24657500;
+        let timestamp: u64 = 1773512747;
+        let pool = "2886a01a0645390872a9eb99dAe1283664b0c524";
+
+        let (config, decoded) = decode_pool_at_block(pool, rpc, block, timestamp).await;
+        let col = resolver_collateral(pool, rpc, block).await;
+        let debt = resolver_debt(pool, rpc, block).await;
+
+        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
+        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+
+        assert_eq!(decoded.fee, 500, "fee mismatch");
+        compare_reserves("Pool 5 (USDC/ETH)", &decoded, &col, &debt, n0, d0, n1, d1, 1);
+
+        println!("\n✅ Pool 5 all reserves match within 1%");
+    }
+
+    /// Pool 1 (wstETH/ETH): gm ≥ 1e27, takes inversion branch, oracle hook center price.
+    /// Uses wider tolerance (2%) because the oracle hook center price differs
+    /// from our stored BigMath approximation.
+    #[tokio::test]
+    #[ignore = "requires local reth node on localhost:8545"]
+    async fn test_e2e_pool1_wsteth_eth() {
+        let rpc = "http://localhost:8545";
+        let block: u64 = 24657500;
+        let timestamp: u64 = 1773512747;
+        let pool = "0B1a513ee24972DAEf112bC777a5610d4325C9e7";
+
+        let (config, decoded) = decode_pool_at_block(pool, rpc, block, timestamp).await;
+        let col = resolver_collateral(pool, rpc, block).await;
+        let debt = resolver_debt(pool, rpc, block).await;
+
+        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
+        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+
+        assert_eq!(decoded.fee, 73, "fee mismatch");
+        // Pool 1 uses oracle hook → center price ~0.01% off → reserves ~1% off.
+        compare_reserves("Pool 1 (wstETH/ETH)", &decoded, &col, &debt, n0, d0, n1, d1, 2);
+
+        println!("\n✅ Pool 1 all reserves match within 2%");
     }
 }
