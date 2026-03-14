@@ -633,17 +633,17 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                         tx_index: 0,
                                         log_index: 0,
                                         is_revert: false,
-                                        update: PoolUpdate::FluidReserves {
+                                        update: PoolUpdate::FluidSwap {
+                                            col_token0_real: reserves.col_token0_real_reserves,
+                                            col_token1_real: reserves.col_token1_real_reserves,
+                                            col_token0_imaginary: reserves.col_token0_imaginary_reserves,
+                                            col_token1_imaginary: reserves.col_token1_imaginary_reserves,
+                                            debt_token0_real: reserves.debt_token0_real_reserves,
+                                            debt_token1_real: reserves.debt_token1_real_reserves,
+                                            debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
+                                            debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
                                             center_price: reserves.center_price,
                                             fee: reserves.fee,
-                                            col_token0_real_reserves: reserves.col_token0_real_reserves,
-                                            col_token1_real_reserves: reserves.col_token1_real_reserves,
-                                            col_token0_imaginary_reserves: reserves.col_token0_imaginary_reserves,
-                                            col_token1_imaginary_reserves: reserves.col_token1_imaginary_reserves,
-                                            debt_token0_real_reserves: reserves.debt_token0_real_reserves,
-                                            debt_token1_real_reserves: reserves.debt_token1_real_reserves,
-                                            debt_token0_imaginary_reserves: reserves.debt_token0_imaginary_reserves,
-                                            debt_token1_imaginary_reserves: reserves.debt_token1_imaginary_reserves,
                                         },
                                     };
                                     exex.send_pool_update(&mut stream_seq, update_msg);

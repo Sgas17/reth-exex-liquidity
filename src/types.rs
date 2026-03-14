@@ -113,19 +113,20 @@ pub enum PoolUpdate {
 
     /// Fluid DEX full reserve snapshot.
     ///
-    /// Emitted after decoding storage slots post-`LogOperate`. Contains
-    /// the complete reserve state — no further RPC calls needed by the arena.
-    FluidReserves {
+    /// Decoded from 8 storage slots post-`LogOperate`. Contains the
+    /// complete reserve state — no further RPC calls needed by the arena.
+    /// All reserve values in 1e12 decimals (resolver format).
+    FluidSwap {
+        col_token0_real: u128,
+        col_token1_real: u128,
+        col_token0_imaginary: u128,
+        col_token1_imaginary: u128,
+        debt_token0_real: u128,
+        debt_token1_real: u128,
+        debt_token0_imaginary: u128,
+        debt_token1_imaginary: u128,
         center_price: u128,
         fee: u128,
-        col_token0_real_reserves: u128,
-        col_token1_real_reserves: u128,
-        col_token0_imaginary_reserves: u128,
-        col_token1_imaginary_reserves: u128,
-        debt_token0_real_reserves: u128,
-        debt_token1_real_reserves: u128,
-        debt_token0_imaginary_reserves: u128,
-        debt_token1_imaginary_reserves: u128,
     },
 }
 
