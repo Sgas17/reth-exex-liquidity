@@ -32,6 +32,7 @@ use reth_provider::StateProviderFactory;
 use socket::PoolUpdateSocketServer;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use types::{
@@ -967,72 +968,130 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
     let chain = std::env::var("CHAIN").unwrap_or_else(|_| "ethereum".to_string());
 
     info!("Connecting to NATS at {} for chain {}", nats_url, chain);
+    info!("Enforcing whitelist startup barrier before block processing");
 
-    match WhitelistNatsClient::connect(&nats_url).await {
-        Ok(nats_client) => {
-            info!("✅ NATS connected successfully");
+    // Hard startup barrier:
+    // 1) connect NATS
+    // 2) subscribe whitelist deltas
+    // 3) request + apply full snapshot
+    // Only then continue into block processing.
+    let nats_client = loop {
+        match WhitelistNatsClient::connect(&nats_url).await {
+            Ok(client) => {
+                info!("✅ NATS connected successfully");
+                break client;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to connect to NATS, retrying in 2s");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
 
-            // Subscribe to whitelist updates
-            match nats_client.subscribe_whitelist(&chain).await {
-                Ok(subscriber) => {
-                    info!("✅ Subscribed to whitelist updates for {}", chain);
+    let subscriber = loop {
+        match nats_client.subscribe_whitelist(&chain).await {
+            Ok(subscriber) => {
+                info!("✅ Subscribed to whitelist updates for {}", chain);
+                break subscriber;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to whitelist updates, retrying in 2s");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
 
-                    // Spawn task to handle whitelist updates with reconnect
-                    let pool_tracker = exex.pool_tracker.clone();
-                    let chain_for_task = chain.clone();
-                    tokio::spawn(async move {
-                        let mut current_sub = subscriber;
-                        loop {
-                            while let Some(message) = current_sub.next().await {
-                                match nats_client.parse_message(&message.payload) {
-                                    Ok(whitelist_msg) => {
-                                        match nats_client.convert_to_pool_update(whitelist_msg) {
-                                            Ok(update) => {
-                                                pool_tracker.write().await.queue_update(update);
-                                            }
-                                            Err(e) => {
-                                                warn!("Failed to convert whitelist message: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to parse whitelist message: {}", e);
-                                    }
-                                }
+    loop {
+        match nats_client
+            .request_snapshot(&chain, Duration::from_secs(10))
+            .await
+        {
+            Ok(snapshot_msg) => {
+                if snapshot_msg.message_type != "full" {
+                    warn!(
+                        message_type = %snapshot_msg.message_type,
+                        "Ignoring non-full startup snapshot response"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                match nats_client.convert_to_pool_update(snapshot_msg) {
+                    Ok(update) => {
+                        let pool_count = match &update {
+                            crate::pool_tracker::WhitelistUpdate::Add(pools)
+                            | crate::pool_tracker::WhitelistUpdate::Replace(pools) => pools.len(),
+                            crate::pool_tracker::WhitelistUpdate::Remove(pool_ids) => {
+                                pool_ids.len()
                             }
+                        };
 
-                            // Stream closed — attempt resubscribe with backoff
-                            warn!("Whitelist subscription closed, attempting resubscribe");
-                            let mut backoff = std::time::Duration::from_secs(1);
-                            loop {
-                                tokio::time::sleep(backoff).await;
-                                match nats_client.subscribe_whitelist(&chain_for_task).await {
-                                    Ok(new_sub) => {
-                                        info!("✅ Whitelist subscription restored");
-                                        current_sub = new_sub;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "Failed to resubscribe, retrying in {:?}", backoff);
-                                        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-                                    }
-                                }
+                        if pool_count == 0 {
+                            warn!("Startup snapshot contained zero pools, retrying in 2s");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+
+                        exex.pool_tracker.write().await.queue_update(update);
+                        info!(pools = pool_count, "✅ Applied startup whitelist snapshot");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to convert startup snapshot, retrying in 2s");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to request startup snapshot, retrying in 2s");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Spawn task to handle whitelist updates with reconnect.
+    let pool_tracker = exex.pool_tracker.clone();
+    let chain_for_task = chain.clone();
+    tokio::spawn(async move {
+        let mut current_sub = subscriber;
+        loop {
+            while let Some(message) = current_sub.next().await {
+                match nats_client.parse_message(&message.payload) {
+                    Ok(whitelist_msg) => {
+                        match nats_client.convert_to_pool_update(whitelist_msg) {
+                            Ok(update) => {
+                                pool_tracker.write().await.queue_update(update);
+                            }
+                            Err(e) => {
+                                warn!("Failed to convert whitelist message: {}", e);
                             }
                         }
-                    });
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse whitelist message: {}", e);
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to subscribe to NATS: {}", e);
-                    info!("⚠️  Starting with empty pool whitelist");
+            }
+
+            // Stream closed — attempt resubscribe with backoff
+            warn!("Whitelist subscription closed, attempting resubscribe");
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(backoff).await;
+                match nats_client.subscribe_whitelist(&chain_for_task).await {
+                    Ok(new_sub) => {
+                        info!("✅ Whitelist subscription restored");
+                        current_sub = new_sub;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to resubscribe, retrying in {:?}", backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
                 }
             }
         }
-        Err(e) => {
-            warn!("Failed to connect to NATS: {}", e);
-            info!("⚠️  Starting with empty pool whitelist");
-            info!("   Set NATS_URL environment variable to enable whitelist updates");
-        }
-    }
+    });
 
     // Main event loop: receive notifications from Reth
     while let Some(notification) = ctx.notifications.try_next().await? {
