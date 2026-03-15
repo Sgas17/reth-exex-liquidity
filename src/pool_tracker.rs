@@ -308,6 +308,7 @@ impl PoolTracker {
     }
 
     /// Legacy method for backward compatibility - converts to Replace update
+    #[allow(dead_code)]
     pub fn update_whitelist(&mut self, pools: Vec<PoolMetadata>) {
         self.queue_update(WhitelistUpdate::Replace(pools));
     }
@@ -323,21 +324,25 @@ impl PoolTracker {
     }
 
     /// Get pool metadata by address
+    #[allow(dead_code)]
     pub fn get_by_address(&self, address: &Address) -> Option<&PoolMetadata> {
         self.pools_by_address.get(address)
     }
 
     /// Get pool metadata by pool ID
+    #[allow(dead_code)]
     pub fn get_by_pool_id(&self, pool_id: &[u8; 32]) -> Option<&PoolMetadata> {
         self.pools_by_id.get(pool_id)
     }
 
     /// Get all tracked addresses
+    #[allow(dead_code)]
     pub fn tracked_addresses(&self) -> &HashSet<Address> {
         &self.tracked_addresses
     }
 
     /// Get all tracked pool IDs
+    #[allow(dead_code)]
     pub fn tracked_pool_ids(&self) -> &HashSet<[u8; 32]> {
         &self.tracked_pool_ids
     }
@@ -351,6 +356,7 @@ impl PoolTracker {
     }
 
     /// Check if a Fluid pool has its config resolved (slot addresses cached).
+    #[allow(dead_code)]
     pub fn has_fluid_config(&self, address: &Address) -> bool {
         self.fluid_configs.contains_key(address)
     }
@@ -378,22 +384,30 @@ impl PoolTracker {
             v2_pools: self.v2_count,
             v3_pools: self.v3_count,
             v4_pools: self.v4_count,
+            ekubo_pools: self.ekubo_count,
+            curve_stable_pools: self.curve_stable_count,
+            curve_twocrypto_pools: self.curve_twocrypto_count,
             fluid_pools: self.fluid_count,
         }
     }
 
     /// Check if there are pending updates
+    #[allow(dead_code)]
     pub fn has_pending_updates(&self) -> bool {
         !self.pending_updates.is_empty()
     }
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PoolTrackerStats {
     pub total_pools: usize,
     pub v2_pools: usize,
     pub v3_pools: usize,
     pub v4_pools: usize,
+    pub ekubo_pools: usize,
+    pub curve_stable_pools: usize,
+    pub curve_twocrypto_pools: usize,
     pub fluid_pools: usize,
 }
 

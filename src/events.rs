@@ -536,6 +536,7 @@ pub enum DecodedEvent {
     /// pool changed reserves. `user` = pool address, `token` = asset involved.
     FluidOperate {
         pool: Address,
+        #[allow(dead_code)]
         token: Address,
     },
 }
@@ -548,6 +549,7 @@ pub enum DecodedEvent {
 ///   - topics[1] = user (pool address, left-padded to 32 bytes)
 ///   - topics[2] = token
 #[inline]
+#[allow(dead_code)]
 pub fn is_fluid_log_operate_for_pool(log: &Log, pool: &Address) -> bool {
     let topics = log.topics();
     topics.len() >= 2

@@ -48,6 +48,7 @@ impl PoolIdentifier {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_pool_id(&self) -> Option<[u8; 32]> {
         match self {
             PoolIdentifier::Address(_) => None,
@@ -325,6 +326,7 @@ pub enum ControlMessage {
 
 impl ControlMessage {
     /// Returns stream sequence for sequenced messages.
+    #[allow(dead_code)]
     pub fn stream_seq(&self) -> Option<u64> {
         match self {
             ControlMessage::BeginBlock { stream_seq, .. }

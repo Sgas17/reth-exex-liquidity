@@ -13,7 +13,7 @@ use alloy_consensus::{BlockHeader, TxReceipt, transaction::TxHashRef};
 use alloy_primitives::{Address, Log, U256};
 use futures::{StreamExt, TryStreamExt};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth_node_api::{BlockBody, FullNodeComponents, NodePrimitives, NodeTypes};
+use reth_node_api::{BlockBody, FullNodeComponents, NodePrimitives};
 use reth::providers::StateProviderFactory;
 use rust_decimal::Decimal;
 use std::collections::HashMap;

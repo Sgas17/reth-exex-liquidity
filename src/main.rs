@@ -14,8 +14,10 @@ mod fluid_decoder;
 mod nats_client;
 mod pool_creations;
 mod pool_tracker;
+#[allow(dead_code)]
 mod socket;
 mod swap_monitor;
+#[allow(dead_code)]
 mod transfers;
 mod types;
 
