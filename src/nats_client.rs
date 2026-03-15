@@ -9,6 +9,7 @@ use async_nats::Client;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Minimal whitelist message from dynamicWhitelist
@@ -55,6 +56,23 @@ impl WhitelistNatsClient {
         let subscriber = self.client.subscribe(subject.clone()).await?;
         info!("Subscribed to NATS subject: {}", subject);
         Ok(subscriber)
+    }
+
+    /// Request the latest full whitelist snapshot for startup hydration.
+    ///
+    /// Request subject: `whitelist.snapshot.request.{chain}`
+    pub async fn request_snapshot(
+        &self,
+        chain: &str,
+        timeout: Duration,
+    ) -> Result<WhitelistPoolMessage> {
+        let subject = format!("whitelist.snapshot.request.{chain}");
+        let response =
+            tokio::time::timeout(timeout, self.client.request(subject.clone(), "".into()))
+                .await
+                .map_err(|_| eyre::eyre!("snapshot request timed out on subject {subject}"))??;
+
+        self.parse_message(&response.payload)
     }
 
     /// Parse a whitelist message from NATS

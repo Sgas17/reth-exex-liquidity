@@ -9,7 +9,7 @@ pub struct PoolRow {
     pub asset0: String,  // lowercase hex
     pub asset1: String,  // lowercase hex
     pub creation_block: u64,
-    pub fee: Option<i32>,
+    pub fee: Option<i64>,
     pub tick_spacing: Option<i32>,
     pub additional_data: Option<serde_json::Value>,
 }

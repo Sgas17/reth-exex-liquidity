@@ -30,9 +30,13 @@ pub async fn pool_creations_exex<Node: FullNodeComponents>(
 ) -> eyre::Result<()> {
     info!("Pool Creations ExEx starting");
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://transfers_user:transfers_pass@localhost:5433/transfers".to_string()
-    });
+    // POOL_CREATIONS_DATABASE_URL targets the DB that the whitelist orchestrator reads.
+    // Falls back to DATABASE_URL for backward compatibility.
+    let database_url = std::env::var("POOL_CREATIONS_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| {
+            "postgres://transfers_user:transfers_pass@localhost:5433/transfers".to_string()
+        });
     let db = Arc::new(PoolDb::new(&database_url).await?);
 
     let mut blocks_processed: u64 = 0;

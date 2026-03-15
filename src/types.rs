@@ -34,7 +34,7 @@ pub struct PoolUpdateMessage {
 }
 
 /// Pool identifier - can be address (V2/V3) or bytes32 (V4)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PoolIdentifier {
     Address(Address),
     PoolId([u8; 32]), // V4 uses bytes32 poolId
@@ -57,11 +57,14 @@ impl PoolIdentifier {
 }
 
 /// Protocol type
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Protocol {
     UniswapV2,
     UniswapV3,
     UniswapV4,
+    Ekubo,
+    CurveStable,
+    CurveTwoCrypto,
     Fluid,
 }
 
@@ -109,6 +112,108 @@ pub enum PoolUpdate {
         tick_lower: i32,
         tick_upper: i32,
         liquidity_delta: i128,
+    },
+
+    /// Ekubo Swap Update (from anonymous log0 on Core contract).
+    ///
+    /// sqrtRatio is Ekubo's native uint96 stored as U256 — NOT Q64.96.
+    /// Downstream Ekubo swap math reads it as u128.
+    EkuboSwap {
+        sqrt_ratio: U256,
+        liquidity: u128,
+        tick: i32,
+    },
+
+    /// Ekubo Liquidity Update (PositionUpdated event).
+    ///
+    /// Unlike V3/V4, Ekubo does not emit separate Mint/Burn events.
+    /// PositionUpdated carries tick bounds (packed in positionId),
+    /// `liquidityDelta`, and the full post-state (sqrtRatio, tick, liquidity).
+    EkuboLiquidity {
+        tick_lower: i32,
+        tick_upper: i32,
+        liquidity_delta: i128,
+        /// Post-state from stateAfter — Ekubo native uint96, NOT Q64.96.
+        sqrt_ratio: U256,
+        liquidity: u128,
+        tick: i32,
+    },
+
+    /// Curve StableSwap-NG TokenExchange event.
+    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
+    /// sends `tokens_bought` of coin[bought_id].
+    CurveSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+    },
+
+    /// Curve StableSwap-NG liquidity event (AddLiquidity / RemoveLiquidity / etc).
+    /// Carries the full effective balances after the event (re-scraped from storage).
+    CurveLiquidity {
+        effective_balances: Vec<u128>,
+    },
+
+    /// Curve StableSwap-NG RampA event.
+    CurveRampA {
+        initial_a: u64,
+        future_a: u64,
+        initial_a_time: u64,
+        future_a_time: u64,
+    },
+
+    /// Curve StableSwap-NG ApplyNewFee event.
+    CurveFeeUpdate {
+        fee: u64,
+        offpeg_fee_multiplier: u64,
+    },
+
+    /// Curve TwoCryptoNG TokenExchange event.
+    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
+    /// sends `tokens_bought` of coin[bought_id].
+    /// `packed_price_scale` carries the updated price_scale from the event.
+    /// `d` is read from pool storage (slot 14) after the swap — avoids
+    /// newton_D recomputation on the arena side.
+    TwoCryptoSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+        packed_price_scale: U256,
+        d: U256,
+    },
+
+    /// Curve TwoCryptoNG liquidity event (AddLiquidity / RemoveLiquidity / etc).
+    /// Carries the full balances after the event (re-scraped from storage).
+    TwoCryptoLiquidity {
+        balances: [u128; 2],
+    },
+
+    /// Curve TwoCryptoNG RampAgamma event.
+    TwoCryptoRampAgamma {
+        initial_a: u64,
+        future_a: u64,
+        initial_gamma: u128,
+        future_gamma: u128,
+        initial_time: u64,
+        future_time: u64,
+    },
+
+    /// Curve TwoCryptoNG NewParameters event.
+    TwoCryptoNewParameters {
+        mid_fee: u64,
+        out_fee: u64,
+        fee_gamma: u128,
+    },
+
+    /// Definitive slot0 state read from storage after a reorg.
+    /// Replaces the `slot0_resync_required` mechanism — the ExEx reads the
+    /// correct post-reorg state directly and sends it to the arena.
+    Slot0Override {
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
     },
 
     /// Fluid DEX full reserve snapshot.
@@ -173,6 +278,8 @@ pub enum ControlMessage {
         stream_seq: u64,
         block_number: u64,
         block_timestamp: u64,
+        /// EIP-1559 base fee in wei. Always present post-London.
+        base_fee_per_gas: u64,
         /// If true, this block's events are reverts (from ChainReorged or ChainReverted)
         is_revert: bool,
     },
@@ -203,12 +310,15 @@ pub enum ControlMessage {
     },
 
     /// Reorg boundary: emitted exactly once after the final EndBlock for that reorg batch.
+    /// Slot0 overrides for affected V3/V4/Ekubo pools are sent as `Slot0Override`
+    /// pool updates before this message.
     ReorgComplete {
         stream_seq: u64,
         final_tip_block: u64,
         /// Pools that require slot0 resync after the reorg.
         ///
-        /// Emitted deterministically from reverted V3/V4 swap events.
+        /// Kept for compatibility with the main ExEx schema. Overrides are still
+        /// emitted explicitly as `Slot0Override` updates.
         slot0_resync_required: Vec<PoolIdentifier>,
     },
 }
@@ -255,6 +365,7 @@ mod tests {
             stream_seq: 42,
             block_number: 1000,
             block_timestamp: 123,
+            base_fee_per_gas: 1_000_000_000,
             is_revert: false,
         };
 

@@ -3,7 +3,7 @@
 ## Overview
 
 The ExEx binary is bind-mounted from the host filesystem into the Reth container:
-- **Host path:** `/home/sam-sullivan/reth-exex-liquidity/target/release/exex`
+- **Host path:** `/home/sam-sullivan/reth-exex-liquidity/target-user/release/exex`
 - **Container path:** `/usr/local/bin/reth-exex`
 
 This means you only need to rebuild the binary and restart the container - no manual file copying required.
@@ -43,14 +43,14 @@ docker run --rm --network host \
     apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev &&
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
     . \$HOME/.cargo/env &&
-    cargo build --release
+    CARGO_TARGET_DIR=/workspace/target-user cargo build --release
   "
 ```
 
 **Notes:**
 - `--network host` ensures the container can resolve DNS for crates.io and GitHub
 - Build takes ~5-15 minutes depending on cached dependencies
-- Binary created at: `/home/sam-sullivan/reth-exex-liquidity/target/release/exex`
+- Binary created at: `/home/sam-sullivan/reth-exex-liquidity/target-user/release/exex`
 
 ### 2. Restart the Execution Container
 
@@ -114,7 +114,7 @@ LOG_LEVEL=debug
 3. Clean and rebuild:
    ```bash
    # Clean old artifacts (may need sudo if owned by root from previous Docker builds)
-   sudo rm -rf target/release
+   sudo rm -rf target-user/release
 
    # Rebuild using the Docker command above
    ```
@@ -124,8 +124,30 @@ LOG_LEVEL=debug
 ## One-Line Build Command
 
 ```bash
-cd /home/sam-sullivan/reth-exex-liquidity && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -w /workspace ubuntu:22.04 bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && cargo build --release" && cd /home/sam-sullivan/eth-docker && ./ethd restart execution
+cd /home/sam-sullivan/reth-exex-liquidity && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -w /workspace ubuntu:22.04 bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && CARGO_TARGET_DIR=/workspace/target-user cargo build --release" && cd /home/sam-sullivan/eth-docker && ./ethd restart execution
 ```
+
+## Justfile Automation
+
+A `justfile` is available in the repo root to make cutovers repeatable.
+
+```bash
+# Show latest upstream release metadata
+just reth-latest
+
+# Full cutover: update Cargo.toml tags, rebuild, restart, verify logs
+just deploy v1.11.2
+
+# Rebuild + restart without changing version
+just rebuild-and-restart
+```
+
+Available recipes:
+- `just set-reth-version vX.Y.Z`
+- `just build-exex`
+- `just restart-execution`
+- `just verify-exex`
+- `just deploy vX.Y.Z`
 
 ## Common Issues
 
@@ -144,7 +166,7 @@ cd /home/sam-sullivan/reth-exex-liquidity && docker run --rm --network host -v /
 **Cause:** Mixed ownership from host builds and Docker builds (root vs user)
 **Solution:**
 ```bash
-sudo rm -rf /home/sam-sullivan/reth-exex-liquidity/target/release
+sudo rm -rf /home/sam-sullivan/reth-exex-liquidity/target-user/release
 # Then rebuild
 ```
 
@@ -162,7 +184,7 @@ sudo rm -rf /home/sam-sullivan/reth-exex-liquidity/target/release
 **Error:** Changes not reflected after restart
 **Solution:** Check that build completed successfully and file timestamp updated:
 ```bash
-ls -lh /home/sam-sullivan/reth-exex-liquidity/target/release/exex
+ls -lh /home/sam-sullivan/reth-exex-liquidity/target-user/release/exex
 ```
 
 ### Container Won't Start

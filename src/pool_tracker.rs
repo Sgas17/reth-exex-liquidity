@@ -5,6 +5,7 @@
 // 2. Block-synchronized updates - changes applied between blocks to prevent event loss
 // 3. Pending update queue - whitelist changes queued and applied atomically
 
+use crate::events::EKUBO_CORE;
 use crate::fluid_decoder::FluidPoolConfig;
 use crate::types::{PoolIdentifier, PoolMetadata, Protocol};
 use alloy_primitives::{address, Address};
@@ -12,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{info, warn};
 
 // ============================================================================
-// UNISWAP V4 CONSTANTS
+// SINGLETON CONTRACT CONSTANTS
 // ============================================================================
 
 /// Uniswap V4 PoolManager singleton contract address (Ethereum Mainnet)
@@ -64,6 +65,9 @@ pub struct PoolTracker {
     v2_count: usize,
     v3_count: usize,
     v4_count: usize,
+    ekubo_count: usize,
+    curve_stable_count: usize,
+    curve_twocrypto_count: usize,
     fluid_count: usize,
 }
 
@@ -80,6 +84,9 @@ impl PoolTracker {
             v2_count: 0,
             v3_count: 0,
             v4_count: 0,
+            ekubo_count: 0,
+            curve_stable_count: 0,
+            curve_twocrypto_count: 0,
             fluid_count: 0,
         }
     }
@@ -139,10 +146,13 @@ impl PoolTracker {
         }
 
         info!(
-            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Fluid pools (total: {})",
+            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo, {} CurveStable, {} CurveTwoCrypto, {} Fluid pools (total: {})",
             self.v2_count,
             self.v3_count,
             self.v4_count,
+            self.ekubo_count,
+            self.curve_stable_count,
+            self.curve_twocrypto_count,
             self.fluid_count,
             self.pools_by_address.len() + self.pools_by_id.len()
         );
@@ -170,17 +180,31 @@ impl PoolTracker {
                     self.pools_by_address.insert(*addr, pool.clone());
                 }
                 PoolIdentifier::PoolId(id) => {
-                    // For V4 pools, track the poolId AND the PoolManager address
+                    // For V4/Ekubo pools, track the poolId AND the singleton address
                     self.tracked_pool_ids.insert(*id);
                     self.pools_by_id.insert(*id, pool.clone());
 
-                    // Also track PoolManager address so we receive its events
-                    if !self.tracked_addresses.contains(&UNISWAP_V4_POOL_MANAGER) {
-                        self.tracked_addresses.insert(UNISWAP_V4_POOL_MANAGER);
-                        info!(
-                            "🔧 Added PoolManager address to tracked addresses for V4 events: {:?}",
-                            UNISWAP_V4_POOL_MANAGER
-                        );
+                    // Track singleton contract addresses so we receive their events
+                    match pool.protocol {
+                        Protocol::UniswapV4 => {
+                            if !self.tracked_addresses.contains(&UNISWAP_V4_POOL_MANAGER) {
+                                self.tracked_addresses.insert(UNISWAP_V4_POOL_MANAGER);
+                                info!(
+                                    "🔧 Added PoolManager address for V4 events: {:?}",
+                                    UNISWAP_V4_POOL_MANAGER
+                                );
+                            }
+                        }
+                        Protocol::Ekubo => {
+                            if !self.tracked_addresses.contains(&EKUBO_CORE) {
+                                self.tracked_addresses.insert(EKUBO_CORE);
+                                info!(
+                                    "🔧 Added Ekubo Core address for Ekubo events: {:?}",
+                                    EKUBO_CORE
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -190,6 +214,9 @@ impl PoolTracker {
                 Protocol::UniswapV2 => self.v2_count += 1,
                 Protocol::UniswapV3 => self.v3_count += 1,
                 Protocol::UniswapV4 => self.v4_count += 1,
+                Protocol::Ekubo => self.ekubo_count += 1,
+                Protocol::CurveStable => self.curve_stable_count += 1,
+                Protocol::CurveTwoCrypto => self.curve_twocrypto_count += 1,
                 Protocol::Fluid => self.fluid_count += 1,
             }
 
@@ -228,6 +255,9 @@ impl PoolTracker {
                             Protocol::UniswapV2 => self.v2_count -= 1,
                             Protocol::UniswapV3 => self.v3_count -= 1,
                             Protocol::UniswapV4 => self.v4_count -= 1,
+                            Protocol::Ekubo => self.ekubo_count -= 1,
+                            Protocol::CurveStable => self.curve_stable_count -= 1,
+                            Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
@@ -243,6 +273,9 @@ impl PoolTracker {
                             Protocol::UniswapV2 => self.v2_count -= 1,
                             Protocol::UniswapV3 => self.v3_count -= 1,
                             Protocol::UniswapV4 => self.v4_count -= 1,
+                            Protocol::Ekubo => self.ekubo_count -= 1,
+                            Protocol::CurveStable => self.curve_stable_count -= 1,
+                            Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
