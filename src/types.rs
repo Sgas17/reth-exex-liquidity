@@ -66,6 +66,8 @@ pub enum Protocol {
     Ekubo,
     CurveStable,
     CurveTwoCrypto,
+    CurveTricrypto,
+    BalancerV2Weighted,
     Fluid,
 }
 
@@ -208,9 +210,56 @@ pub enum PoolUpdate {
         fee_gamma: u128,
     },
 
+    /// Curve TricryptoNG TokenExchange event.
+    TricryptoSwap {
+        sold_id: u8,
+        tokens_sold: u128,
+        bought_id: u8,
+        tokens_bought: u128,
+        /// Packed price_scale: ps[0] in lower 128, ps[1] in upper 128.
+        packed_price_scale: U256,
+        d: U256,
+    },
+
+    /// Curve TricryptoNG liquidity event (full re-scraped balances).
+    TricryptoLiquidity { balances: [u128; 3] },
+
+    /// Curve TricryptoNG RampAgamma event.
+    TricryptoRampAgamma {
+        initial_a: u64,
+        future_a: u64,
+        initial_gamma: u128,
+        future_gamma: u128,
+        initial_time: u64,
+        future_time: u64,
+    },
+
+    /// Curve TricryptoNG NewParameters event.
+    TricryptoNewParameters {
+        mid_fee: u64,
+        out_fee: u64,
+        fee_gamma: u128,
+    },
+
+    /// Balancer V2 Vault Swap event.
+    /// tokenIn/tokenOut identify which pair within the multi-token pool was swapped.
+    /// amountIn/amountOut are raw token amounts (not scaled to 18 dec).
+    BalancerSwap {
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        amount_out: U256,
+    },
+
+    /// Balancer V2 PoolBalanceChanged (join/exit).
+    /// Signed deltas per token (positive = entering pool, negative = leaving).
+    BalancerLiquidity { deltas: Vec<i128> },
+
+    /// Balancer V2 SwapFeePercentageChanged event.
+    BalancerFeeUpdate { swap_fee_percentage: u64 },
+
     /// Definitive slot0 state read from storage after a reorg.
-    /// Replaces the `slot0_resync_required` mechanism — the ExEx reads the
-    /// correct post-reorg state directly and sends it to the arena.
+    /// The ExEx reads the correct post-reorg state directly and sends it to the arena.
     Slot0Override {
         sqrt_price_x96: U256,
         liquidity: u128,
@@ -316,11 +365,6 @@ pub enum ControlMessage {
     ReorgComplete {
         stream_seq: u64,
         final_tip_block: u64,
-        /// Pools that require slot0 resync after the reorg.
-        ///
-        /// Kept for compatibility with the main ExEx schema. Overrides are still
-        /// emitted explicitly as `Slot0Override` updates.
-        slot0_resync_required: Vec<PoolIdentifier>,
     },
 }
 
@@ -379,7 +423,6 @@ mod tests {
         let msg = ControlMessage::ReorgComplete {
             stream_seq: 7,
             final_tip_block: 12345,
-            slot0_resync_required: vec![PoolIdentifier::PoolId([1u8; 32])],
         };
 
         let encoded = bincode::serialize(&msg).expect("serialize");
@@ -389,11 +432,9 @@ mod tests {
             ControlMessage::ReorgComplete {
                 stream_seq,
                 final_tip_block,
-                slot0_resync_required,
             } => {
                 assert_eq!(stream_seq, 7);
                 assert_eq!(final_tip_block, 12345);
-                assert_eq!(slot0_resync_required.len(), 1);
             }
             other => panic!("unexpected decoded variant: {other:?}"),
         }

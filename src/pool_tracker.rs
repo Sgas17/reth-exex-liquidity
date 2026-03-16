@@ -217,6 +217,8 @@ impl PoolTracker {
                 Protocol::Ekubo => self.ekubo_count += 1,
                 Protocol::CurveStable => self.curve_stable_count += 1,
                 Protocol::CurveTwoCrypto => self.curve_twocrypto_count += 1,
+                Protocol::CurveTricrypto => {}
+                Protocol::BalancerV2Weighted => {}
                 Protocol::Fluid => self.fluid_count += 1,
             }
 
@@ -258,6 +260,8 @@ impl PoolTracker {
                             Protocol::Ekubo => self.ekubo_count -= 1,
                             Protocol::CurveStable => self.curve_stable_count -= 1,
                             Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
+                            Protocol::CurveTricrypto => {}
+                            Protocol::BalancerV2Weighted => {}
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
@@ -276,6 +280,8 @@ impl PoolTracker {
                             Protocol::Ekubo => self.ekubo_count -= 1,
                             Protocol::CurveStable => self.curve_stable_count -= 1,
                             Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
+                            Protocol::CurveTricrypto => {}
+                            Protocol::BalancerV2Weighted => {}
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 

@@ -160,9 +160,14 @@ impl WhitelistNatsClient {
         for (i, address_str) in addresses.iter().enumerate() {
             let protocol_str = &protocols[i];
             let protocol = match protocol_str.as_str() {
-                "v2" => Protocol::UniswapV2,
-                "v3" => Protocol::UniswapV3,
-                "v4" => Protocol::UniswapV4,
+                "v2" | "uniswap_v2" => Protocol::UniswapV2,
+                "v3" | "uniswap_v3" => Protocol::UniswapV3,
+                "v4" | "uniswap_v4" => Protocol::UniswapV4,
+                "ekubo" => Protocol::Ekubo,
+                "curve_stable" => Protocol::CurveStable,
+                "curve_twocrypto" => Protocol::CurveTwoCrypto,
+                "curve_tricrypto" => Protocol::CurveTricrypto,
+                "balancer_v2_weighted" => Protocol::BalancerV2Weighted,
                 "fluid" => Protocol::Fluid,
                 unknown => {
                     warn!(

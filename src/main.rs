@@ -590,17 +590,11 @@ impl LiquidityExEx {
         }
     }
 
-    fn send_reorg_complete(
-        &self,
-        stream_seq: &mut u64,
-        final_tip_block: u64,
-        slot0_resync_required: Vec<PoolIdentifier>,
-    ) {
+    fn send_reorg_complete(&self, stream_seq: &mut u64, final_tip_block: u64) {
         let seq = next_stream_seq(stream_seq);
         if let Err(e) = self.socket_tx.try_send(ControlMessage::ReorgComplete {
             stream_seq: seq,
             final_tip_block,
-            slot0_resync_required,
         }) {
             warn!("Failed to send ReorgComplete: {}", e);
         }
@@ -858,7 +852,7 @@ fn read_ekubo_state<P: StateProviderFactory>(
 /// Send Slot0Override messages for all affected pools after a reorg.
 ///
 /// Reads definitive post-reorg state from `latest()` storage and sends
-/// override messages, replacing the old `slot0_resync_required` mechanism.
+/// override messages as the sole slot0 recovery mechanism.
 fn send_slot0_overrides<P: StateProviderFactory>(
     provider: &P,
     affected_pools: &HashSet<(PoolIdentifier, Protocol)>,
@@ -930,33 +924,6 @@ fn record_affected_slot0_pool(
     }
 }
 
-/// Compatibility bridge for the legacy `ReorgComplete.slot0_resync_required` field.
-///
-/// We still emit explicit `Slot0Override` updates, but keep this list populated so
-/// consumers expecting the main ExEx schema continue to work.
-fn build_slot0_resync_required(
-    affected: &HashSet<(PoolIdentifier, Protocol)>,
-) -> Vec<PoolIdentifier> {
-    let mut ids: Vec<PoolIdentifier> = affected
-        .iter()
-        .filter_map(|(pool_id, protocol)| {
-            matches!(protocol, Protocol::UniswapV3 | Protocol::UniswapV4 | Protocol::Ekubo)
-                .then_some(pool_id.clone())
-        })
-        .collect();
-
-    ids.sort_by_key(|id| match id {
-        PoolIdentifier::Address(addr) => format!("a:{}", hex::encode(addr)),
-        PoolIdentifier::PoolId(pid) => format!("p:{}", hex::encode(pid)),
-    });
-    ids.dedup_by(|a, b| std::mem::discriminant(a) == std::mem::discriminant(b) && match (a, b) {
-        (PoolIdentifier::Address(a1), PoolIdentifier::Address(a2)) => a1 == a2,
-        (PoolIdentifier::PoolId(p1), PoolIdentifier::PoolId(p2)) => p1 == p2,
-        _ => false,
-    });
-
-    ids
-}
 
 /// Main ExEx entry point
 async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
@@ -1580,12 +1547,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     final_tip_block,
                     new.blocks().values().last().map(|b| b.timestamp()).unwrap_or(0),
                 );
-                let slot0_resync_required = build_slot0_resync_required(&affected_slot0_pools);
-                exex.send_reorg_complete(
-                    &mut stream_seq,
-                    final_tip_block,
-                    slot0_resync_required,
-                );
+                exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
                 info!("✅ Reorg handled successfully");
             }
@@ -1736,12 +1698,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     final_tip_block,
                     0, // No new blocks in ChainReverted
                 );
-                let slot0_resync_required = build_slot0_resync_required(&affected_slot0_pools);
-                exex.send_reorg_complete(
-                    &mut stream_seq,
-                    final_tip_block,
-                    slot0_resync_required,
-                );
+                exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
                 info!("✅ Revert handled successfully");
             }
