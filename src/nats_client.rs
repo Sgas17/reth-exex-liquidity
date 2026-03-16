@@ -163,6 +163,7 @@ impl WhitelistNatsClient {
                 "v2" => Protocol::UniswapV2,
                 "v3" => Protocol::UniswapV3,
                 "v4" => Protocol::UniswapV4,
+                "fluid" => Protocol::Fluid,
                 unknown => {
                     warn!(
                         "Unknown protocol '{}' for pool {}, skipping",

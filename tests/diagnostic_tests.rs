@@ -61,6 +61,9 @@ fn simulate_event_processing(log: &Log, pool_tracker: &PoolTracker) -> EventProc
             pool_tracker.is_tracked_pool_id(pool_id)
         }
 
+        // Fluid LogOperate: check if pool is a tracked Fluid pool
+        DecodedEvent::FluidOperate { pool, .. } => pool_tracker.is_tracked_fluid_pool(pool),
+
         // Other protocols are not exercised by these diagnostics.
         _ => false,
     };

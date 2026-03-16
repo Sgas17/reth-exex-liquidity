@@ -6,6 +6,7 @@
 // 3. Pending update queue - whitelist changes queued and applied atomically
 
 use crate::events::EKUBO_CORE;
+use crate::fluid_decoder::FluidPoolConfig;
 use crate::types::{PoolIdentifier, PoolMetadata, Protocol};
 use alloy_primitives::{address, Address};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,6 +20,11 @@ use tracing::{info, warn};
 /// All V4 Swap and ModifyLiquidity events are emitted from this address
 /// Deployed: https://etherscan.io/address/0x000000000004444c5dc75cb358380d2e3de08a90
 pub const UNISWAP_V4_POOL_MANAGER: Address = address!("000000000004444c5dc75cb358380d2e3de08a90");
+
+/// Fluid Liquidity Layer singleton address (Ethereum Mainnet).
+/// All LogOperate events from Fluid DEX pools are emitted from this address.
+/// Deployed: https://etherscan.io/address/0x52Aa899454998Be5b000Ad077a46Bbe360F4e497
+pub const FLUID_LIQUIDITY_LAYER: Address = address!("52Aa899454998Be5b000Ad077a46Bbe360F4e497");
 
 /// Differential whitelist update operations
 #[derive(Debug, Clone)]
@@ -45,6 +51,10 @@ pub struct PoolTracker {
     /// Set of tracked pool IDs for fast lookup
     tracked_pool_ids: HashSet<[u8; 32]>,
 
+    /// Fluid pool configs — cached immutable constants from `constantsView()`.
+    /// Keyed by pool address. Populated at registration time via RPC.
+    fluid_configs: HashMap<Address, FluidPoolConfig>,
+
     /// Pending whitelist updates (applied between blocks)
     pending_updates: VecDeque<WhitelistUpdate>,
 
@@ -58,6 +68,7 @@ pub struct PoolTracker {
     ekubo_count: usize,
     curve_stable_count: usize,
     curve_twocrypto_count: usize,
+    fluid_count: usize,
 }
 
 impl PoolTracker {
@@ -67,6 +78,7 @@ impl PoolTracker {
             pools_by_id: HashMap::new(),
             tracked_addresses: HashSet::new(),
             tracked_pool_ids: HashSet::new(),
+            fluid_configs: HashMap::new(),
             pending_updates: VecDeque::new(),
             in_block: false,
             v2_count: 0,
@@ -75,6 +87,7 @@ impl PoolTracker {
             ekubo_count: 0,
             curve_stable_count: 0,
             curve_twocrypto_count: 0,
+            fluid_count: 0,
         }
     }
 
@@ -133,13 +146,14 @@ impl PoolTracker {
         }
 
         info!(
-            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo, {} CurveStable, {} CurveTwoCrypto pools (total: {})",
+            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo, {} CurveStable, {} CurveTwoCrypto, {} Fluid pools (total: {})",
             self.v2_count,
             self.v3_count,
             self.v4_count,
             self.ekubo_count,
             self.curve_stable_count,
             self.curve_twocrypto_count,
+            self.fluid_count,
             self.pools_by_address.len() + self.pools_by_id.len()
         );
     }
@@ -203,9 +217,19 @@ impl PoolTracker {
                 Protocol::Ekubo => self.ekubo_count += 1,
                 Protocol::CurveStable => self.curve_stable_count += 1,
                 Protocol::CurveTwoCrypto => self.curve_twocrypto_count += 1,
+                Protocol::Fluid => self.fluid_count += 1,
             }
 
             added += 1;
+        }
+
+        // Ensure Liquidity Layer address is tracked when any Fluid pools exist
+        if self.fluid_count > 0 && !self.tracked_addresses.contains(&FLUID_LIQUIDITY_LAYER) {
+            self.tracked_addresses.insert(FLUID_LIQUIDITY_LAYER);
+            info!(
+                "🔧 Added Fluid Liquidity Layer to tracked addresses for LogOperate events: {:?}",
+                FLUID_LIQUIDITY_LAYER
+            );
         }
 
         info!("Added {} new pools to whitelist", added);
@@ -221,6 +245,11 @@ impl PoolTracker {
                     if let Some(pool) = self.pools_by_address.remove(&addr) {
                         self.tracked_addresses.remove(&addr);
 
+                        // Clean up Fluid config if applicable
+                        if pool.protocol == Protocol::Fluid {
+                            self.fluid_configs.remove(&addr);
+                        }
+
                         // Update counts
                         match pool.protocol {
                             Protocol::UniswapV2 => self.v2_count -= 1,
@@ -229,6 +258,7 @@ impl PoolTracker {
                             Protocol::Ekubo => self.ekubo_count -= 1,
                             Protocol::CurveStable => self.curve_stable_count -= 1,
                             Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
+                            Protocol::Fluid => self.fluid_count -= 1,
                         }
 
                         removed += 1;
@@ -246,6 +276,7 @@ impl PoolTracker {
                             Protocol::Ekubo => self.ekubo_count -= 1,
                             Protocol::CurveStable => self.curve_stable_count -= 1,
                             Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
+                            Protocol::Fluid => self.fluid_count -= 1,
                         }
 
                         removed += 1;
@@ -266,15 +297,18 @@ impl PoolTracker {
         self.pools_by_id.clear();
         self.tracked_addresses.clear();
         self.tracked_pool_ids.clear();
+        self.fluid_configs.clear();
         self.v2_count = 0;
         self.v3_count = 0;
         self.v4_count = 0;
+        self.fluid_count = 0;
 
         // Add new pools
         self.add_pools(pools);
     }
 
     /// Legacy method for backward compatibility - converts to Replace update
+    #[allow(dead_code)]
     pub fn update_whitelist(&mut self, pools: Vec<PoolMetadata>) {
         self.queue_update(WhitelistUpdate::Replace(pools));
     }
@@ -290,23 +324,57 @@ impl PoolTracker {
     }
 
     /// Get pool metadata by address
+    #[allow(dead_code)]
     pub fn get_by_address(&self, address: &Address) -> Option<&PoolMetadata> {
         self.pools_by_address.get(address)
     }
 
     /// Get pool metadata by pool ID
+    #[allow(dead_code)]
     pub fn get_by_pool_id(&self, pool_id: &[u8; 32]) -> Option<&PoolMetadata> {
         self.pools_by_id.get(pool_id)
     }
 
     /// Get all tracked addresses
+    #[allow(dead_code)]
     pub fn tracked_addresses(&self) -> &HashSet<Address> {
         &self.tracked_addresses
     }
 
     /// Get all tracked pool IDs
+    #[allow(dead_code)]
     pub fn tracked_pool_ids(&self) -> &HashSet<[u8; 32]> {
         &self.tracked_pool_ids
+    }
+
+    /// Check if a pool address is a tracked Fluid pool.
+    pub fn is_tracked_fluid_pool(&self, address: &Address) -> bool {
+        self.pools_by_address
+            .get(address)
+            .map(|p| p.protocol == Protocol::Fluid)
+            .unwrap_or(false)
+    }
+
+    /// Check if a Fluid pool has its config resolved (slot addresses cached).
+    #[allow(dead_code)]
+    pub fn has_fluid_config(&self, address: &Address) -> bool {
+        self.fluid_configs.contains_key(address)
+    }
+
+    /// Register a Fluid pool's immutable config (slot addresses + precision).
+    /// Called once per pool at registration time after RPC resolution.
+    pub fn register_fluid_config(&mut self, config: FluidPoolConfig) {
+        info!(
+            pool = %config.pool_address,
+            liquidity = %config.liquidity_address,
+            "Registered Fluid pool config"
+        );
+        self.fluid_configs.insert(config.pool_address, config);
+    }
+
+    /// Get a Fluid pool's cached config for storage reads + decoding.
+    pub fn fluid_config(&self, pool: &Address) -> Option<&FluidPoolConfig> {
+        self.fluid_configs.get(pool)
     }
 
     /// Get statistics
@@ -316,21 +384,31 @@ impl PoolTracker {
             v2_pools: self.v2_count,
             v3_pools: self.v3_count,
             v4_pools: self.v4_count,
+            ekubo_pools: self.ekubo_count,
+            curve_stable_pools: self.curve_stable_count,
+            curve_twocrypto_pools: self.curve_twocrypto_count,
+            fluid_pools: self.fluid_count,
         }
     }
 
     /// Check if there are pending updates
+    #[allow(dead_code)]
     pub fn has_pending_updates(&self) -> bool {
         !self.pending_updates.is_empty()
     }
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PoolTrackerStats {
     pub total_pools: usize,
     pub v2_pools: usize,
     pub v3_pools: usize,
     pub v4_pools: usize,
+    pub ekubo_pools: usize,
+    pub curve_stable_pools: usize,
+    pub curve_twocrypto_pools: usize,
+    pub fluid_pools: usize,
 }
 
 impl Default for PoolTracker {
@@ -431,5 +509,54 @@ mod tests {
         // Should only count once
         assert_eq!(tracker.stats().total_pools, 1);
         assert_eq!(tracker.stats().v2_pools, 1);
+    }
+
+    #[test]
+    fn test_fluid_pool_tracking() {
+        let mut tracker = PoolTracker::new();
+
+        let fluid_addr = Address::from([0xAA; 20]);
+        let v2_addr = Address::from([0xBB; 20]);
+
+        let fluid_pool = create_test_pool(fluid_addr, Protocol::Fluid);
+        let v2_pool = create_test_pool(v2_addr, Protocol::UniswapV2);
+
+        tracker.queue_update(WhitelistUpdate::Add(vec![fluid_pool, v2_pool]));
+
+        assert_eq!(tracker.stats().fluid_pools, 1);
+        assert_eq!(tracker.stats().v2_pools, 1);
+        assert_eq!(tracker.stats().total_pools, 2);
+
+        // Fluid pool should be tracked by address
+        assert!(tracker.is_tracked_address(&fluid_addr));
+        assert!(tracker.is_tracked_fluid_pool(&fluid_addr));
+
+        // V2 pool should be tracked but NOT as Fluid
+        assert!(tracker.is_tracked_address(&v2_addr));
+        assert!(!tracker.is_tracked_fluid_pool(&v2_addr));
+
+        // Liquidity Layer singleton should be auto-added for LogOperate events
+        assert!(
+            tracker.is_tracked_address(&FLUID_LIQUIDITY_LAYER),
+            "Liquidity Layer address should be tracked when Fluid pools exist"
+        );
+    }
+
+    #[test]
+    fn test_fluid_pool_remove() {
+        let mut tracker = PoolTracker::new();
+
+        let fluid_addr = Address::from([0xCC; 20]);
+        let fluid_pool = create_test_pool(fluid_addr, Protocol::Fluid);
+
+        tracker.queue_update(WhitelistUpdate::Add(vec![fluid_pool]));
+        assert_eq!(tracker.stats().fluid_pools, 1);
+
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(
+            fluid_addr,
+        )]));
+
+        assert_eq!(tracker.stats().fluid_pools, 0);
+        assert!(!tracker.is_tracked_fluid_pool(&fluid_addr));
     }
 }

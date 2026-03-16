@@ -1,4 +1,6 @@
+#[allow(dead_code)]
 mod aggregator;
+#[allow(dead_code)]
 mod db;
 pub mod events;
 

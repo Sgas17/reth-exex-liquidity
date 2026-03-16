@@ -45,6 +45,11 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 [dev-dependencies]
 chrono = "0.4"
 rust_decimal_macros = "1.39"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "fluid_decoder"
+harness = false
 
 [[bin]]
 name = "exex"

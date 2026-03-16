@@ -48,6 +48,7 @@ impl PoolIdentifier {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_pool_id(&self) -> Option<[u8; 32]> {
         match self {
             PoolIdentifier::Address(_) => None,
@@ -65,6 +66,7 @@ pub enum Protocol {
     Ekubo,
     CurveStable,
     CurveTwoCrypto,
+    Fluid,
 }
 
 /// Update type - which event triggered this update
@@ -214,6 +216,24 @@ pub enum PoolUpdate {
         liquidity: u128,
         tick: i32,
     },
+
+    /// Fluid DEX full reserve snapshot.
+    ///
+    /// Decoded from 8 storage slots post-`LogOperate`. Contains the
+    /// complete reserve state — no further RPC calls needed by the arena.
+    /// All reserve values in 1e12 decimals (resolver format).
+    FluidSwap {
+        col_token0_real: u128,
+        col_token1_real: u128,
+        col_token0_imaginary: u128,
+        col_token1_imaginary: u128,
+        debt_token0_real: u128,
+        debt_token1_real: u128,
+        debt_token0_imaginary: u128,
+        debt_token1_imaginary: u128,
+        center_price: u128,
+        fee: u128,
+    },
 }
 
 /// Pool metadata from whitelist
@@ -306,6 +326,7 @@ pub enum ControlMessage {
 
 impl ControlMessage {
     /// Returns stream sequence for sequenced messages.
+    #[allow(dead_code)]
     pub fn stream_seq(&self) -> Option<u64> {
         match self {
             ControlMessage::BeginBlock { stream_seq, .. }
