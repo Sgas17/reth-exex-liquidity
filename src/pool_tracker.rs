@@ -5,7 +5,7 @@
 // 2. Block-synchronized updates - changes applied between blocks to prevent event loss
 // 3. Pending update queue - whitelist changes queued and applied atomically
 
-use crate::events::EKUBO_CORE;
+use crate::events::{BALANCER_V2_VAULT, EKUBO_CORE};
 use crate::fluid_decoder::FluidPoolConfig;
 use crate::types::{PoolIdentifier, PoolMetadata, Protocol};
 use alloy_primitives::{address, Address};
@@ -68,6 +68,8 @@ pub struct PoolTracker {
     ekubo_count: usize,
     curve_stable_count: usize,
     curve_twocrypto_count: usize,
+    curve_tricrypto_count: usize,
+    balancer_v2_count: usize,
     fluid_count: usize,
 }
 
@@ -87,6 +89,8 @@ impl PoolTracker {
             ekubo_count: 0,
             curve_stable_count: 0,
             curve_twocrypto_count: 0,
+            curve_tricrypto_count: 0,
+            balancer_v2_count: 0,
             fluid_count: 0,
         }
     }
@@ -146,13 +150,15 @@ impl PoolTracker {
         }
 
         info!(
-            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo, {} CurveStable, {} CurveTwoCrypto, {} Fluid pools (total: {})",
+            "Whitelist now tracking: {} V2, {} V3, {} V4, {} Ekubo, {} CurveStable, {} CurveTwoCrypto, {} CurveTricrypto, {} BalancerV2, {} Fluid pools (total: {})",
             self.v2_count,
             self.v3_count,
             self.v4_count,
             self.ekubo_count,
             self.curve_stable_count,
             self.curve_twocrypto_count,
+            self.curve_tricrypto_count,
+            self.balancer_v2_count,
             self.fluid_count,
             self.pools_by_address.len() + self.pools_by_id.len()
         );
@@ -204,6 +210,15 @@ impl PoolTracker {
                                 );
                             }
                         }
+                        Protocol::BalancerV2Weighted => {
+                            if !self.tracked_addresses.contains(&BALANCER_V2_VAULT) {
+                                self.tracked_addresses.insert(BALANCER_V2_VAULT);
+                                info!(
+                                    "🔧 Added Balancer V2 Vault for Swap/PoolBalanceChanged events: {:?}",
+                                    BALANCER_V2_VAULT
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -217,8 +232,8 @@ impl PoolTracker {
                 Protocol::Ekubo => self.ekubo_count += 1,
                 Protocol::CurveStable => self.curve_stable_count += 1,
                 Protocol::CurveTwoCrypto => self.curve_twocrypto_count += 1,
-                Protocol::CurveTricrypto => {}
-                Protocol::BalancerV2Weighted => {}
+                Protocol::CurveTricrypto => self.curve_tricrypto_count += 1,
+                Protocol::BalancerV2Weighted => self.balancer_v2_count += 1,
                 Protocol::Fluid => self.fluid_count += 1,
             }
 
@@ -260,8 +275,8 @@ impl PoolTracker {
                             Protocol::Ekubo => self.ekubo_count -= 1,
                             Protocol::CurveStable => self.curve_stable_count -= 1,
                             Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
-                            Protocol::CurveTricrypto => {}
-                            Protocol::BalancerV2Weighted => {}
+                            Protocol::CurveTricrypto => self.curve_tricrypto_count -= 1,
+                            Protocol::BalancerV2Weighted => self.balancer_v2_count -= 1,
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
@@ -280,8 +295,8 @@ impl PoolTracker {
                             Protocol::Ekubo => self.ekubo_count -= 1,
                             Protocol::CurveStable => self.curve_stable_count -= 1,
                             Protocol::CurveTwoCrypto => self.curve_twocrypto_count -= 1,
-                            Protocol::CurveTricrypto => {}
-                            Protocol::BalancerV2Weighted => {}
+                            Protocol::CurveTricrypto => self.curve_tricrypto_count -= 1,
+                            Protocol::BalancerV2Weighted => self.balancer_v2_count -= 1,
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
@@ -307,6 +322,11 @@ impl PoolTracker {
         self.v2_count = 0;
         self.v3_count = 0;
         self.v4_count = 0;
+        self.ekubo_count = 0;
+        self.curve_stable_count = 0;
+        self.curve_twocrypto_count = 0;
+        self.curve_tricrypto_count = 0;
+        self.balancer_v2_count = 0;
         self.fluid_count = 0;
 
         // Add new pools
@@ -327,6 +347,11 @@ impl PoolTracker {
     /// Check if a pool ID is tracked
     pub fn is_tracked_pool_id(&self, pool_id: &[u8; 32]) -> bool {
         self.tracked_pool_ids.contains(pool_id)
+    }
+
+    /// Get the protocol of a pool tracked by address.
+    pub fn get_protocol(&self, address: &Address) -> Option<Protocol> {
+        self.pools_by_address.get(address).map(|m| m.protocol)
     }
 
     /// Get pool metadata by address

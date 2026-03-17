@@ -403,6 +403,89 @@ pub const EKUBO_CORE: Address = Address::new([
 ]);
 
 // ============================================================================
+// BALANCER V2 VAULT EVENTS
+// ============================================================================
+// The Vault (0xBA12222222228d8Ba445958a75a0704d566BF2C8) emits Swap and
+// PoolBalanceChanged events for ALL Balancer pools. Pool identification uses
+// the indexed poolId (bytes32) in topics.
+
+mod balancer {
+    use super::*;
+
+    sol! {
+        /// Vault Swap event.
+        /// Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut)
+        #[derive(Debug)]
+        event Swap(
+            bytes32 indexed poolId,
+            address indexed tokenIn,
+            address indexed tokenOut,
+            uint256 amountIn,
+            uint256 amountOut
+        );
+
+        /// Vault PoolBalanceChanged event (join/exit).
+        /// PoolBalanceChanged(bytes32 indexed poolId, address indexed liquidityProvider, address[] tokens, int256[] deltas, uint256[] protocolFeeAmounts)
+        #[derive(Debug)]
+        event PoolBalanceChanged(
+            bytes32 indexed poolId,
+            address indexed liquidityProvider,
+            address[] tokens,
+            int256[] deltas,
+            uint256[] protocolFeeAmounts
+        );
+    }
+}
+
+use balancer::{
+    PoolBalanceChanged as BalancerPoolBalanceChanged,
+    Swap as BalancerVaultSwap,
+};
+
+/// Balancer V2 Vault contract address (Ethereum Mainnet).
+pub const BALANCER_V2_VAULT: Address = Address::new([
+    0xBA, 0x12, 0x22, 0x22, 0x22, 0x22, 0x8d, 0x8B,
+    0xa4, 0x45, 0x95, 0x8a, 0x75, 0xa0, 0x70, 0x4d,
+    0x56, 0x6B, 0xF2, 0xC8,
+]);
+
+// ============================================================================
+// CURVE TRICRYPTO-NG EVENTS (unique signatures only)
+// ============================================================================
+// TokenExchange, RampAgamma, NewParameters, RemoveLiquidityOne share signatures
+// with TwoCryptoNG. Only AddLiquidity and RemoveLiquidity differ (uint256[3]
+// vs uint256[2] fixed arrays).
+
+mod tricrypto {
+    use super::*;
+
+    sol! {
+        /// TricryptoNG AddLiquidity (uint256[3] token_amounts, not [2]).
+        #[derive(Debug)]
+        event AddLiquidity(
+            address indexed provider,
+            uint256[3] token_amounts,
+            uint256 fee,
+            uint256 token_supply,
+            uint256[2] packed_price_scale
+        );
+
+        /// TricryptoNG RemoveLiquidity (uint256[3] token_amounts, not [2]).
+        #[derive(Debug)]
+        event RemoveLiquidity(
+            address indexed provider,
+            uint256[3] token_amounts,
+            uint256 token_supply
+        );
+    }
+}
+
+use tricrypto::{
+    AddLiquidity as TricryptoAddLiquidity,
+    RemoveLiquidity as TricryptoRemoveLiquidity,
+};
+
+// ============================================================================
 // EVENT DECODING LOGIC
 // ============================================================================
 
@@ -538,6 +621,25 @@ pub enum DecodedEvent {
         pool: Address,
         #[allow(dead_code)]
         token: Address,
+    },
+    /// TricryptoNG liquidity event (AddLiquidity / RemoveLiquidity).
+    /// Only these two have unique signatures (uint256[3] arrays); other Tricrypto
+    /// events share signatures with TwoCrypto and are disambiguated in create_pool_update.
+    TricryptoLiquidityChange {
+        pool: Address,
+    },
+    /// Balancer V2 Vault Swap event.
+    BalancerSwap {
+        pool_id: [u8; 32],
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        amount_out: U256,
+    },
+    /// Balancer V2 Vault PoolBalanceChanged (join/exit).
+    BalancerPoolBalanceChanged {
+        pool_id: [u8; 32],
+        deltas: Vec<i128>,
     },
 }
 
@@ -861,6 +963,61 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
         }
     }
 
+    // ── Balancer V2 Vault events ──────────────────────────────────────────
+    // The Vault singleton emits Swap and PoolBalanceChanged for all Balancer pools.
+    // poolId is in topics[1]; tokenIn/tokenOut are indexed for Swap.
+
+    if log.address == BALANCER_V2_VAULT {
+        // Vault Swap: topics = [sig, poolId, tokenIn, tokenOut], data = (amountIn, amountOut)
+        if log.topics().len() >= 4 && log.topics()[0] == BalancerVaultSwap::SIGNATURE_HASH {
+            if let Ok(event) = BalancerVaultSwap::decode_log_data(&log.data) {
+                let pool_id: [u8; 32] = log.topics()[1].into();
+                let token_in = Address::from_slice(&log.topics()[2].as_slice()[12..]);
+                let token_out = Address::from_slice(&log.topics()[3].as_slice()[12..]);
+                return Some(DecodedEvent::BalancerSwap {
+                    pool_id,
+                    token_in,
+                    token_out,
+                    amount_in: event.amountIn,
+                    amount_out: event.amountOut,
+                });
+            }
+        }
+
+        // PoolBalanceChanged: topics = [sig, poolId, liquidityProvider], data = (tokens[], deltas[], protocolFees[])
+        if log.topics().len() >= 3 && log.topics()[0] == BalancerPoolBalanceChanged::SIGNATURE_HASH {
+            if let Ok(event) = BalancerPoolBalanceChanged::decode_log_data(&log.data) {
+                let pool_id: [u8; 32] = log.topics()[1].into();
+                let deltas: Vec<i128> = event.deltas.iter()
+                    .map(|d| {
+                        if *d >= alloy_primitives::I256::ZERO {
+                            i128::try_from(d.into_raw().saturating_to::<u128>()).unwrap_or(i128::MAX)
+                        } else {
+                            -i128::try_from((-*d).into_raw().saturating_to::<u128>()).unwrap_or(i128::MAX)
+                        }
+                    })
+                    .collect();
+                return Some(DecodedEvent::BalancerPoolBalanceChanged {
+                    pool_id,
+                    deltas,
+                });
+            }
+        }
+    }
+
+    // ── Curve TricryptoNG-specific events ─────────────────────────────────
+    // Only AddLiquidity and RemoveLiquidity have unique signatures (uint256[3]
+    // fixed arrays). TokenExchange, RampAgamma, NewParameters share sigs with
+    // TwoCrypto — those are decoded above and disambiguated in create_pool_update.
+
+    if let Ok(_event) = TricryptoAddLiquidity::decode_log(log) {
+        return Some(DecodedEvent::TricryptoLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = TricryptoRemoveLiquidity::decode_log(log) {
+        return Some(DecodedEvent::TricryptoLiquidityChange { pool });
+    }
+
     None
 }
 
@@ -939,6 +1096,32 @@ mod tests {
             FluidLogOperate::SIGNATURE_HASH,
             alloy_primitives::B256::ZERO,
             "FluidLogOperate signature should not be zero"
+        );
+
+        // Balancer V2 Vault Event Signatures
+        // Swap(bytes32,address,address,uint256,uint256)
+        assert_eq!(
+            BalancerVaultSwap::SIGNATURE_HASH.to_string(),
+            "0x2170c741c41531aec20e7c107c24eecfdd15e69c9bb0a8dd37b1840b9e0b207b"
+        );
+
+        // PoolBalanceChanged(bytes32,address,address[],int256[],uint256[])
+        assert_eq!(
+            BalancerPoolBalanceChanged::SIGNATURE_HASH.to_string(),
+            "0xe5ce249087ce04f05a957192435400fd97868dba0e6a4b4c049abf8af80dae78"
+        );
+
+        // Curve TricryptoNG Event Signatures (unique — differ from TwoCrypto)
+        // AddLiquidity(address,uint256[3],uint256,uint256,uint256[2])
+        assert_eq!(
+            TricryptoAddLiquidity::SIGNATURE_HASH.to_string(),
+            "0x4a25e5f3348d6ab046b8d1d91f70bc1bc13edf735bc3faf523868488dc39326c"
+        );
+
+        // RemoveLiquidity(address,uint256[3],uint256)
+        assert_eq!(
+            TricryptoRemoveLiquidity::SIGNATURE_HASH.to_string(),
+            "0xd6cc314a0b1e3b2579f8e64248e82434072e8271290eef8ad0886709304195f5"
         );
     }
 

@@ -439,6 +439,12 @@ impl LiquidityExEx {
             // ============================================================================
             // CURVE TWOCRYPTO-NG EVENTS
             // ============================================================================
+            // ============================================================================
+            // CURVE TWOCRYPTO / TRICRYPTO EVENTS (shared signatures)
+            // ============================================================================
+            // TwoCrypto and Tricrypto share TokenExchange, RampAgamma, NewParameters,
+            // and RemoveLiquidityOne signatures. Disambiguate by pool protocol.
+
             DecodedEvent::TwoCryptoSwap {
                 pool,
                 sold_id,
@@ -446,38 +452,63 @@ impl LiquidityExEx {
                 bought_id,
                 tokens_bought,
                 packed_price_scale,
-            } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::CurveTwoCrypto,
-                update_type: UpdateType::Swap,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::TwoCryptoSwap {
-                    sold_id,
-                    tokens_sold,
-                    bought_id,
-                    tokens_bought,
-                    packed_price_scale,
-                    d: U256::ZERO, // Enriched from storage after creation
-                },
-            }),
-
-            DecodedEvent::TwoCryptoLiquidityChange { pool } => {
+            } => {
+                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let update = if is_tricrypto {
+                    PoolUpdate::TricryptoSwap {
+                        sold_id,
+                        tokens_sold,
+                        bought_id,
+                        tokens_bought,
+                        packed_price_scale,
+                        d: U256::ZERO, // Enriched from storage after creation
+                    }
+                } else {
+                    PoolUpdate::TwoCryptoSwap {
+                        sold_id,
+                        tokens_sold,
+                        bought_id,
+                        tokens_bought,
+                        packed_price_scale,
+                        d: U256::ZERO,
+                    }
+                };
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
-                    protocol: Protocol::CurveTwoCrypto,
+                    protocol,
+                    update_type: UpdateType::Swap,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update,
+                })
+            }
+
+            DecodedEvent::TwoCryptoLiquidityChange { pool } => {
+                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let update = if is_tricrypto {
+                    PoolUpdate::TricryptoLiquidity {
+                        balances: [0; 3], // Empty — arena will re-scrape
+                    }
+                } else {
+                    PoolUpdate::TwoCryptoLiquidity {
+                        balances: [0; 2],
+                    }
+                };
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol,
                     update_type: UpdateType::Mint,
                     block_number,
                     block_timestamp,
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::TwoCryptoLiquidity {
-                        balances: [0; 2], // Empty — arena will re-scrape
-                    },
+                    update,
                 })
             }
 
@@ -489,44 +520,133 @@ impl LiquidityExEx {
                 future_gamma,
                 initial_time,
                 future_time,
-            } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::CurveTwoCrypto,
-                update_type: UpdateType::Swap,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::TwoCryptoRampAgamma {
-                    initial_a,
-                    future_a,
-                    initial_gamma,
-                    future_gamma,
-                    initial_time,
-                    future_time,
-                },
-            }),
+            } => {
+                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let update = if is_tricrypto {
+                    PoolUpdate::TricryptoRampAgamma {
+                        initial_a,
+                        future_a,
+                        initial_gamma,
+                        future_gamma,
+                        initial_time,
+                        future_time,
+                    }
+                } else {
+                    PoolUpdate::TwoCryptoRampAgamma {
+                        initial_a,
+                        future_a,
+                        initial_gamma,
+                        future_gamma,
+                        initial_time,
+                        future_time,
+                    }
+                };
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol,
+                    update_type: UpdateType::Swap,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update,
+                })
+            }
 
             DecodedEvent::TwoCryptoNewParameters {
                 pool,
                 mid_fee,
                 out_fee,
                 fee_gamma,
+            } => {
+                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let update = if is_tricrypto {
+                    PoolUpdate::TricryptoNewParameters {
+                        mid_fee,
+                        out_fee,
+                        fee_gamma,
+                    }
+                } else {
+                    PoolUpdate::TwoCryptoNewParameters {
+                        mid_fee,
+                        out_fee,
+                        fee_gamma,
+                    }
+                };
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol,
+                    update_type: UpdateType::Swap,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update,
+                })
+            }
+
+            // ============================================================================
+            // CURVE TRICRYPTO EVENTS (unique signatures)
+            // ============================================================================
+            DecodedEvent::TricryptoLiquidityChange { pool } => {
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::CurveTricrypto,
+                    update_type: UpdateType::Mint,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::TricryptoLiquidity {
+                        balances: [0; 3], // Empty — arena will re-scrape
+                    },
+                })
+            }
+
+            // ============================================================================
+            // BALANCER V2 EVENTS
+            // ============================================================================
+            DecodedEvent::BalancerSwap {
+                pool_id,
+                token_in,
+                token_out,
+                amount_in,
+                amount_out,
             } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::CurveTwoCrypto,
+                pool_id: PoolIdentifier::PoolId(pool_id),
+                protocol: Protocol::BalancerV2Weighted,
                 update_type: UpdateType::Swap,
                 block_number,
                 block_timestamp,
                 tx_index,
                 log_index,
                 is_revert,
-                update: PoolUpdate::TwoCryptoNewParameters {
-                    mid_fee,
-                    out_fee,
-                    fee_gamma,
+                update: PoolUpdate::BalancerSwap {
+                    token_in,
+                    token_out,
+                    amount_in,
+                    amount_out,
                 },
+            }),
+
+            DecodedEvent::BalancerPoolBalanceChanged {
+                pool_id,
+                deltas,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::PoolId(pool_id),
+                protocol: Protocol::BalancerV2Weighted,
+                update_type: UpdateType::Mint,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::BalancerLiquidity { deltas },
             }),
 
             // ============================================================================
@@ -634,11 +754,25 @@ impl LiquidityExEx {
             }
 
             // Curve TwoCrypto events: check pool address
+            // NOTE: Tricrypto pools share TokenExchange/RampAgamma/NewParameters
+            // signatures with TwoCrypto — they are decoded as TwoCrypto variants
+            // and disambiguated in create_pool_update.
             DecodedEvent::TwoCryptoSwap { pool, .. }
             | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
             | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
             | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
                 pool_tracker.is_tracked_address(pool)
+            }
+
+            // Curve Tricrypto-specific events (unique signatures)
+            DecodedEvent::TricryptoLiquidityChange { pool, .. } => {
+                pool_tracker.is_tracked_address(pool)
+            }
+
+            // Balancer V2 events: check pool_id (emitted by Vault singleton)
+            DecodedEvent::BalancerSwap { pool_id, .. }
+            | DecodedEvent::BalancerPoolBalanceChanged { pool_id, .. } => {
+                pool_tracker.is_tracked_pool_id(pool_id)
             }
 
             // Fluid LogOperate: emitted by Liquidity Layer, `pool` is the
@@ -685,7 +819,17 @@ impl LiquidityExEx {
                 | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
                 | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
                 | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
-                    debug!("Filtered CurveTwoCrypto event from untracked pool: {:?}", pool);
+                    debug!("Filtered CurveTwoCrypto/Tricrypto event from untracked pool: {:?}", pool);
+                }
+                DecodedEvent::TricryptoLiquidityChange { pool, .. } => {
+                    debug!("Filtered CurveTricrypto event from untracked pool: {:?}", pool);
+                }
+                DecodedEvent::BalancerSwap { pool_id, .. }
+                | DecodedEvent::BalancerPoolBalanceChanged { pool_id, .. } => {
+                    debug!(
+                        "Filtered Balancer V2 event from untracked pool_id: {:?}",
+                        hex::encode(pool_id)
+                    );
                 }
                 DecodedEvent::FluidOperate { pool, .. } => {
                     debug!("Filtered Fluid LogOperate from untracked pool: {:?}", pool);
@@ -736,12 +880,12 @@ fn enrich_with_storage<P: StateProviderFactory>(
     provider: &P,
 ) {
     match &mut msg.update {
-        PoolUpdate::TwoCryptoSwap { d, .. } => {
+        PoolUpdate::TwoCryptoSwap { d, .. }
+        | PoolUpdate::TricryptoSwap { d, .. } => {
             if let Some(address) = msg.pool_id.as_address() {
                 *d = read_storage_slot(provider, address, CURVE_D_SLOT);
             }
         }
-        // Future: PoolUpdate::TricryptoSwap { d, .. } => { ... }
         _ => {}
     }
 }
