@@ -418,6 +418,8 @@ impl PoolTracker {
             ekubo_pools: self.ekubo_count,
             curve_stable_pools: self.curve_stable_count,
             curve_twocrypto_pools: self.curve_twocrypto_count,
+            curve_tricrypto_pools: self.curve_tricrypto_count,
+            balancer_v2_pools: self.balancer_v2_count,
             fluid_pools: self.fluid_count,
         }
     }
@@ -439,6 +441,8 @@ pub struct PoolTrackerStats {
     pub ekubo_pools: usize,
     pub curve_stable_pools: usize,
     pub curve_twocrypto_pools: usize,
+    pub curve_tricrypto_pools: usize,
+    pub balancer_v2_pools: usize,
     pub fluid_pools: usize,
 }
 
