@@ -841,8 +841,17 @@ impl LiquidityExEx {
     }
 }
 
-/// Curve pool storage slot for D (TwoCrypto slot 14, Tricrypto slot 14).
-const CURVE_D_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
+/// Curve pool storage slot for D.
+///
+/// TwoCryptoNG layout (Vyper 0.4.1):
+///   slot 9  = balances[0]
+///   slot 10 = balances[1]
+///   slot 11 = D              ← correct
+///   slot 14 = virtual_price  ← was incorrectly used before
+///
+/// Verified empirically via eth_getStorageAt on multiple live TwoCrypto pools.
+/// Matches scrape_reth/src/twocrypto_storage.rs slots::D = 11.
+const CURVE_D_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
 
 /// Read a single storage slot from the state at a given block.
 ///

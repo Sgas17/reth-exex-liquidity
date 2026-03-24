@@ -543,14 +543,17 @@ fn calculate_debt_reserves(gp: u128, pb: u128, dx: u128, dy: u128) -> (u128, u12
 
     let dx_dy = mul256(dx, dy);
     let e50 = U256::from(10u64).pow(U256::from(50u64));
-    let p2 = if dx_dy < e50 {
-        u128_from_u256(dx_dy * U256::from(pb) / U256::from(E27))
+    // Keep p2 as U256 to avoid u128 overflow when dx*dy is large
+    // (e.g. high-TVL stablecoin pools where dx*dy*pb/E27 > u128::MAX ≈ 3.4e38).
+    // Truncating to u128 here gives a completely wrong ry and cascades to rx=0.
+    let p2_u256 = if dx_dy < e50 {
+        dx_dy * U256::from(pb) / U256::from(E27)
     } else {
-        u128_from_u256(dx_dy / U256::from(E27) * U256::from(pb))
+        dx_dy / U256::from(E27) * U256::from(pb)
     };
 
     let p1_abs = p1.unsigned_abs();
-    let ry = (p1 + isqrt_u256(U256::from(p2) + mul256(p1_abs, p1_abs)) as i128) as u128;
+    let ry = (p1 + isqrt_u256(p2_u256 + mul256(p1_abs, p1_abs)) as i128) as u128;
 
     let ry_sq = mul256(ry, ry);
     let iry_denom = mul256(ry, E27) - mul256(dx, pb); // ry*1e27 - dx*pb
@@ -1260,5 +1263,34 @@ mod tests {
         compare_reserves("Pool ea734b (USDC/USDT)", &decoded, &col, &debt, n0, d0, n1, d1, 1);
 
         println!("\n✅ Pool ea734b all reserves match within 1%");
+    }
+
+    /// Pool 667701 (USDC/USDT): arena verifier shows debt_token0_real=0 in arena.
+    /// This test checks what the decoder actually produces for this pool.
+    #[tokio::test]
+    #[ignore = "requires local reth node on localhost:8545"]
+    async fn test_e2e_pool_667701_usdc_usdt() {
+        let rpc = "http://localhost:8545";
+        // Use a recent block that matches the current arena state.
+        let block: u64 = 24728700;
+        let timestamp: u64 = 1774371200;
+        let pool = "667701e51b4d1ca244f17c78f7ab8744b4c99f9b";
+
+        let (config, decoded) = decode_pool_at_block(pool, rpc, block, timestamp).await;
+        let col = resolver_collateral(pool, rpc, block).await;
+        let debt = resolver_debt(pool, rpc, block).await;
+
+        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
+        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+
+        println!("token0 prec: num={} denom={}", n0, d0);
+        println!("token1 prec: num={} denom={}", n1, d1);
+        println!("decoded.debt_token0_real = {}", decoded.debt_token0_real_reserves);
+        println!("decoded.debt_token1_real = {}", decoded.debt_token1_real_reserves);
+        println!("resolver debt: {:?}", debt);
+
+        compare_reserves("Pool 667701 (USDC/USDT)", &decoded, &col, &debt, n0, d0, n1, d1, 5);
+
+        println!("\n✅ Pool 667701 all reserves match within 5%");
     }
 }
