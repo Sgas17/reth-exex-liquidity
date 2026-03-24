@@ -1238,4 +1238,27 @@ mod tests {
 
         println!("\n✅ Pool 1 all reserves match within 2%");
     }
+
+    /// Pool ea734b... (USDC/USDT): debt-only Fluid pool that showed a
+    /// token0/token1 swap in the live arena. This is the regression target.
+    #[tokio::test]
+    #[ignore = "requires local reth node on localhost:8545"]
+    async fn test_e2e_pool_ea734b_usdc_usdt() {
+        let rpc = "http://localhost:8545";
+        let block: u64 = 24727726;
+        let timestamp: u64 = 1774359311;
+        let pool = "ea734b615888c669667038d11950f44b177f15c0";
+
+        let (config, decoded) = decode_pool_at_block(pool, rpc, block, timestamp).await;
+        let col = resolver_collateral(pool, rpc, block).await;
+        let debt = resolver_debt(pool, rpc, block).await;
+
+        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
+        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+
+        assert_eq!(decoded.fee, 7, "fee mismatch");
+        compare_reserves("Pool ea734b (USDC/USDT)", &decoded, &col, &debt, n0, d0, n1, d1, 1);
+
+        println!("\n✅ Pool ea734b all reserves match within 1%");
+    }
 }
