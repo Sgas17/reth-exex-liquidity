@@ -153,9 +153,15 @@ pub enum PoolUpdate {
     },
 
     /// Curve StableSwap-NG liquidity event (AddLiquidity / RemoveLiquidity / etc).
-    /// Carries the full effective balances after the event (re-scraped from storage).
+    /// Carries the full post-state from storage so the arena can update directly.
     CurveLiquidity {
         effective_balances: Vec<u128>,
+        fee: u64,
+        offpeg_fee_multiplier: u64,
+        initial_a: u64,
+        future_a: u64,
+        initial_a_time: u64,
+        future_a_time: u64,
     },
 
     /// Curve StableSwap-NG RampA event.
@@ -176,7 +182,7 @@ pub enum PoolUpdate {
     /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
     /// sends `tokens_bought` of coin[bought_id].
     /// `packed_price_scale` carries the updated price_scale from the event.
-    /// `d` is read from pool storage (slot 14) after the swap — avoids
+    /// `d` is read from pool storage after the swap — avoids
     /// newton_D recomputation on the arena side.
     TwoCryptoSwap {
         sold_id: u8,
@@ -188,9 +194,11 @@ pub enum PoolUpdate {
     },
 
     /// Curve TwoCryptoNG liquidity event (AddLiquidity / RemoveLiquidity / etc).
-    /// Carries the full balances after the event (re-scraped from storage).
+    /// Carries the full post-state from storage so the arena never needs to rescrape.
     TwoCryptoLiquidity {
         balances: [u128; 2],
+        price_scale: U256,
+        d: U256,
     },
 
     /// Curve TwoCryptoNG RampAgamma event.
@@ -221,8 +229,12 @@ pub enum PoolUpdate {
         d: U256,
     },
 
-    /// Curve TricryptoNG liquidity event (full re-scraped balances).
-    TricryptoLiquidity { balances: [u128; 3] },
+    /// Curve TricryptoNG liquidity event (full post-state from storage).
+    TricryptoLiquidity {
+        balances: [u128; 3],
+        packed_price_scale: U256,
+        d: U256,
+    },
 
     /// Curve TricryptoNG RampAgamma event.
     TricryptoRampAgamma {

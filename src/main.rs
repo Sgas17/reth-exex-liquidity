@@ -8,6 +8,12 @@
 // Architecture:
 //   Reth ExEx → Event Decoder → Pool State Extractor → Unix Socket → Orderbook Engine
 
+// Use jemalloc as the global allocator to avoid glibc robust mutex crashes
+// with MDBX. Without this, glibc's pthread_mutex_lock can abort() the process
+// when a thread dies while holding an MDBX reader table lock (ESRCH).
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
 mod balance_monitor;
 mod events;
 mod fluid_decoder;
@@ -66,7 +72,7 @@ impl LiquidityExEx {
     }
 
     /// Convert a decoded event into a PoolUpdateMessage
-    fn create_pool_update(
+    fn create_pool_update<P: StateProviderFactory>(
         &self,
         event: DecodedEvent,
         block_number: u64,
@@ -74,6 +80,7 @@ impl LiquidityExEx {
         tx_index: u64,
         log_index: u64,
         is_revert: bool,
+        provider: &P,
         _pool_tracker: &PoolTracker,
     ) -> Option<PoolUpdateMessage> {
         match event {
@@ -377,19 +384,32 @@ impl LiquidityExEx {
             }),
 
             DecodedEvent::CurveLiquidityChange { pool } => {
-                // Liquidity events don't carry enough info for delta tracking.
-                // Signal the arena to re-scrape this pool's balances from storage.
+                let (
+                    effective_balances,
+                    fee,
+                    offpeg_fee_multiplier,
+                    initial_a,
+                    future_a,
+                    initial_a_time,
+                    future_a_time,
+                ) = read_curve_stable_liquidity_state(provider, pool);
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::CurveStable,
-                    update_type: UpdateType::Mint, // Generic — arena re-scrapes regardless
+                    update_type: UpdateType::Mint,
                     block_number,
                     block_timestamp,
                     tx_index,
                     log_index,
                     is_revert,
                     update: PoolUpdate::CurveLiquidity {
-                        effective_balances: vec![], // Empty — arena will re-scrape
+                        effective_balances,
+                        fee,
+                        offpeg_fee_multiplier,
+                        initial_a,
+                        future_a,
+                        initial_a_time,
+                        future_a_time,
                     },
                 })
             }
@@ -491,12 +511,18 @@ impl LiquidityExEx {
                 let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
                 let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
                 let update = if is_tricrypto {
+                    let (balances, packed_price_scale, d) = read_tricrypto_liquidity_state(provider, pool);
                     PoolUpdate::TricryptoLiquidity {
-                        balances: [0; 3], // Empty — arena will re-scrape
+                        balances,
+                        packed_price_scale,
+                        d,
                     }
                 } else {
+                    let (balances, price_scale, d) = read_twocrypto_liquidity_state(provider, pool);
                     PoolUpdate::TwoCryptoLiquidity {
-                        balances: [0; 2],
+                        balances,
+                        price_scale,
+                        d,
                     }
                 };
                 Some(PoolUpdateMessage {
@@ -593,6 +619,7 @@ impl LiquidityExEx {
             // CURVE TRICRYPTO EVENTS (unique signatures)
             // ============================================================================
             DecodedEvent::TricryptoLiquidityChange { pool } => {
+                let (balances, packed_price_scale, d) = read_tricrypto_liquidity_state(provider, pool);
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::CurveTricrypto,
@@ -603,7 +630,9 @@ impl LiquidityExEx {
                     log_index,
                     is_revert,
                     update: PoolUpdate::TricryptoLiquidity {
-                        balances: [0; 3], // Empty — arena will re-scrape
+                        balances,
+                        packed_price_scale,
+                        d,
                     },
                 })
             }
@@ -841,17 +870,22 @@ impl LiquidityExEx {
     }
 }
 
-/// Curve pool storage slot for D.
-///
-/// TwoCryptoNG layout (Vyper 0.4.1):
+/// TwoCryptoNG D slot (Vyper 0.4.1 layout).
 ///   slot 9  = balances[0]
 ///   slot 10 = balances[1]
 ///   slot 11 = D              ← correct
-///   slot 14 = virtual_price  ← was incorrectly used before
-///
-/// Verified empirically via eth_getStorageAt on multiple live TwoCrypto pools.
+///   slot 14 = virtual_price  ← was incorrectly used before fix
 /// Matches scrape_reth/src/twocrypto_storage.rs slots::D = 11.
-const CURVE_D_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
+const TWOCRYPTO_D_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
+
+/// TricryptoNG D slot (Vyper 0.3.10 layout — different from TwoCrypto).
+///   slot 11 = balances[0]   ← NOT D
+///   slot 12 = balances[1]
+///   slot 13 = balances[2]
+///   slot 14 = D              ← correct
+///   slot 17 = virtual_price
+/// Matches scrape_reth/src/tricrypto_storage.rs slots::D = 14.
+const TRICRYPTO_D_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
 
 /// Read a single storage slot from the state at a given block.
 ///
@@ -880,19 +914,82 @@ fn read_storage_slot<P: StateProviderFactory>(
     }
 }
 
+fn read_twocrypto_liquidity_state<P: StateProviderFactory>(
+    provider: &P,
+    address: Address,
+) -> ([u128; 2], U256, U256) {
+    let balances = [
+        read_storage_slot(provider, address, U256::from_limbs([9, 0, 0, 0])).to::<u128>(),
+        read_storage_slot(provider, address, U256::from_limbs([10, 0, 0, 0])).to::<u128>(),
+    ];
+    let price_scale = read_storage_slot(provider, address, U256::from_limbs([1, 0, 0, 0]));
+    let d = read_storage_slot(provider, address, TWOCRYPTO_D_SLOT);
+    (balances, price_scale, d)
+}
+
+fn read_tricrypto_liquidity_state<P: StateProviderFactory>(
+    provider: &P,
+    address: Address,
+) -> ([u128; 3], U256, U256) {
+    let balances = [
+        read_storage_slot(provider, address, U256::from_limbs([11, 0, 0, 0])).to::<u128>(),
+        read_storage_slot(provider, address, U256::from_limbs([12, 0, 0, 0])).to::<u128>(),
+        read_storage_slot(provider, address, U256::from_limbs([13, 0, 0, 0])).to::<u128>(),
+    ];
+    let packed_price_scale = read_storage_slot(provider, address, U256::from_limbs([3, 0, 0, 0]));
+    let d = read_storage_slot(provider, address, TRICRYPTO_D_SLOT);
+    (balances, packed_price_scale, d)
+}
+
+fn read_curve_stable_liquidity_state<P: StateProviderFactory>(
+    provider: &P,
+    address: Address,
+) -> (Vec<u128>, u64, u64, u64, u64, u64, u64) {
+    let n_coins = read_storage_slot(provider, address, U256::from(1u64)).to::<usize>();
+    let n_coins = n_coins.min(8);
+
+    let mut effective_balances = Vec::with_capacity(n_coins);
+    for i in 0..n_coins {
+        let stored = read_storage_slot(provider, address, U256::from((2 + i) as u64)).to::<u128>();
+        let admin = read_storage_slot(provider, address, U256::from((17 + i) as u64)).to::<u128>();
+        effective_balances.push(stored.saturating_sub(admin));
+    }
+
+    let fee = read_storage_slot(provider, address, U256::from(10u64)).to::<u64>();
+    let offpeg_fee_multiplier = read_storage_slot(provider, address, U256::from(11u64)).to::<u64>();
+    let initial_a = read_storage_slot(provider, address, U256::from(12u64)).to::<u64>();
+    let future_a = read_storage_slot(provider, address, U256::from(13u64)).to::<u64>();
+    let initial_a_time = read_storage_slot(provider, address, U256::from(14u64)).to::<u64>();
+    let future_a_time = read_storage_slot(provider, address, U256::from(15u64)).to::<u64>();
+
+    (
+        effective_balances,
+        fee,
+        offpeg_fee_multiplier,
+        initial_a,
+        future_a,
+        initial_a_time,
+        future_a_time,
+    )
+}
+
 /// Enrich a pool update message with storage-derived fields.
 ///
-/// For Curve TwoCrypto/Tricrypto swap events, reads D from storage (slot 14)
-/// to avoid newton_D recomputation on the arena side.
+/// For Curve TwoCrypto/Tricrypto swap events, reads D from storage using the
+/// protocol-specific slot to avoid newton_D recomputation on the arena side.
 fn enrich_with_storage<P: StateProviderFactory>(
     msg: &mut PoolUpdateMessage,
     provider: &P,
 ) {
     match &mut msg.update {
-        PoolUpdate::TwoCryptoSwap { d, .. }
-        | PoolUpdate::TricryptoSwap { d, .. } => {
+        PoolUpdate::TwoCryptoSwap { d, .. } => {
             if let Some(address) = msg.pool_id.as_address() {
-                *d = read_storage_slot(provider, address, CURVE_D_SLOT);
+                *d = read_storage_slot(provider, address, TWOCRYPTO_D_SLOT);
+            }
+        }
+        PoolUpdate::TricryptoSwap { d, .. } => {
+            if let Some(address) = msg.pool_id.as_address() {
+                *d = read_storage_slot(provider, address, TRICRYPTO_D_SLOT);
             }
         }
         _ => {}
@@ -1351,6 +1448,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 false,
+                                ctx.provider(),
                                 &pool_tracker,
                             ) {
                                 if enrich_storage_for_block {
@@ -1520,6 +1618,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 true,
+                                ctx.provider(),
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(
@@ -1618,6 +1717,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 false,
+                                ctx.provider(),
                                 &pool_tracker,
                             ) {
                                 if enrich_storage_for_block {
@@ -1788,6 +1888,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 true,
+                                ctx.provider(),
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(

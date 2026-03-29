@@ -137,17 +137,15 @@ async fn handle_client(
             }
         };
 
-        // Send length prefix (4 bytes) + message
+        // Send length prefix (4 bytes) + message as a single write
+        // to prevent partial frames if the process crashes mid-send.
         let len = serialized.len() as u32;
-        let len_bytes = len.to_le_bytes();
+        let mut frame = Vec::with_capacity(4 + serialized.len());
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(&serialized);
 
-        if let Err(e) = stream.write_all(&len_bytes).await {
-            error!("Failed to write message length: {}", e);
-            break;
-        }
-
-        if let Err(e) = stream.write_all(&serialized).await {
-            error!("Failed to write message: {}", e);
+        if let Err(e) = stream.write_all(&frame).await {
+            error!("Failed to write framed message: {}", e);
             break;
         }
 
