@@ -998,7 +998,8 @@ fn enrich_with_storage<P: StateProviderFactory>(
 
 /// V3 storage slots.
 const V3_SLOT0: U256 = U256::from_limbs([0, 0, 0, 0]);
-const V3_LIQUIDITY: U256 = U256::from_limbs([4, 0, 0, 0]);
+const V3_LIQUIDITY_VANILLA: U256 = U256::from_limbs([4, 0, 0, 0]);
+const V3_LIQUIDITY_PANCAKE: U256 = U256::from_limbs([5, 0, 0, 0]);
 
 /// V4 PoolManager mapping slot (pools mapping at slot 6).
 const V4_POOLS_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
@@ -1047,6 +1048,21 @@ fn v4_pool_base_slot(pool_id: &[u8; 32]) -> U256 {
     U256::from_be_bytes(*keccak256(&encoded))
 }
 
+fn read_v3_liquidity<P: StateProviderFactory>(provider: &P, address: Address) -> u128 {
+    let liquidity_raw = read_storage_slot(provider, address, V3_LIQUIDITY_VANILLA);
+
+    // Vanilla Uniswap V3-compatible pools store a plain uint128 at slot 4.
+    if (liquidity_raw >> 128usize).is_zero() {
+        return liquidity_raw.to::<u128>();
+    }
+
+    // PancakeSwap V3 on Ethereum packs protocolFees into slot 4 and stores
+    // liquidity at slot 5 instead. Minimal whitelist updates do not preserve
+    // factory metadata, so reorg overrides need this runtime fallback.
+    let pancake_liquidity_raw = read_storage_slot(provider, address, V3_LIQUIDITY_PANCAKE);
+    pancake_liquidity_raw.to::<u128>()
+}
+
 /// Read slot0 override for a V3 pool from latest state.
 fn read_v3_slot0<P: StateProviderFactory>(
     provider: &P,
@@ -1057,8 +1073,7 @@ fn read_v3_slot0<P: StateProviderFactory>(
         return None;
     }
     let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
-    let liquidity_raw = read_storage_slot(provider, address, V3_LIQUIDITY);
-    let liquidity = liquidity_raw.to::<u128>();
+    let liquidity = read_v3_liquidity(provider, address);
     Some((sqrt_price_x96, tick, liquidity))
 }
 
