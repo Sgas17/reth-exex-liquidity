@@ -79,6 +79,29 @@ pub enum UpdateType {
     Burn,
 }
 
+/// Slot0-like post-state shared by swap and reorg-epilogue messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Slot0State {
+    pub sqrt_price_x96: U256,
+    pub liquidity: u128,
+    pub tick: i32,
+}
+
+/// Full Fluid reserve snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FluidState {
+    pub col_token0_real: u128,
+    pub col_token1_real: u128,
+    pub col_token0_imaginary: u128,
+    pub col_token1_imaginary: u128,
+    pub debt_token0_real: u128,
+    pub debt_token1_real: u128,
+    pub debt_token0_imaginary: u128,
+    pub debt_token1_imaginary: u128,
+    pub center_price: u128,
+    pub fee: u128,
+}
+
 /// Pool update data - enum of all possible update types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolUpdate {
@@ -270,30 +293,29 @@ pub enum PoolUpdate {
     /// Balancer V2 SwapFeePercentageChanged event.
     BalancerFeeUpdate { swap_fee_percentage: u64 },
 
-    /// Definitive slot0 state read from storage after a reorg.
-    /// The ExEx reads the correct post-reorg state directly and sends it to the arena.
-    Slot0Override {
-        sqrt_price_x96: U256,
-        liquidity: u128,
-        tick: i32,
-    },
-
     /// Fluid DEX full reserve snapshot.
     ///
     /// Decoded from 8 storage slots post-`LogOperate`. Contains the
     /// complete reserve state — no further RPC calls needed by the arena.
     /// All reserve values in 1e12 decimals (resolver format).
-    FluidSwap {
-        col_token0_real: u128,
-        col_token1_real: u128,
-        col_token0_imaginary: u128,
-        col_token1_imaginary: u128,
-        debt_token0_real: u128,
-        debt_token1_real: u128,
-        debt_token0_imaginary: u128,
-        debt_token1_imaginary: u128,
-        center_price: u128,
-        fee: u128,
+    FluidState { state: FluidState },
+}
+
+/// Reorg-epilogue-only canonical state updates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReorgEpilogueUpdate {
+    /// Definitive final slot0 state read from storage after a reorg settles.
+    Slot0Final {
+        pool_id: PoolIdentifier,
+        protocol: Protocol,
+        state: Slot0State,
+    },
+
+    /// Definitive final Fluid reserve state for pools not covered by replayed
+    /// new-chain block updates.
+    FluidStateFinal {
+        pool_id: PoolIdentifier,
+        state: FluidState,
     },
 }
 
@@ -371,9 +393,16 @@ pub enum ControlMessage {
         new_range: ReorgRange,
     },
 
-    /// Reorg boundary: emitted exactly once after the final EndBlock for that reorg batch.
-    /// Slot0 overrides for affected V3/V4/Ekubo pools are sent as `Slot0Override`
-    /// pool updates before this message.
+    /// Reorg epilogue update: emitted after replayed blocks, outside any
+    /// BeginBlock/EndBlock envelope, while the reorg is still open.
+    ReorgEpilogue {
+        stream_seq: u64,
+        final_tip_block: u64,
+        final_tip_timestamp: u64,
+        update: ReorgEpilogueUpdate,
+    },
+
+    /// Reorg boundary: emitted exactly once after all epilogue updates.
     ReorgComplete {
         stream_seq: u64,
         final_tip_block: u64,
@@ -389,6 +418,7 @@ impl ControlMessage {
             | ControlMessage::PoolUpdate { stream_seq, .. }
             | ControlMessage::EndBlock { stream_seq, .. }
             | ControlMessage::ReorgStart { stream_seq, .. }
+            | ControlMessage::ReorgEpilogue { stream_seq, .. }
             | ControlMessage::ReorgComplete { stream_seq, .. } => Some(*stream_seq),
             ControlMessage::UpdateWhitelist(_) | ControlMessage::Ping | ControlMessage::Pong => {
                 None

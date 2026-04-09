@@ -45,7 +45,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use types::{
-    ControlMessage, PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, ReorgRange, UpdateType,
+    ControlMessage, FluidState, PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol,
+    ReorgEpilogueUpdate, ReorgRange, Slot0State, UpdateType,
 };
 
 /// Main ExEx state
@@ -739,6 +740,24 @@ impl LiquidityExEx {
         }
     }
 
+    fn send_reorg_epilogue(
+        &self,
+        stream_seq: &mut u64,
+        final_tip_block: u64,
+        final_tip_timestamp: u64,
+        update: ReorgEpilogueUpdate,
+    ) {
+        let seq = next_stream_seq(stream_seq);
+        if let Err(e) = self.socket_tx.try_send(ControlMessage::ReorgEpilogue {
+            stream_seq: seq,
+            final_tip_block,
+            final_tip_timestamp,
+            update,
+        }) {
+            warn!("Failed to send ReorgEpilogue: {}", e);
+        }
+    }
+
     fn send_reorg_complete(&self, stream_seq: &mut u64, final_tip_block: u64) {
         let seq = next_stream_seq(stream_seq);
         if let Err(e) = self.socket_tx.try_send(ControlMessage::ReorgComplete {
@@ -1114,11 +1133,11 @@ fn read_ekubo_state<P: StateProviderFactory>(
     Some((sqrt_ratio, tick, liquidity))
 }
 
-/// Send Slot0Override messages for all affected pools after a reorg.
+/// Send final slot0 epilogue messages for all affected pools after a reorg.
 ///
 /// Reads definitive post-reorg state from `latest()` storage and sends
-/// override messages as the sole slot0 recovery mechanism.
-fn send_slot0_overrides<P: StateProviderFactory>(
+/// epilogue messages as the sole slot0 recovery mechanism.
+fn send_slot0_finals<P: StateProviderFactory>(
     provider: &P,
     affected_pools: &HashSet<(PoolIdentifier, Protocol)>,
     exex: &LiquidityExEx,
@@ -1150,28 +1169,25 @@ fn send_slot0_overrides<P: StateProviderFactory>(
             continue;
         };
 
-        let update_msg = PoolUpdateMessage {
-            pool_id: pool_id.clone(),
-            protocol: *protocol,
-            update_type: UpdateType::Swap, // Reuses swap path in arena
+        exex.send_reorg_epilogue(
+            stream_seq,
             block_number,
             block_timestamp,
-            tx_index: u64::MAX, // Sentinel: synthetic override, not from a real tx
-            log_index: u64::MAX,
-            is_revert: false,
-            update: PoolUpdate::Slot0Override {
-                sqrt_price_x96,
-                liquidity,
-                tick,
+            ReorgEpilogueUpdate::Slot0Final {
+                pool_id: pool_id.clone(),
+                protocol: *protocol,
+                state: Slot0State {
+                    sqrt_price_x96,
+                    liquidity,
+                    tick,
+                },
             },
-        };
-
-        exex.send_pool_update(stream_seq, update_msg);
+        );
         overrides_sent += 1;
     }
 
     if overrides_sent > 0 {
-        info!("Sent {} slot0 overrides after reorg", overrides_sent);
+        info!("Sent {} slot0 final epilogue updates after reorg", overrides_sent);
     }
 }
 
@@ -1794,8 +1810,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(ctx.provider(), config, tip_timestamp) {
                                 Some(reserves) => {
-                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, final_tip_block, tip_timestamp));
-                                    debug!(pool = %pool_addr, "Decoded Fluid reserves post-reorg (not in new chain)");
+                                    exex.send_reorg_epilogue(
+                                        &mut stream_seq,
+                                        final_tip_block,
+                                        tip_timestamp,
+                                        ReorgEpilogueUpdate::FluidStateFinal {
+                                            pool_id: PoolIdentifier::Address(*pool_addr),
+                                            state: fluid_state_from_reserves(&reserves),
+                                        },
+                                    );
+                                    debug!(pool = %pool_addr, "Decoded Fluid reserves post-reorg epilogue (not in new chain)");
                                 }
                                 None => {
                                     warn!(pool = %pool_addr, "Failed to decode Fluid reserves post-reorg");
@@ -1807,7 +1831,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
 
                 // Send definitive slot0 overrides from latest() state
-                send_slot0_overrides(
+                send_slot0_finals(
                     ctx.provider(),
                     &affected_slot0_pools,
                     &exex,
@@ -1946,8 +1970,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(ctx.provider(), config, tip_timestamp) {
                                 Some(reserves) => {
-                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, final_tip_block, tip_timestamp));
-                                    debug!(pool = %pool_addr, "Decoded Fluid reserves post-revert");
+                                    exex.send_reorg_epilogue(
+                                        &mut stream_seq,
+                                        final_tip_block,
+                                        tip_timestamp,
+                                        ReorgEpilogueUpdate::FluidStateFinal {
+                                            pool_id: PoolIdentifier::Address(*pool_addr),
+                                            state: fluid_state_from_reserves(&reserves),
+                                        },
+                                    );
+                                    debug!(pool = %pool_addr, "Decoded Fluid reserves post-revert epilogue");
                                 }
                                 None => {
                                     warn!(pool = %pool_addr, "Failed to decode Fluid reserves post-revert");
@@ -1959,7 +1991,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
 
                 // Send definitive slot0 overrides from latest() state
-                send_slot0_overrides(
+                send_slot0_finals(
                     ctx.provider(),
                     &affected_slot0_pools,
                     &exex,
@@ -1985,6 +2017,21 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
 #[inline]
 /// Build a `PoolUpdateMessage` from decoded Fluid reserves.
+fn fluid_state_from_reserves(reserves: &fluid_decoder::FluidReserves) -> FluidState {
+    FluidState {
+        col_token0_real: reserves.col_token0_real_reserves,
+        col_token1_real: reserves.col_token1_real_reserves,
+        col_token0_imaginary: reserves.col_token0_imaginary_reserves,
+        col_token1_imaginary: reserves.col_token1_imaginary_reserves,
+        debt_token0_real: reserves.debt_token0_real_reserves,
+        debt_token1_real: reserves.debt_token1_real_reserves,
+        debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
+        debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
+        center_price: reserves.center_price,
+        fee: reserves.fee,
+    }
+}
+
 fn fluid_update_msg(
     pool_addr: Address,
     reserves: &fluid_decoder::FluidReserves,
@@ -2000,17 +2047,8 @@ fn fluid_update_msg(
         tx_index: 0,
         log_index: 0,
         is_revert: false,
-        update: PoolUpdate::FluidSwap {
-            col_token0_real: reserves.col_token0_real_reserves,
-            col_token1_real: reserves.col_token1_real_reserves,
-            col_token0_imaginary: reserves.col_token0_imaginary_reserves,
-            col_token1_imaginary: reserves.col_token1_imaginary_reserves,
-            debt_token0_real: reserves.debt_token0_real_reserves,
-            debt_token1_real: reserves.debt_token1_real_reserves,
-            debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
-            debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
-            center_price: reserves.center_price,
-            fee: reserves.fee,
+        update: PoolUpdate::FluidState {
+            state: fluid_state_from_reserves(reserves),
         },
     }
 }
