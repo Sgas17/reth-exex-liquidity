@@ -101,7 +101,6 @@ fn save_to_disk(path: &Path, tokens: &HashMap<Address, u8>) -> Result<(), String
 mod tests {
     use super::*;
     use alloy_primitives::address;
-    use std::io::Write;
 
     #[test]
     fn add_returns_true_for_new_token() {

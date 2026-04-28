@@ -9,12 +9,12 @@
 pub mod slots;
 pub mod token_tracker;
 
-use alloy_consensus::{BlockHeader, TxReceipt, transaction::TxHashRef};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
 use alloy_primitives::{Address, Log, U256};
 use futures::{StreamExt, TryStreamExt};
+use reth::providers::StateProviderFactory;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{BlockBody, FullNodeComponents, NodePrimitives};
-use reth::providers::StateProviderFactory;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,25 +24,26 @@ use tracing::{debug, info, warn};
 use crate::swap_monitor::{self, SwapConfirmation};
 use crate::transfers::events::decode_transfer;
 
-/// NATS message matching `ChainBalanceSnapshot` schema in defi_arb_rust/common.
+/// NATS message matching `ChainBalanceSnapshot` schema in `foundation_messaging`.
 ///
-/// The hedger deserializes this as `ChainBalanceSnapshot`, so field names and
-/// serde formats must match exactly.
+/// The hedger and quoter deserialize this as `ChainBalanceSnapshot`, so field
+/// names and serde formats must match exactly.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChainBalanceSnapshot {
     pub chain: String,
+    pub block_number: u64,
     pub balances: Vec<ChainTokenBalance>,
     pub ts: u64,
 }
 
-/// Per-token balance entry matching `ChainTokenBalance` in common/messages.rs.
+/// Per-token raw balance entry matching `ChainTokenBalance` in `foundation_messaging`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChainTokenBalance {
     pub token: String,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub available: Decimal,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "rust_decimal::serde::str_option")]
-    pub total: Option<Decimal>,
+    pub raw_available: String,
+    pub decimals: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_total: Option<String>,
 }
 
 /// Convert a raw U256 balance to a human-readable Decimal given token decimals.
@@ -69,9 +70,12 @@ pub fn u256_to_decimal(raw: U256, decimals: u8) -> Decimal {
     d.checked_mul(scale).unwrap_or(Decimal::MAX)
 }
 
-/// How often to publish a full snapshot of all balances (in blocks).
-/// Acts as a resync mechanism if individual publishes are lost.
-const FULL_SNAPSHOT_INTERVAL: u64 = 50;
+/// Default full snapshot interval in blocks. Acts as a resync mechanism if
+/// individual publishes are lost.
+const DEFAULT_FULL_SNAPSHOT_INTERVAL_BLOCKS: u64 = 5;
+
+/// Startup whitelist wait before seeding persisted balances anyway.
+const DEFAULT_STARTUP_WHITELIST_TIMEOUT_MS: u64 = 2_000;
 
 /// Max retry attempts for a failed NATS publish before giving up on that message.
 const PUBLISH_MAX_RETRIES: u32 = 2;
@@ -88,6 +92,7 @@ const WHITELIST_RESUB_BASE_DELAY: std::time::Duration = std::time::Duration::fro
 /// Build a full snapshot of all tracked token balances.
 fn build_full_snapshot(
     chain_id: &str,
+    block_number: u64,
     tracker: &TokenTracker,
     balances: &HashMap<Address, U256>,
 ) -> ChainBalanceSnapshot {
@@ -97,27 +102,28 @@ fn build_full_snapshot(
             let raw = balances.get(&token).copied().unwrap_or(U256::ZERO);
             ChainTokenBalance {
                 token: format!("{token:#x}"),
-                available: u256_to_decimal(raw, decimals),
-                total: None,
+                raw_available: raw.to_string(),
+                decimals,
+                raw_total: None,
             }
         })
         .collect();
 
     ChainBalanceSnapshot {
         chain: chain_id.to_string(),
+        block_number,
         balances: entries,
         ts: now_ms(),
     }
 }
 
 /// Publish to NATS with retry. Returns true on success.
-async fn publish_with_retry(
-    client: &async_nats::Client,
-    subject: &str,
-    payload: Vec<u8>,
-) -> bool {
+async fn publish_with_retry(client: &async_nats::Client, subject: &str, payload: Vec<u8>) -> bool {
     for attempt in 0..=PUBLISH_MAX_RETRIES {
-        match client.publish(subject.to_string(), payload.clone().into()).await {
+        match client
+            .publish(subject.to_string(), payload.clone().into())
+            .await
+        {
             Ok(()) => return true,
             Err(e) => {
                 if attempt < PUBLISH_MAX_RETRIES {
@@ -147,13 +153,25 @@ where
         .parse()
         .map_err(|e| eyre::eyre!("invalid BALANCE_MONITOR_ADDRESS: {e}"))?;
 
-    let chain_id =
-        std::env::var("BALANCE_MONITOR_CHAIN_ID").unwrap_or_else(|_| "1".to_string());
+    let chain_id = std::env::var("BALANCE_MONITOR_CHAIN_ID").unwrap_or_else(|_| "1".to_string());
 
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
 
     let chain = std::env::var("CHAIN").unwrap_or_else(|_| "ethereum".to_string());
+
+    let full_snapshot_interval_blocks =
+        std::env::var("BALANCE_MONITOR_FULL_SNAPSHOT_INTERVAL_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_FULL_SNAPSHOT_INTERVAL_BLOCKS);
+
+    let startup_whitelist_timeout_ms =
+        std::env::var("BALANCE_MONITOR_STARTUP_WHITELIST_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_STARTUP_WHITELIST_TIMEOUT_MS);
 
     // Derive persist path from reth datadir.
     let persist_path = std::env::var("BALANCE_MONITOR_PERSIST_PATH")
@@ -174,6 +192,8 @@ where
         persist_path = %persist_path.display(),
         nats_subject = %nats_subject,
         swap_subject = %swap_subject,
+        full_snapshot_interval_blocks,
+        startup_whitelist_timeout_ms,
         "balance monitor + swap monitor config"
     );
 
@@ -192,16 +212,71 @@ where
     let mut whitelist_sub = Some(nats_client.subscribe(whitelist_subject.clone()).await?);
     info!(subject = %whitelist_subject, "subscribed to whitelist for token discovery");
 
+    // Ask whitelist publishers for a fresh full snapshot, then wait briefly before
+    // seeding balances. Persisted tokens still provide a safe startup fallback.
+    let reseed_payload = br#"{"source":"balance_monitor"}"#.to_vec();
+    if let Err(e) = nats_client
+        .publish(
+            "whitelist.reseed".to_string(),
+            reseed_payload.clone().into(),
+        )
+        .await
+    {
+        warn!(error = %e, "failed to request whitelist reseed");
+    }
+    let snapshot_request_subject = format!("whitelist.snapshot.request.{chain}");
+    if let Err(e) = nats_client
+        .publish(snapshot_request_subject.clone(), reseed_payload.into())
+        .await
+    {
+        debug!(error = %e, subject = %snapshot_request_subject, "failed to request whitelist snapshot");
+    }
+
+    if let Some(sub) = whitelist_sub.as_mut() {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(startup_whitelist_timeout_ms),
+            sub.next(),
+        )
+        .await
+        {
+            Ok(Some(msg)) => {
+                let new_tokens = process_whitelist_message(&msg.payload, &mut tracker);
+                info!(
+                    new_tokens = new_tokens.len(),
+                    total = tracker.len(),
+                    "processed startup whitelist snapshot"
+                );
+            }
+            Ok(None) => warn!("whitelist subscription closed during startup snapshot wait"),
+            Err(_) => info!(
+                timeout_ms = startup_whitelist_timeout_ms,
+                persisted_tokens = tracker.len(),
+                "startup whitelist snapshot wait timed out; proceeding with persisted tokens"
+            ),
+        }
+    }
+
     // ── In-memory balance map ───────────────────────────────────────────
 
     let mut balances: HashMap<Address, U256> = HashMap::new();
 
-    // Seed existing tracked tokens from Reth DB.
+    // Seed tracked tokens from Reth DB after the startup whitelist barrier.
     seed_balances_from_db(ctx.provider(), executor_address, &tracker, &mut balances)?;
     info!(
         tokens = tracker.len(),
         "seeded initial balances from Reth DB"
     );
+
+    if tracker.len() > 0 {
+        let snapshot = build_full_snapshot(&chain_id, 0, &tracker, &balances);
+        let payload = serde_json::to_vec(&snapshot).expect("ChainBalanceSnapshot serializes");
+        if publish_with_retry(&nats_client, &nats_subject, payload).await {
+            info!(
+                tokens = tracker.len(),
+                "published startup full balance snapshot"
+            );
+        }
+    }
 
     // ── Stats ───────────────────────────────────────────────────────────
 
@@ -228,6 +303,7 @@ where
 
                 // Publish snapshot for changed tokens.
                 if !changed.is_empty() {
+                    let block_number = notification_tip_block(&notification);
                     let entries: Vec<ChainTokenBalance> = changed
                         .iter()
                         .map(|token| {
@@ -235,14 +311,16 @@ where
                             let decimals = tracker.decimals(token).unwrap_or(18);
                             ChainTokenBalance {
                                 token: format!("{token:#x}"),
-                                available: u256_to_decimal(raw, decimals),
-                                total: None,
+                                raw_available: raw.to_string(),
+                                decimals,
+                                raw_total: None,
                             }
                         })
                         .collect();
 
                     let snapshot = ChainBalanceSnapshot {
                         chain: chain_id.clone(),
+                        block_number,
                         balances: entries,
                         ts: now_ms(),
                     };
@@ -295,8 +373,13 @@ where
 
                 // Periodic full snapshot as heartbeat — ensures hedger has
                 // current balances even if individual per-block publishes were lost.
-                if blocks_processed % FULL_SNAPSHOT_INTERVAL == 0 && tracker.len() > 0 {
-                    let snapshot = build_full_snapshot(&chain_id, &tracker, &balances);
+                if blocks_processed % full_snapshot_interval_blocks == 0 && tracker.len() > 0 {
+                    let snapshot = build_full_snapshot(
+                        &chain_id,
+                        notification_tip_block(&notification),
+                        &tracker,
+                        &balances,
+                    );
                     let payload = serde_json::to_vec(&snapshot)
                         .expect("ChainBalanceSnapshot serializes");
                     if publish_with_retry(&nats_client, &nats_subject, payload).await {
@@ -345,6 +428,17 @@ where
                                 total = tracker.len(),
                                 "discovered tokens from whitelist"
                             );
+
+                            let snapshot = build_full_snapshot(&chain_id, 0, &tracker, &balances);
+                            let payload = serde_json::to_vec(&snapshot)
+                                .expect("ChainBalanceSnapshot serializes");
+                            if publish_with_retry(&nats_client, &nats_subject, payload).await {
+                                debug!(
+                                    new_tokens = new_tokens.len(),
+                                    total = tracker.len(),
+                                    "published whitelist-seeded full balance snapshot"
+                                );
+                            }
                         }
                     }
                     None => {
@@ -578,6 +672,8 @@ struct WhitelistPoolEntry {
     token0: Option<TokenEntry>,
     #[serde(default)]
     token1: Option<TokenEntry>,
+    #[serde(default)]
+    extra_tokens: Vec<TokenEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -604,16 +700,14 @@ fn process_whitelist_message(payload: &[u8], tracker: &mut TokenTracker) -> Vec<
     let mut new_tokens = Vec::new();
 
     for pool in &msg.pools {
-        if let Some(ref t) = pool.token0 {
-            if let Ok(addr) = t.address.parse::<Address>() {
-                if tracker.add(addr, t.decimals) {
-                    new_tokens.push(addr);
-                }
-            }
-        }
-        if let Some(ref t) = pool.token1 {
-            if let Ok(addr) = t.address.parse::<Address>() {
-                if tracker.add(addr, t.decimals) {
+        for token in pool
+            .token0
+            .iter()
+            .chain(pool.token1.iter())
+            .chain(pool.extra_tokens.iter())
+        {
+            if let Ok(addr) = token.address.parse::<Address>() {
+                if tracker.add(addr, token.decimals) {
                     new_tokens.push(addr);
                 }
             }
@@ -627,15 +721,9 @@ fn process_whitelist_message(payload: &[u8], tracker: &mut TokenTracker) -> Vec<
 
 fn notification_tip_block<N: NodePrimitives>(notification: &ExExNotification<N>) -> u64 {
     match notification {
-        ExExNotification::ChainCommitted { new } => {
-            new.tip().number()
-        }
-        ExExNotification::ChainReorged { new, .. } => {
-            new.tip().number()
-        }
-        ExExNotification::ChainReverted { old } => {
-            old.tip().number()
-        }
+        ExExNotification::ChainCommitted { new } => new.tip().number(),
+        ExExNotification::ChainReorged { new, .. } => new.tip().number(),
+        ExExNotification::ChainReverted { old } => old.tip().number(),
     }
 }
 
@@ -664,12 +752,18 @@ mod tests {
         fn status_or_post_state(&self) -> alloy_consensus::Eip658Value {
             alloy_consensus::Eip658Value::Eip658(true)
         }
-        fn status(&self) -> bool { true }
+        fn status(&self) -> bool {
+            true
+        }
         fn bloom(&self) -> alloy_primitives::Bloom {
             alloy_primitives::Bloom::default()
         }
-        fn cumulative_gas_used(&self) -> u64 { 0 }
-        fn logs(&self) -> &[Log] { &self.logs }
+        fn cumulative_gas_used(&self) -> u64 {
+            0
+        }
+        fn logs(&self) -> &[Log] {
+            &self.logs
+        }
     }
 
     fn transfer_log(token: Address, from: Address, to: Address, value: U256) -> Log {
@@ -736,15 +830,17 @@ mod tests {
     // ── Schema compatibility ─────────────────────────────────────────────
 
     /// Verify the JSON shape matches what the hedger deserializes as
-    /// `ChainBalanceSnapshot` from common/messages.rs.
+    /// `ChainBalanceSnapshot` from `foundation_messaging`.
     #[test]
     fn snapshot_json_matches_hedger_schema() {
         let snapshot = ChainBalanceSnapshot {
             chain: "1".to_string(),
+            block_number: 123,
             balances: vec![ChainTokenBalance {
                 token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
-                available: dec!(1000.5),
-                total: None,
+                raw_available: "1000500000".to_string(),
+                decimals: 6,
+                raw_total: None,
             }],
             ts: 1234567890,
         };
@@ -753,43 +849,44 @@ mod tests {
 
         // Required fields
         assert_eq!(json["chain"], "1");
+        assert_eq!(json["block_number"], 123u64);
         assert_eq!(json["ts"], 1234567890u64);
         assert!(json["balances"].is_array());
 
         let entry = &json["balances"][0];
         assert_eq!(entry["token"], "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-        // `available` must be a string (rust_decimal::serde::str format)
-        assert_eq!(entry["available"], "1000.5");
-        // `total` should be absent (skip_serializing_if = None)
-        assert!(entry.get("total").is_none());
+        assert_eq!(entry["raw_available"], "1000500000");
+        assert_eq!(entry["decimals"], 6u64);
+        assert!(entry.get("raw_total").is_none());
     }
 
-    /// Verify the hedger can round-trip our JSON through its expected types.
+    /// Verify the hedger can round-trip our JSON through its expected raw types.
     /// We replicate the hedger's deserialization structs here to prove compat.
     #[test]
     fn snapshot_json_deserializes_as_hedger_types() {
-        // Hedger-side types (mirrored from common/messages.rs)
         #[derive(serde::Deserialize)]
         struct HedgerSnapshot {
             chain: String,
+            block_number: u64,
             balances: Vec<HedgerTokenBalance>,
             ts: u64,
         }
         #[derive(serde::Deserialize)]
         struct HedgerTokenBalance {
             token: String,
-            #[serde(with = "rust_decimal::serde::str")]
-            available: Decimal,
-            #[serde(default, with = "rust_decimal::serde::str_option")]
-            total: Option<Decimal>,
+            raw_available: String,
+            decimals: u8,
+            raw_total: Option<String>,
         }
 
         let snapshot = ChainBalanceSnapshot {
             chain: "1".to_string(),
+            block_number: 999_111,
             balances: vec![ChainTokenBalance {
                 token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".to_string(),
-                available: dec!(2.5),
-                total: None,
+                raw_available: "2500000000000000000".to_string(),
+                decimals: 18,
+                raw_total: None,
             }],
             ts: 999,
         };
@@ -798,11 +895,16 @@ mod tests {
         let parsed: HedgerSnapshot = serde_json::from_slice(&json).unwrap();
 
         assert_eq!(parsed.chain, "1");
+        assert_eq!(parsed.block_number, 999_111);
         assert_eq!(parsed.ts, 999);
         assert_eq!(parsed.balances.len(), 1);
-        assert_eq!(parsed.balances[0].token, "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
-        assert_eq!(parsed.balances[0].available, dec!(2.5));
-        assert!(parsed.balances[0].total.is_none());
+        assert_eq!(
+            parsed.balances[0].token,
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        );
+        assert_eq!(parsed.balances[0].raw_available, "2500000000000000000");
+        assert_eq!(parsed.balances[0].decimals, 18);
+        assert!(parsed.balances[0].raw_total.is_none());
     }
 
     // ── process_receipts: delta logic ────────────────────────────────────
@@ -819,9 +921,21 @@ mod tests {
         let mut changed = Vec::new();
 
         let receipt = MockReceipt {
-            logs: vec![transfer_log(USDC, OTHER, EXECUTOR, U256::from(1_000_000u64))],
+            logs: vec![transfer_log(
+                USDC,
+                OTHER,
+                EXECUTOR,
+                U256::from(1_000_000u64),
+            )],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         assert_eq!(balances[&USDC], U256::from(1_000_000u64));
         assert_eq!(changed, vec![USDC]);
@@ -834,9 +948,21 @@ mod tests {
         let mut changed = Vec::new();
 
         let receipt = MockReceipt {
-            logs: vec![transfer_log(USDC, EXECUTOR, OTHER, U256::from(2_000_000u64))],
+            logs: vec![transfer_log(
+                USDC,
+                EXECUTOR,
+                OTHER,
+                U256::from(2_000_000u64),
+            )],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         assert_eq!(balances[&USDC], U256::from(3_000_000u64));
     }
@@ -849,9 +975,21 @@ mod tests {
 
         // Revert an incoming transfer of 3M
         let receipt = MockReceipt {
-            logs: vec![transfer_log(USDC, OTHER, EXECUTOR, U256::from(3_000_000u64))],
+            logs: vec![transfer_log(
+                USDC,
+                OTHER,
+                EXECUTOR,
+                U256::from(3_000_000u64),
+            )],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, true);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            true,
+        );
 
         assert_eq!(balances[&USDC], U256::from(7_000_000u64));
     }
@@ -864,9 +1002,21 @@ mod tests {
 
         // Revert an outgoing transfer of 2M (should add back)
         let receipt = MockReceipt {
-            logs: vec![transfer_log(USDC, EXECUTOR, OTHER, U256::from(2_000_000u64))],
+            logs: vec![transfer_log(
+                USDC,
+                EXECUTOR,
+                OTHER,
+                U256::from(2_000_000u64),
+            )],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, true);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            true,
+        );
 
         assert_eq!(balances[&USDC], U256::from(12_000_000u64));
     }
@@ -878,9 +1028,21 @@ mod tests {
         let mut changed = Vec::new();
 
         let receipt = MockReceipt {
-            logs: vec![transfer_log(USDC, EXECUTOR, EXECUTOR, U256::from(1_000_000u64))],
+            logs: vec![transfer_log(
+                USDC,
+                EXECUTOR,
+                EXECUTOR,
+                U256::from(1_000_000u64),
+            )],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         // Balance unchanged, no token in changed list.
         assert_eq!(balances[&USDC], U256::from(5_000_000u64));
@@ -896,7 +1058,14 @@ mod tests {
         let receipt = MockReceipt {
             logs: vec![transfer_log(USDC, OTHER, EXECUTOR, U256::ZERO)],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         assert_eq!(balances[&USDC], U256::from(5_000_000u64));
         assert!(changed.is_empty());
@@ -911,7 +1080,14 @@ mod tests {
         let receipt = MockReceipt {
             logs: vec![transfer_log(WETH, OTHER, EXECUTOR, U256::from(1_000u64))],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         assert!(!balances.contains_key(&WETH));
         assert!(changed.is_empty());
@@ -925,9 +1101,21 @@ mod tests {
 
         // Transfer between two other addresses
         let receipt = MockReceipt {
-            logs: vec![transfer_log(USDC, OTHER, address!("BEEF000000000000000000000000000000000000"), U256::from(999u64))],
+            logs: vec![transfer_log(
+                USDC,
+                OTHER,
+                address!("BEEF000000000000000000000000000000000000"),
+                U256::from(999u64),
+            )],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         assert!(changed.is_empty());
     }
@@ -942,7 +1130,14 @@ mod tests {
         let receipt = MockReceipt {
             logs: vec![transfer_log(USDC, EXECUTOR, OTHER, U256::from(500u64))],
         };
-        process_receipts(&[receipt], EXECUTOR, &tracker, &mut balances, &mut changed, false);
+        process_receipts(
+            &[receipt],
+            EXECUTOR,
+            &tracker,
+            &mut balances,
+            &mut changed,
+            false,
+        );
 
         assert_eq!(balances[&USDC], U256::ZERO);
     }
@@ -953,21 +1148,32 @@ mod tests {
     fn full_snapshot_includes_all_tracked_tokens() {
         let tracker = make_tracker(&[(USDC, 6), (WETH, 18)]);
         let balances = HashMap::from([
-            (USDC, U256::from(2_000_000u64)),     // 2.0 USDC
+            (USDC, U256::from(2_000_000u64)),               // 2.0 USDC
             (WETH, U256::from(500_000_000_000_000_000u64)), // 0.5 WETH
         ]);
 
-        let snapshot = build_full_snapshot("1", &tracker, &balances);
+        let snapshot = build_full_snapshot("1", 42, &tracker, &balances);
 
         assert_eq!(snapshot.chain, "1");
+        assert_eq!(snapshot.block_number, 42);
         assert_eq!(snapshot.balances.len(), 2);
 
         // Find each token (order is non-deterministic from HashMap iter)
-        let usdc_entry = snapshot.balances.iter().find(|e| e.token.contains("a0b8")).unwrap();
-        let weth_entry = snapshot.balances.iter().find(|e| e.token.contains("c02a")).unwrap();
+        let usdc_entry = snapshot
+            .balances
+            .iter()
+            .find(|e| e.token.contains("a0b8"))
+            .unwrap();
+        let weth_entry = snapshot
+            .balances
+            .iter()
+            .find(|e| e.token.contains("c02a"))
+            .unwrap();
 
-        assert_eq!(usdc_entry.available, dec!(2));
-        assert_eq!(weth_entry.available, dec!(0.5));
+        assert_eq!(usdc_entry.raw_available, "2000000");
+        assert_eq!(usdc_entry.decimals, 6);
+        assert_eq!(weth_entry.raw_available, "500000000000000000");
+        assert_eq!(weth_entry.decimals, 18);
     }
 
     // ── process_whitelist_message ────────────────────────────────────────
@@ -977,7 +1183,10 @@ mod tests {
         let json = serde_json::json!({
             "pools": [{
                 "token0": { "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6 },
-                "token1": { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "decimals": 18 }
+                "token1": { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "decimals": 18 },
+                "extra_tokens": [
+                    { "address": "0xdEAD000000000000000000000000000000000000", "decimals": 8 }
+                ]
             }]
         });
         let payload = serde_json::to_vec(&json).unwrap();
@@ -985,10 +1194,12 @@ mod tests {
         let mut tracker = make_tracker(&[]);
         let new = process_whitelist_message(&payload, &mut tracker);
 
-        assert_eq!(new.len(), 2);
-        assert_eq!(tracker.len(), 2);
+        assert_eq!(new.len(), 3);
+        assert_eq!(tracker.len(), 3);
         assert!(tracker.contains(&USDC));
         assert!(tracker.contains(&WETH));
+        assert!(tracker.contains(&OTHER));
+        assert_eq!(tracker.decimals(&OTHER), Some(8));
     }
 
     #[test]
