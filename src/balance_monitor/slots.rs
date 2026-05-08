@@ -10,6 +10,8 @@ use alloy_sol_types::SolValue;
 
 /// Known tokens with non-standard balance mapping slots.
 const SLOT_OVERRIDES: &[(Address, u64)] = &[
+    // USDC FiatTokenV2 — balancesAndBlacklistStates mapping slot 9.
+    (address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), 9),
     // USDT — slot 2
     (address!("dAC17F958D2ee523a2206206994597C13D831ec7"), 2),
     // WETH9 — slot 3
@@ -47,11 +49,20 @@ mod tests {
 
     #[test]
     fn standard_token_uses_slot_0() {
-        let token = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // USDC
+        let token = address!("6B175474E89094C44Da98b954EedeAC495271d0F"); // DAI
         let holder = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
         let slot = balance_storage_slot(token, holder);
         // Should be keccak256(abi.encode(holder, 0))
         let expected = compute_mapping_slot(holder, 0);
+        assert_eq!(slot, expected);
+    }
+
+    #[test]
+    fn usdc_uses_slot_9() {
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let holder = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let slot = balance_storage_slot(usdc, holder);
+        let expected = compute_mapping_slot(holder, 9);
         assert_eq!(slot, expected);
     }
 

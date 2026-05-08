@@ -2152,9 +2152,9 @@ fn main() -> eyre::Result<()> {
             .install_exex("BalanceMonitor", async move |ctx| {
                 Ok(balance_monitor::balance_monitor_exex(ctx))
             })
-            .install_exex("PoolCreations", async move |ctx| {
-                Ok(pool_creations::pool_creations_exex(ctx))
-            })
+            // .install_exex("PoolCreations", async move |ctx| {
+            //     Ok(pool_creations::pool_creations_exex(ctx))
+            // })
             .launch()
             .await?;
 

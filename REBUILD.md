@@ -1,5 +1,9 @@
 # Rebuilding and Deploying the ExEx
 
+## Current target
+
+This deployment currently targets **Reth `v2.2.0`**. Keep all `reth*` git dependencies on the same tag and keep direct Alloy dependencies aligned with Reth's Alloy 2 dependency graph.
+
 ## Overview
 
 The ExEx binary is bind-mounted from the host filesystem into the Reth container:
@@ -8,10 +12,11 @@ The ExEx binary is bind-mounted from the host filesystem into the Reth container
 
 This means you only need to rebuild the binary and restart the container - no manual file copying required.
 
-The binary runs three ExExes in a single Reth node:
+The binary runs ExExes in a single Reth node. The production deployment currently installs:
 - **Liquidity** — Decodes Uniswap V2/V3/V4 Swap/Mint/Burn events from whitelisted pools, sends updates via Unix socket
-- **Transfers** — Indexes all ERC20 Transfer events to PostgreSQL, with aggregation and cleanup
-- **PoolCreations** — Indexes Uniswap V2/V3/V4 pool creation events to PostgreSQL
+- **BalanceMonitor** — Publishes executor token balance snapshots to NATS
+
+Additional ExEx modules are still present in the repository but are not installed by the current `main.rs` deployment path.
 
 ## Build Requirements
 
@@ -68,8 +73,7 @@ Check the ExEx logs:
 
 Look for:
 - `Liquidity ExEx starting`
-- `Transfers ExEx starting`
-- `Pool Creations ExEx starting`
+- `Balance Monitor ExEx starting`
 - `NATS connected successfully`
 - `connected_peers=X` where X > 0
 
@@ -106,10 +110,12 @@ LOG_LEVEL=debug
 
 2. Update `Cargo.toml` - change all Reth dependencies to the new version:
    ```toml
-   reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3" }
-   reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.3", features = ["serde"] }
-   # ... update all reth-* dependencies
+   reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+   reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", features = ["serde"] }
+   # ... update all reth-* dependencies to the same tag
    ```
+
+   If the Reth update moves to a new Alloy major, update direct `alloy-*` dependencies to match Reth's dependency graph before rebuilding.
 
 3. Clean and rebuild:
    ```bash
@@ -136,7 +142,7 @@ A `justfile` is available in the repo root to make cutovers repeatable.
 just reth-latest
 
 # Full cutover: update Cargo.toml tags, rebuild, restart, verify logs
-just deploy v1.11.2
+just deploy v2.2.0
 
 # Rebuild + restart without changing version
 just rebuild-and-restart

@@ -5,18 +5,17 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Reth ExEx framework (v1.11.1 — two critical fixes over v1.11.0)
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["jemalloc"] }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["serde"] }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+# Reth ExEx framework
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", features = ["jemalloc"] }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", features = ["serde"] }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
 
-# Alloy for type-safe event decoding (versions matched to reth v1.11.0)
-alloy-consensus = { version = "1.6.3", default-features = false }
+# Alloy for type-safe event decoding
+alloy-consensus = { version = "2.0.4", default-features = false }
 alloy-sol-types = { version = "1.5.6", features = ["json"] }
 alloy-primitives = { version = "1.5.6", default-features = false }
 

@@ -1,305 +1,392 @@
-# Reth ExEx for Real-Time Liquidity Tracking
+# reth-exex-liquidity
 
-A Reth Execution Extension (ExEx) that monitors Uniswap V3/V4 liquidity events (Mint/Burn) in real-time and streams them to a Python consumer via gRPC.
+A Reth-based execution client binary that installs multiple ExExes into the node, with the main data path focused on low-latency pool state extraction for downstream consumers.
 
-## Overview
+## What this binary does
 
-This project replaces the traditional parquet-based ETL pipeline with a high-performance, real-time event streaming system:
+This crate builds a single `exex` binary that launches a Reth node and installs:
 
-**Old Architecture:**
-```
-Reth → JSON-RPC → Cryo → Parquet → Python → Database
-(minutes-hours latency, multiple processes)
-```
+- `Liquidity` — decodes whitelisted pool activity and emits normalized updates over a Unix socket
+- `BalanceMonitor` — balance monitoring ExEx
+- `PoolCreations` — pool creation monitoring ExEx
+- `Transfers` — present in the codebase but currently not installed in `main.rs`
 
-**New Architecture:**
-```
-Reth (with ExEx) → gRPC → Python → Database
-(real-time, 10-100x faster)
-```
+The important production path in this repo is:
 
-## Project Structure
-
-```
-reth-exex-liquidity/
-├── Cargo.toml                    # Rust dependencies
-├── build.rs                      # Protobuf code generation
-├── proto/
-│   └── liquidity.proto           # gRPC protocol definitions
-├── src/
-│   ├── main.rs                   # ExEx entry point (TO BE CREATED)
-│   ├── grpc_server.rs            # gRPC server implementation (TO BE CREATED)
-│   └── pool_tracker.rs           # Pool address tracking (TO BE CREATED)
-└── python-consumer/
-    ├── requirements.txt          # Python dependencies (TO BE CREATED)
-    ├── consumer.py               # Python gRPC client (TO BE CREATED)
-    └── test_consumer.py          # Tests and validation (TO BE CREATED)
-```
-
-## Prerequisites
-
-### Rust Setup
-
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install required tools
-rustup default stable
-```
-
-### Reth Node
-
-You need a running Reth node. Options:
-
-**Option 1: Local Reth (Recommended for Development)**
-```bash
-# Clone and build Reth
-git clone https://github.com/paradigmxyz/reth.git
-cd reth
-cargo build --release --features exex
-
-# Run Reth (sync required)
-./target/release/reth node
-```
-
-**Option 2: Use Existing Reth Instance**
-If you already have Reth running, note the IPC/HTTP endpoint.
-
-## Development Phases
-
-### Phase 1: Minimal ExEx (Week 1) - START HERE
-
-**Goal**: Get basic ExEx running that prints Uniswap events to console
-
-**Tasks**:
-1. ✅ Set up Cargo project
-2. ✅ Create protobuf definitions
-3. ⏳ Implement minimal ExEx (decode events, print to console)
-4. ⏳ Test with Reth node
-
-**Success Criteria**:
-- ExEx compiles
-- Connects to Reth node
-- Prints Mint/Burn events from known Uniswap pools
-
-### Phase 2: gRPC Streaming (Week 1-2)
-
-**Goal**: Stream events to Python consumer
-
-**Tasks**:
-1. Implement gRPC server in Rust
-2. Create Python gRPC client
-3. Stream events in real-time
-4. Handle basic reconnection logic
-
-**Success Criteria**:
-- Python receives events via gRPC
-- Events match Etherscan data
-- Handles Reth restarts gracefully
-
-### Phase 3: Database Integration (Week 2-3)
-
-**Goal**: Connect to existing dynamicWhitelist storage
-
-**Tasks**:
-1. Import storage functions from main project
-2. Store events to TimescaleDB
-3. Update tick maps in memory
-4. Save periodic snapshots to PostgreSQL
-
-**Success Criteria**:
-- Events stored in database
-- Tick maps match parquet-based system
-- Snapshots consistent with legacy data
-
-### Phase 4: Production Hardening (Week 3-4)
-
-**Goal**: Handle reorgs, errors, and edge cases
-
-**Tasks**:
-1. Implement reorg handling
-2. Add state recovery from snapshots
-3. Monitor performance metrics
-4. Load pool list dynamically from database
-
-**Success Criteria**:
-- Reorgs handled correctly
-- Performance: 10-100x faster than parquet
-- Ready for parallel production deployment
-
-## Quick Start (After Implementation)
-
-### 1. Build the ExEx
-
-```bash
-cd reth-exex-liquidity
-cargo build --release
-```
-
-### 2. Run ExEx with Reth
-
-```bash
-# Option A: Run as part of Reth binary (production)
-reth node --exex reth-exex-liquidity
-
-# Option B: Run standalone (development)
-./target/release/exex --reth-ipc /path/to/reth.ipc
-```
-
-### 3. Run Python Consumer
-
-```bash
-cd python-consumer
-pip install -r requirements.txt
-python consumer.py
-```
-
-## Configuration
-
-### Pool Tracking
-
-Create `config.json` with pools to track:
-
-```json
-{
-  "tracked_pools": [
-    "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",  // USDC/WETH 0.05%
-    "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"   // USDC/WETH 0.3%
-  ],
-  "factory_addresses": [
-    "0x1F98431c8aD98523631AE4a59f267346ea31F984"   // Uniswap V3 Factory
-  ]
-}
-```
-
-Or load dynamically from database (Phase 4).
-
-### gRPC Configuration
-
-Set environment variables:
-
-```bash
-export GRPC_HOST=0.0.0.0
-export GRPC_PORT=10000
-export LOG_LEVEL=info
-```
-
-## Testing
-
-### Unit Tests (Rust)
-
-```bash
-cargo test
-```
-
-### Integration Tests (Python)
-
-```bash
-cd python-consumer
-pytest test_consumer.py
-```
-
-### Validation Against Parquet System
-
-```bash
-# Compare outputs
-python validate.py --pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640 --blocks 100
-```
-
-## Performance Expectations
-
-| Metric | Parquet System | ExEx System | Improvement |
-|--------|----------------|-------------|-------------|
-| Latency | 5-60 minutes | <1 second | **60-3600x** |
-| Throughput | ~1K events/sec | ~10-50K events/sec | **10-50x** |
-| CPU Usage | Medium | Low | **Better** |
-| Storage | Large (parquet files) | Minimal | **Much better** |
-| Reorg Handling | Manual | Automatic | **Native** |
-
-## Monitoring
-
-### ExEx Metrics
-
-```bash
-# Check ExEx status
-curl http://localhost:9001/metrics | grep exex
-
-# Key metrics:
-# - exex_events_processed_total
-# - exex_events_per_second
-# - exex_blocks_behind_tip
-```
-
-### Python Consumer Metrics
-
-```python
-# In consumer.py
-print(f"Events received: {total_events}")
-print(f"Events/second: {events_per_second}")
-print(f"Current block: {current_block}")
-```
-
-## Troubleshooting
-
-### ExEx Won't Start
-
-**Problem**: `Error: Failed to connect to Reth node`
-
-**Solution**:
-- Check Reth is running: `ps aux | grep reth`
-- Verify IPC path: `ls /path/to/reth.ipc`
-- Check permissions: `chmod 660 /path/to/reth.ipc`
-
-### No Events Received
-
-**Problem**: Python consumer connected but no events
-
-**Solution**:
-- Verify pools are tracked: Check `tracked_pools` config
-- Confirm blocks are being mined: Check Reth sync status
-- Enable debug logging: `export LOG_LEVEL=debug`
-
-### Events Don't Match Etherscan
-
-**Problem**: Event counts or data differs from Etherscan
-
-**Solution**:
-- Check event decoding: Compare ABI with Etherscan
-- Verify block numbers: Ensure full sync
-- Review logs for decode errors
-
-## Development Roadmap
-
-- [x] Phase 1: Project setup
-- [ ] Phase 1: Minimal ExEx implementation
-- [ ] Phase 2: gRPC streaming
-- [ ] Phase 3: Database integration
-- [ ] Phase 4: Production hardening
-- [ ] Phase 5: Multi-protocol support (V4, Sushiswap, etc.)
-
-## Resources
-
-- [Reth ExEx Documentation](https://reth.rs/exex/overview)
-- [Reth ExEx Examples](https://github.com/paradigmxyz/reth-exex-examples)
-- [Paradigm Blog Post](https://www.paradigm.xyz/2024/05/reth-exex)
-- [Alloy Documentation](https://alloy.rs/)
-
-## Next Steps
-
-**Immediate (Phase 1)**:
-1. Review existing reth-exex-examples/remote
-2. Implement basic ExEx in `src/main.rs`
-3. Add Uniswap V3 ABI decoding
-4. Test with single pool on testnet
-
-**Coming Soon (Phase 2)**:
-1. Add gRPC server implementation
-2. Create Python consumer
-3. Stream events in real-time
+- **control plane:** NATS whitelist updates
+- **execution plane:** Reth `ExExNotification`s
+- **data plane:** framed bincode messages over a Unix socket
 
 ---
 
-**Status**: 🏗️ Phase 1 - Project Structure Complete
-**Next**: Implement minimal ExEx with event decoding
-**Target**: Real-time liquidity tracking at 10-100x performance improvement
+## Actual runtime architecture
+
+```text
+                        NATS
+     whitelist snapshot + incremental updates
+                          │
+                          ▼
+                   ┌──────────────┐
+                   │ PoolTracker  │
+                   │ in-memory    │
+                   │ whitelist    │
+                   └──────┬───────┘
+                          │
+                          │ filters what to decode
+                          │
+┌───────────────────────────────────────────────────────────────┐
+│                    reth node + installed ExExes              │
+│                                                               │
+│  ChainCommitted / ChainReorged / ChainReverted notifications  │
+│                           │                                   │
+│                           ▼                                   │
+│                  ┌───────────────────┐                        │
+│                  │ Liquidity ExEx    │                        │
+│                  │ - log scan        │                        │
+│                  │ - protocol decode │                        │
+│                  │ - storage enrich  │                        │
+│                  └─────────┬─────────┘                        │
+└────────────────────────────┼──────────────────────────────────┘
+                             │
+                             ▼
+               /tmp/reth_exex_pool_updates.sock
+                             │
+                             ▼
+                downstream arena / orderbook engine
+```
+
+---
+
+## Startup flow
+
+The Liquidity ExEx uses a hard startup barrier before block processing starts.
+
+```text
+1. start Unix socket server
+2. connect to NATS
+3. subscribe to whitelist.pools.{chain}.minimal
+4. request whitelist.snapshot.request.{chain}
+5. require a non-empty full snapshot
+6. load snapshot into PoolTracker
+7. begin consuming Reth notifications
+```
+
+Sequence view:
+
+```text
+Liquidity ExEx          NATS                 PoolTracker            Reth notifications
+     │                  │                         │                        │
+     │ start socket     │                         │                        │
+     │────────────────────────────────────────────────────────────────────>│
+     │ connect          │                         │                        │
+     │─────────────────>│                         │                        │
+     │ subscribe        │                         │                        │
+     │─────────────────>│                         │                        │
+     │ snapshot request │                         │                        │
+     │─────────────────>│                         │                        │
+     │ full snapshot    │                         │                        │
+     │<─────────────────│                         │                        │
+     │ queue/apply full whitelist                 │                        │
+     │───────────────────────────────────────────>│                        │
+     │ ready                                                          start
+     │────────────────────────────────────────────────────────────────────>│
+```
+
+If the startup snapshot is missing, malformed, or empty, the process keeps retrying. It does **not** silently proceed with an empty whitelist.
+
+---
+
+## Per-block flow
+
+For committed blocks, the Liquidity ExEx processes notifications block-by-block.
+
+```text
+ChainCommitted
+   │
+   ├─ begin_block() on PoolTracker
+   ├─ send BeginBlock
+   ├─ iterate receipts/logs
+   │   ├─ fast address filter
+   │   ├─ protocol decode
+   │   ├─ whitelist check by address or pool_id
+   │   └─ send PoolUpdate for matching events
+   ├─ Fluid only: decode touched pools from storage after log scan
+   ├─ send EndBlock
+   └─ end_block() on PoolTracker
+       └─ apply queued whitelist changes atomically between blocks
+```
+
+Block envelope:
+
+```text
+BeginBlock
+  ├─ PoolUpdate
+  ├─ PoolUpdate
+  ├─ PoolUpdate
+  └─ ...
+EndBlock
+```
+
+This ordering is intentional: downstream consumers can treat each block as an atomic batch.
+
+---
+
+## Reorg flow
+
+Reorgs are explicit in the socket protocol.
+
+```text
+ReorgStart
+  ├─ old-chain blocks replayed as is_revert = true
+  ├─ new-chain blocks replayed as normal updates
+  ├─ ReorgEpilogue messages for canonical final state
+  │    - slot0-style final state for V3/V4/Ekubo
+  │    - final Fluid reserve state when needed
+  └─ ReorgComplete
+```
+
+Sequence view:
+
+```text
+ChainReorged
+   │
+   ├─ send ReorgStart
+   ├─ revert old blocks
+   │    ├─ BeginBlock(is_revert=true)
+   │    ├─ PoolUpdate(... is_revert=true)
+   │    └─ EndBlock
+   ├─ apply new blocks
+   │    ├─ BeginBlock(is_revert=false)
+   │    ├─ PoolUpdate(... is_revert=false)
+   │    └─ EndBlock
+   ├─ send ReorgEpilogue final-state corrections
+   └─ send ReorgComplete
+```
+
+A downstream consumer should not guess reorg semantics from missing data; it should follow the explicit control messages.
+
+---
+
+## Protocol handling
+
+### Direct event decode
+
+- Uniswap V2
+- Uniswap V3
+- Uniswap V4
+- Ekubo
+- Curve Stable
+- Curve TwoCrypto
+- Curve Tricrypto
+- Balancer V2 weighted
+
+### Special singleton emitters
+
+Some protocols emit from singleton contracts instead of pool addresses. `PoolTracker` automatically tracks those emitters so logs are not missed.
+
+- Uniswap V4 PoolManager
+- Ekubo Core
+- Balancer V2 Vault
+- Fluid Liquidity Layer
+
+### Fluid handling
+
+Fluid is handled differently from the other protocols.
+
+```text
+LogOperate observed on Liquidity Layer
+   │
+   ├─ extract touched pool address from indexed topic
+   ├─ verify that pool is whitelisted as Fluid
+   ├─ defer full decode until after the log loop
+   ├─ read cached storage slots using FluidPoolConfig
+   └─ emit full FluidState snapshot
+```
+
+That means Fluid updates are effectively **storage-derived snapshots triggered by logs**, not just ABI-decoded event payloads.
+
+---
+
+## Socket protocol
+
+The Liquidity ExEx writes framed bincode messages to:
+
+```text
+/tmp/reth_exex_pool_updates.sock
+```
+
+Each frame is:
+
+```text
+[4-byte little-endian length][bincode payload]
+```
+
+Current control messages include:
+
+- `BeginBlock`
+- `PoolUpdate`
+- `EndBlock`
+- `ReorgStart`
+- `ReorgEpilogue`
+- `ReorgComplete`
+
+Socket message envelope examples:
+
+```text
+Normal committed block
+
+  [len][BeginBlock {
+           stream_seq,
+           block_number,
+           block_timestamp,
+           base_fee_per_gas,
+           is_revert: false
+         }]
+  [len][PoolUpdate {
+           stream_seq,
+           event: PoolUpdateMessage {
+             pool_id,
+             protocol,
+             update_type,
+             block_number,
+             block_timestamp,
+             tx_index,
+             log_index,
+             is_revert: false,
+             update: ...
+           }
+         }]
+  [len][PoolUpdate {...}]
+  [len][EndBlock {
+           stream_seq,
+           block_number,
+           num_updates
+         }]
+```
+
+```text
+Reorg batch
+
+  [len][ReorgStart {
+           stream_seq,
+           old_range,
+           new_range
+         }]
+
+  [len][BeginBlock { is_revert: true,  ... }]
+  [len][PoolUpdate  { event.is_revert: true,  ... }]
+  [len][EndBlock    { ... }]
+
+  [len][BeginBlock { is_revert: false, ... }]
+  [len][PoolUpdate  { event.is_revert: false, ... }]
+  [len][EndBlock    { ... }]
+
+  [len][ReorgEpilogue {
+           stream_seq,
+           final_tip_block,
+           final_tip_timestamp,
+           update: Slot0Final | FluidStateFinal
+         }]
+  [len][ReorgComplete {
+           stream_seq,
+           final_tip_block
+         }]
+```
+
+The consumer contract is simple:
+
+- read 4-byte frame length
+- decode one `ControlMessage` with bincode
+- process messages strictly in stream order
+- treat `BeginBlock ... EndBlock` as a block envelope
+- treat `ReorgStart ... ReorgComplete` as a reorg envelope
+
+Legacy v1 compatibility was removed. This repo uses a hard cutover model.
+
+---
+
+## Whitelist update model
+
+The whitelist is maintained in memory by `PoolTracker`.
+
+Supported update types:
+
+- `Replace` — full snapshot hydration
+- `Add` — incremental additions
+- `Remove` — incremental removals
+
+Property that matters operationally:
+
+- updates arriving during block processing are queued
+- queued updates are applied only after `EndBlock`
+- whitelist membership therefore changes **between blocks**, not mid-block
+
+This avoids inconsistent filtering inside a single block.
+
+---
+
+## Repository map
+
+```text
+src/main.rs            entrypoint, ExEx installation, Liquidity flow
+src/pool_tracker.rs    whitelist state + deferred update application
+src/nats_client.rs     NATS subscription + snapshot handling
+src/socket.rs          Unix socket server + framed broadcast
+src/types.rs           wire protocol and update enums
+src/events.rs          log decoding across supported protocols
+src/fluid_decoder.rs   Fluid storage-based reserve decoding
+src/balance_monitor/   balance monitor ExEx
+src/pool_creations/    pool creation ExEx
+src/transfers/         transfers ExEx implementation (not installed now)
+REBUILD.md             rebuild + deploy instructions
+docs/benchmarks.md     performance notes and benchmark guidance
+```
+
+---
+
+## Build and run
+
+Current dependency target:
+
+- Reth `v2.2.0`
+- Alloy consensus `2.0.4` (kept aligned with Reth's Alloy 2 graph)
+- `roaring` pinned by `Cargo.lock` to `0.11.4` for the Reth DB bitmap implementation
+
+Build locally:
+
+```bash
+cargo build --release
+```
+
+Run as a Reth execution client binary:
+
+```bash
+./target/release/exex node [reth flags...]
+```
+
+For the actual deployment flow used with your environment, see:
+
+- [`REBUILD.md`](REBUILD.md)
+
+---
+
+## Operational assumptions
+
+This binary expects:
+
+- a working Reth environment
+- reachable NATS
+- a valid startup whitelist snapshot
+- a downstream consumer connected to the Unix socket if you want to use the liquidity feed
+
+Useful environment variables:
+
+- `NATS_URL` — defaults to `nats://localhost:4222`
+- `CHAIN` — defaults to `ethereum`
+- `RPC_URL` — used for resolving Fluid configs, defaults to `http://localhost:8545`
+
+---
+
+## Non-goals of this README
+
+This README documents the **current** flow in the codebase. It does not describe the earlier gRPC/Python-consumer plan, because that is not the live architecture anymore.

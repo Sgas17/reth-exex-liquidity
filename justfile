@@ -10,7 +10,7 @@ reth-latest:
     curl -s https://api.github.com/repos/paradigmxyz/reth/releases/latest | rg 'tag_name|published_at|name'
 
 set-reth-version version:
-    [[ "{{version}}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || (echo "Version must look like v1.11.2" && exit 1)
+    [[ "{{version}}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || (echo "Version must look like v2.2.0" && exit 1)
     perl -i -pe 's#^(reth(?:-[a-z-]+)?\s*=\s*\{[^}]*tag\s*=\s*")v\d+\.\d+\.\d+(".*)$#$1{{version}}$2#' Cargo.toml
     rg -n '^reth|^reth-' Cargo.toml
 
