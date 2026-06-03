@@ -165,9 +165,11 @@ pub enum PoolUpdate {
         tick: i32,
     },
 
-    /// Curve StableSwap-NG TokenExchange event.
-    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
-    /// sends `tokens_bought` of coin[bought_id].
+    /// Legacy Curve StableSwap-NG delta swap update.
+    ///
+    /// Hard cutover: the producer now emits full post-state via `CurveLiquidity`
+    /// even for TokenExchange events. This variant remains only so the mirrored
+    /// socket enums stay source-compatible during the cutover.
     CurveSwap {
         sold_id: u8,
         tokens_sold: u128,
@@ -175,8 +177,9 @@ pub enum PoolUpdate {
         tokens_bought: u128,
     },
 
-    /// Curve StableSwap-NG liquidity event (AddLiquidity / RemoveLiquidity / etc).
-    /// Carries the full post-state from storage so the arena can update directly.
+    /// Curve StableSwap-NG full post-state update.
+    /// Used for swaps and liquidity events so the arena never reconstructs
+    /// stable pool balances locally.
     CurveLiquidity {
         effective_balances: Vec<u128>,
         fee: u64,

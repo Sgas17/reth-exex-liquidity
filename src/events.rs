@@ -327,13 +327,15 @@ mod twocrypto {
             uint256 token_supply
         );
 
-        /// RemoveLiquidityOne(address indexed provider, uint256 token_id,
-        ///                    uint256 token_amount, uint256 approx_fee, uint256 packed_price_scale)
+        /// RemoveLiquidityOne(address indexed provider, uint256 token_amount,
+        ///                    uint256 coin_index, uint256 coin_amount,
+        ///                    uint256 approx_fee, uint256 packed_price_scale)
         #[derive(Debug)]
         event RemoveLiquidityOne(
             address indexed provider,
-            uint256 token_id,
             uint256 token_amount,
+            uint256 coin_index,
+            uint256 coin_amount,
             uint256 approx_fee,
             uint256 packed_price_scale
         );
@@ -1109,6 +1111,13 @@ mod tests {
         assert_eq!(
             BalancerPoolBalanceChanged::SIGNATURE_HASH.to_string(),
             "0xe5ce249087ce04f05a957192435400fd97868dba0e6a4b4c049abf8af80dae78"
+        );
+
+        // Curve TwoCrypto / Tricrypto shared RemoveLiquidityOne signature.
+        // RemoveLiquidityOne(address,uint256,uint256,uint256,uint256,uint256)
+        assert_eq!(
+            TwoCryptoRemoveLiquidityOne::SIGNATURE_HASH.to_string(),
+            "0xe200e24d4a4c7cd367dd9befe394dc8a14e6d58c88ff5e2f512d65a9e0aa9c5c"
         );
 
         // Curve TricryptoNG Event Signatures (unique — differ from TwoCrypto)

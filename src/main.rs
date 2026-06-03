@@ -361,28 +361,36 @@ impl LiquidityExEx {
             // ============================================================================
             // CURVE STABLESWAP-NG EVENTS
             // ============================================================================
-            DecodedEvent::CurveSwap {
-                pool,
-                sold_id,
-                tokens_sold,
-                bought_id,
-                tokens_bought,
-            } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::Address(pool),
-                protocol: Protocol::CurveStable,
-                update_type: UpdateType::Swap,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::CurveSwap {
-                    sold_id,
-                    tokens_sold,
-                    bought_id,
-                    tokens_bought,
-                },
-            }),
+            DecodedEvent::CurveSwap { pool, .. } => {
+                let (
+                    effective_balances,
+                    fee,
+                    offpeg_fee_multiplier,
+                    initial_a,
+                    future_a,
+                    initial_a_time,
+                    future_a_time,
+                ) = read_curve_stable_liquidity_state(provider, pool);
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::Address(pool),
+                    protocol: Protocol::CurveStable,
+                    update_type: UpdateType::Swap,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::CurveLiquidity {
+                        effective_balances,
+                        fee,
+                        offpeg_fee_multiplier,
+                        initial_a,
+                        future_a,
+                        initial_a_time,
+                        future_a_time,
+                    },
+                })
+            }
 
             DecodedEvent::CurveLiquidityChange { pool } => {
                 let (
