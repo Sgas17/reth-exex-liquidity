@@ -123,7 +123,10 @@ async fn handle_client(
                 break;
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!("Client lagged, skipped {} messages — disconnecting for resync", skipped);
+                warn!(
+                    "Client lagged, skipped {} messages — disconnecting for resync",
+                    skipped
+                );
                 break;
             }
         };

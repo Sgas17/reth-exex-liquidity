@@ -59,15 +59,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Pools: {}", message.pools.len());
     println!(
         "  - {} V2 pools",
-        message.protocols.iter().filter(|p| p.as_str() == "v2").count()
+        message
+            .protocols
+            .iter()
+            .filter(|p| p.as_str() == "v2")
+            .count()
     );
     println!(
         "  - {} V3 pools",
-        message.protocols.iter().filter(|p| p.as_str() == "v3").count()
+        message
+            .protocols
+            .iter()
+            .filter(|p| p.as_str() == "v3")
+            .count()
     );
     println!(
         "  - {} V4 pools",
-        message.protocols.iter().filter(|p| p.as_str() == "v4").count()
+        message
+            .protocols
+            .iter()
+            .filter(|p| p.as_str() == "v4")
+            .count()
     );
 
     println!("\n💡 The ExEx should receive this message if it's running with:");

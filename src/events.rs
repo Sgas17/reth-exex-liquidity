@@ -276,13 +276,10 @@ mod curve {
 use fluid::LogOperate as FluidLogOperate;
 
 use curve::{
-    AddLiquidity as CurveAddLiquidity,
-    ApplyNewFee as CurveApplyNewFee,
-    RampA as CurveRampA,
+    AddLiquidity as CurveAddLiquidity, ApplyNewFee as CurveApplyNewFee, RampA as CurveRampA,
     RemoveLiquidity as CurveRemoveLiquidity,
     RemoveLiquidityImbalance as CurveRemoveLiquidityImbalance,
-    RemoveLiquidityOne as CurveRemoveLiquidityOne,
-    TokenExchange as CurveTokenExchange,
+    RemoveLiquidityOne as CurveRemoveLiquidityOne, TokenExchange as CurveTokenExchange,
 };
 
 // ============================================================================
@@ -369,12 +366,9 @@ mod twocrypto {
 }
 
 use twocrypto::{
-    AddLiquidity as TwoCryptoAddLiquidity,
-    NewParameters as TwoCryptoNewParameters,
-    RampAgamma as TwoCryptoRampAgamma,
-    RemoveLiquidity as TwoCryptoRemoveLiquidity,
-    RemoveLiquidityOne as TwoCryptoRemoveLiquidityOne,
-    TokenExchange as TwoCryptoTokenExchange,
+    AddLiquidity as TwoCryptoAddLiquidity, NewParameters as TwoCryptoNewParameters,
+    RampAgamma as TwoCryptoRampAgamma, RemoveLiquidity as TwoCryptoRemoveLiquidity,
+    RemoveLiquidityOne as TwoCryptoRemoveLiquidityOne, TokenExchange as TwoCryptoTokenExchange,
 };
 
 mod ekubo {
@@ -399,8 +393,7 @@ use ekubo::PositionUpdated as EkuboPositionUpdated;
 
 /// Ekubo Core contract address on Ethereum mainnet.
 pub const EKUBO_CORE: Address = Address::new([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0xaA,
-    0x86, 0xC5, 0xd3, 0xc4, 0x17, 0x65, 0xbB, 0x24,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0xaA, 0x86, 0xC5, 0xd3, 0xc4, 0x17, 0x65, 0xbB, 0x24,
     0xe1, 0x1b, 0xd7, 0x01,
 ]);
 
@@ -439,15 +432,11 @@ mod balancer {
     }
 }
 
-use balancer::{
-    PoolBalanceChanged as BalancerPoolBalanceChanged,
-    Swap as BalancerVaultSwap,
-};
+use balancer::{PoolBalanceChanged as BalancerPoolBalanceChanged, Swap as BalancerVaultSwap};
 
 /// Balancer V2 Vault contract address (Ethereum Mainnet).
 pub const BALANCER_V2_VAULT: Address = Address::new([
-    0xBA, 0x12, 0x22, 0x22, 0x22, 0x22, 0x8d, 0x8B,
-    0xa4, 0x45, 0x95, 0x8a, 0x75, 0xa0, 0x70, 0x4d,
+    0xBA, 0x12, 0x22, 0x22, 0x22, 0x22, 0x8d, 0x8B, 0xa4, 0x45, 0x95, 0x8a, 0x75, 0xa0, 0x70, 0x4d,
     0x56, 0x6B, 0xF2, 0xC8,
 ]);
 
@@ -483,8 +472,7 @@ mod tricrypto {
 }
 
 use tricrypto::{
-    AddLiquidity as TricryptoAddLiquidity,
-    RemoveLiquidity as TricryptoRemoveLiquidity,
+    AddLiquidity as TricryptoAddLiquidity, RemoveLiquidity as TricryptoRemoveLiquidity,
 };
 
 // ============================================================================
@@ -560,19 +548,12 @@ pub enum DecodedEvent {
         liquidity: u128,
         tick: i32,
     },
-    /// Curve StableSwap-NG TokenExchange event.
-    CurveSwap {
-        pool: Address,
-        sold_id: u8,
-        tokens_sold: u128,
-        bought_id: u8,
-        tokens_bought: u128,
-    },
+    /// Curve StableSwap-NG TokenExchange touch signal.
+    /// Full post-state is scraped after detection.
+    CurveSwap { pool: Address },
     /// Curve liquidity event (AddLiquidity, RemoveLiquidity, etc).
     /// We don't decode the amounts — balances will be re-scraped from storage.
-    CurveLiquidityChange {
-        pool: Address,
-    },
+    CurveLiquidityChange { pool: Address },
     /// Curve RampA parameter change.
     CurveRampA {
         pool: Address,
@@ -587,19 +568,11 @@ pub enum DecodedEvent {
         fee: u64,
         offpeg_fee_multiplier: u64,
     },
-    /// TwoCryptoNG TokenExchange event.
-    TwoCryptoSwap {
-        pool: Address,
-        sold_id: u8,
-        tokens_sold: u128,
-        bought_id: u8,
-        tokens_bought: u128,
-        packed_price_scale: U256,
-    },
+    /// TwoCryptoNG TokenExchange touch signal.
+    /// Full post-state is scraped after detection.
+    TwoCryptoSwap { pool: Address },
     /// TwoCryptoNG liquidity event (AddLiquidity, RemoveLiquidity, RemoveLiquidityOne).
-    TwoCryptoLiquidityChange {
-        pool: Address,
-    },
+    TwoCryptoLiquidityChange { pool: Address },
     /// TwoCryptoNG RampAgamma parameter change.
     TwoCryptoRampAgamma {
         pool: Address,
@@ -627,9 +600,7 @@ pub enum DecodedEvent {
     /// TricryptoNG liquidity event (AddLiquidity / RemoveLiquidity).
     /// Only these two have unique signatures (uint256[3] arrays); other Tricrypto
     /// events share signatures with TwoCrypto and are disambiguated in create_pool_update.
-    TricryptoLiquidityChange {
-        pool: Address,
-    },
+    TricryptoLiquidityChange { pool: Address },
     /// Balancer V2 Vault Swap event.
     BalancerSwap {
         pool_id: [u8; 32],
@@ -802,18 +773,13 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     }
 
     // ── Curve StableSwap-NG events ───────────────────────────────────────
-    // TokenExchange carries the swap data directly.
+    // TokenExchange is only a touch signal here; the producer later reads the
+    // authoritative full post-state from storage.
     // Liquidity events (Add/Remove/etc) just trigger a re-scrape.
     // RampA and ApplyNewFee are rare but must be tracked.
 
-    if let Ok(event) = CurveTokenExchange::decode_log(log) {
-        return Some(DecodedEvent::CurveSwap {
-            pool,
-            sold_id: event.data.sold_id as u8,
-            tokens_sold: event.data.tokens_sold.saturating_to::<u128>(),
-            bought_id: event.data.bought_id as u8,
-            tokens_bought: event.data.tokens_bought.saturating_to::<u128>(),
-        });
+    if CurveTokenExchange::decode_log(log).is_ok() {
+        return Some(DecodedEvent::CurveSwap { pool });
     }
 
     if let Ok(_event) = CurveAddLiquidity::decode_log(log) {
@@ -851,17 +817,12 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     }
 
     // ── Curve TwoCryptoNG events ─────────────────────────────────────────
+    // TokenExchange is only a touch signal here; the producer later reads the
+    // authoritative full post-state from storage.
     // Different event signatures from StableSwap-NG (uint256 indices, extra fields).
 
-    if let Ok(event) = TwoCryptoTokenExchange::decode_log(log) {
-        return Some(DecodedEvent::TwoCryptoSwap {
-            pool,
-            sold_id: event.data.sold_id.saturating_to::<u8>(),
-            tokens_sold: event.data.tokens_sold.saturating_to::<u128>(),
-            bought_id: event.data.bought_id.saturating_to::<u8>(),
-            tokens_bought: event.data.tokens_bought.saturating_to::<u128>(),
-            packed_price_scale: event.data.packed_price_scale,
-        });
+    if TwoCryptoTokenExchange::decode_log(log).is_ok() {
+        return Some(DecodedEvent::TwoCryptoSwap { pool });
     }
 
     if let Ok(_event) = TwoCryptoAddLiquidity::decode_log(log) {
@@ -937,10 +898,8 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
 
                 // Decode positionId: salt(24B) | tickLower(4B) | tickUpper(4B)
                 let pos_bytes: [u8; 32] = event.positionId.into();
-                let tick_lower =
-                    i32::from_be_bytes(pos_bytes[24..28].try_into().unwrap());
-                let tick_upper =
-                    i32::from_be_bytes(pos_bytes[28..32].try_into().unwrap());
+                let tick_lower = i32::from_be_bytes(pos_bytes[24..28].try_into().unwrap());
+                let tick_upper = i32::from_be_bytes(pos_bytes[28..32].try_into().unwrap());
 
                 // Decode stateAfter packed bytes32: sqrtRatio(12B) | tick(4B) | liquidity(16B)
                 let state_bytes: [u8; 32] = event.stateAfter.into();
@@ -987,22 +946,24 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
         }
 
         // PoolBalanceChanged: topics = [sig, poolId, liquidityProvider], data = (tokens[], deltas[], protocolFees[])
-        if log.topics().len() >= 3 && log.topics()[0] == BalancerPoolBalanceChanged::SIGNATURE_HASH {
+        if log.topics().len() >= 3 && log.topics()[0] == BalancerPoolBalanceChanged::SIGNATURE_HASH
+        {
             if let Ok(event) = BalancerPoolBalanceChanged::decode_log_data(&log.data) {
                 let pool_id: [u8; 32] = log.topics()[1].into();
-                let deltas: Vec<i128> = event.deltas.iter()
+                let deltas: Vec<i128> = event
+                    .deltas
+                    .iter()
                     .map(|d| {
                         if *d >= alloy_primitives::I256::ZERO {
-                            i128::try_from(d.into_raw().saturating_to::<u128>()).unwrap_or(i128::MAX)
+                            i128::try_from(d.into_raw().saturating_to::<u128>())
+                                .unwrap_or(i128::MAX)
                         } else {
-                            -i128::try_from((-*d).into_raw().saturating_to::<u128>()).unwrap_or(i128::MAX)
+                            -i128::try_from((-*d).into_raw().saturating_to::<u128>())
+                                .unwrap_or(i128::MAX)
                         }
                     })
                     .collect();
-                return Some(DecodedEvent::BalancerPoolBalanceChanged {
-                    pool_id,
-                    deltas,
-                });
+                return Some(DecodedEvent::BalancerPoolBalanceChanged { pool_id, deltas });
             }
         }
     }
@@ -1089,10 +1050,7 @@ mod tests {
 
         // Fluid LogOperate signature
         // LogOperate(address,address,int256,int256,address,address,uint256,uint256)
-        println!(
-            "FluidLogOperate: {}",
-            FluidLogOperate::SIGNATURE_HASH
-        );
+        println!("FluidLogOperate: {}", FluidLogOperate::SIGNATURE_HASH);
         // Verify it's a valid keccak256 hash (not zero)
         assert_ne!(
             FluidLogOperate::SIGNATURE_HASH,
@@ -1160,11 +1118,7 @@ mod tests {
         let log = Log {
             address: liquidity_layer,
             data: LogData::new_unchecked(
-                vec![
-                    FluidLogOperate::SIGNATURE_HASH,
-                    user_topic,
-                    token_topic,
-                ],
+                vec![FluidLogOperate::SIGNATURE_HASH, user_topic, token_topic],
                 vec![0u8; 192].into(),
             ),
         };

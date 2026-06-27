@@ -3,7 +3,7 @@
 // These tests verify the complete event processing pipeline to help debug
 // why events might not be output for watched pools.
 
-use alloy_primitives::{address, Address, I256, Log, LogData, B256, U256};
+use alloy_primitives::{address, Address, Log, LogData, B256, I256, U256};
 use alloy_sol_types::SolEvent;
 use reth_exex_liquidity::{
     events::{decode_log, DecodedEvent},

@@ -18,7 +18,6 @@ mod balance_monitor;
 mod events;
 mod fluid_decoder;
 mod nats_client;
-mod pool_creations;
 mod pool_tracker;
 #[allow(dead_code)]
 mod socket;
@@ -31,8 +30,8 @@ use alloy_consensus::{BlockHeader, TxReceipt};
 use alloy_primitives::{Address, I256, U256};
 use events::{decode_log, fluid_log_operate_pool, DecodedEvent};
 use fluid_decoder::FluidPoolConfig;
-use nats_client::WhitelistNatsClient;
 use futures::{StreamExt, TryStreamExt};
+use nats_client::WhitelistNatsClient;
 use pool_tracker::PoolTracker;
 use reth::providers::StateProviderFactory;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
@@ -60,6 +59,19 @@ struct LiquidityExEx {
     /// Statistics
     events_processed: u64,
     blocks_processed: u64,
+}
+
+fn v2_swap_deltas(
+    amount0_in: U256,
+    amount1_in: U256,
+    amount0_out: U256,
+    amount1_out: U256,
+) -> (I256, I256) {
+    let delta0 = I256::try_from(amount0_in).unwrap_or(I256::ZERO)
+        - I256::try_from(amount0_out).unwrap_or(I256::ZERO);
+    let delta1 = I256::try_from(amount1_in).unwrap_or(I256::ZERO)
+        - I256::try_from(amount1_out).unwrap_or(I256::ZERO);
+    (delta0, delta1)
 }
 
 impl LiquidityExEx {
@@ -95,19 +107,12 @@ impl LiquidityExEx {
                 amount0_out,
                 amount1_out,
             } => {
-                // Calculate signed reserve deltas for V2 swaps
-                // Match Python logic: if amount0In == 0, use (negative out, positive in), else (positive in, negative out)
-                let (amount0, amount1) = if amount0_in == U256::ZERO {
-                    // Token1 -> Token0 swap: token0 going OUT (negative), token1 coming IN (positive)
-                    let delta0 = -I256::try_from(amount0_out).unwrap_or(I256::ZERO);
-                    let delta1 = I256::try_from(amount1_in).unwrap_or(I256::ZERO);
-                    (delta0, delta1)
-                } else {
-                    // Token0 -> Token1 swap: token0 coming IN (positive), token1 going OUT (negative)
-                    let delta0 = I256::try_from(amount0_in).unwrap_or(I256::ZERO);
-                    let delta1 = -I256::try_from(amount1_out).unwrap_or(I256::ZERO);
-                    (delta0, delta1)
-                };
+                // V2 reserve movement is the net of all four event fields.
+                // Do not branch on amount0_in == 0: rare swaps can have both an input and
+                // an output amount populated on the same token side, and dropping one side
+                // creates persistent reserve drift.
+                let (amount0, amount1) =
+                    v2_swap_deltas(amount0_in, amount1_in, amount0_out, amount1_out);
 
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
@@ -237,12 +242,10 @@ impl LiquidityExEx {
                 update: PoolUpdate::V3Liquidity {
                     tick_lower,
                     tick_upper,
-                    liquidity_delta: i128::try_from(amount)
-                        .map(|v| -v)
-                        .unwrap_or_else(|_| {
-                            warn!(amount, "V3 Burn liquidity overflows i128, clamping");
-                            i128::MIN
-                        }),
+                    liquidity_delta: i128::try_from(amount).map(|v| -v).unwrap_or_else(|_| {
+                        warn!(amount, "V3 Burn liquidity overflows i128, clamping");
+                        i128::MIN
+                    }),
                 },
             }),
 
@@ -361,7 +364,7 @@ impl LiquidityExEx {
             // ============================================================================
             // CURVE STABLESWAP-NG EVENTS
             // ============================================================================
-            DecodedEvent::CurveSwap { pool, .. } => {
+            DecodedEvent::CurveSwap { pool } => {
                 let (
                     effective_balances,
                     fee,
@@ -473,34 +476,28 @@ impl LiquidityExEx {
             // ============================================================================
             // TwoCrypto and Tricrypto share TokenExchange, RampAgamma, NewParameters,
             // and RemoveLiquidityOne signatures. Disambiguate by pool protocol.
-
-            DecodedEvent::TwoCryptoSwap {
-                pool,
-                sold_id,
-                tokens_sold,
-                bought_id,
-                tokens_bought,
-                packed_price_scale,
-            } => {
-                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
-                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+            DecodedEvent::TwoCryptoSwap { pool } => {
+                let is_tricrypto =
+                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto {
+                    Protocol::CurveTricrypto
+                } else {
+                    Protocol::CurveTwoCrypto
+                };
                 let update = if is_tricrypto {
-                    PoolUpdate::TricryptoSwap {
-                        sold_id,
-                        tokens_sold,
-                        bought_id,
-                        tokens_bought,
+                    let (balances, packed_price_scale, d) =
+                        read_tricrypto_full_state(provider, pool);
+                    PoolUpdate::TricryptoState {
+                        balances,
                         packed_price_scale,
-                        d: U256::ZERO, // Enriched from storage after creation
+                        d,
                     }
                 } else {
-                    PoolUpdate::TwoCryptoSwap {
-                        sold_id,
-                        tokens_sold,
-                        bought_id,
-                        tokens_bought,
-                        packed_price_scale,
-                        d: U256::ZERO,
+                    let (balances, price_scale, d) = read_twocrypto_full_state(provider, pool);
+                    PoolUpdate::TwoCryptoState {
+                        balances,
+                        price_scale,
+                        d,
                     }
                 };
                 Some(PoolUpdateMessage {
@@ -517,18 +514,24 @@ impl LiquidityExEx {
             }
 
             DecodedEvent::TwoCryptoLiquidityChange { pool } => {
-                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
-                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let is_tricrypto =
+                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto {
+                    Protocol::CurveTricrypto
+                } else {
+                    Protocol::CurveTwoCrypto
+                };
                 let update = if is_tricrypto {
-                    let (balances, packed_price_scale, d) = read_tricrypto_liquidity_state(provider, pool);
-                    PoolUpdate::TricryptoLiquidity {
+                    let (balances, packed_price_scale, d) =
+                        read_tricrypto_full_state(provider, pool);
+                    PoolUpdate::TricryptoState {
                         balances,
                         packed_price_scale,
                         d,
                     }
                 } else {
-                    let (balances, price_scale, d) = read_twocrypto_liquidity_state(provider, pool);
-                    PoolUpdate::TwoCryptoLiquidity {
+                    let (balances, price_scale, d) = read_twocrypto_full_state(provider, pool);
+                    PoolUpdate::TwoCryptoState {
                         balances,
                         price_scale,
                         d,
@@ -556,8 +559,13 @@ impl LiquidityExEx {
                 initial_time,
                 future_time,
             } => {
-                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
-                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let is_tricrypto =
+                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto {
+                    Protocol::CurveTricrypto
+                } else {
+                    Protocol::CurveTwoCrypto
+                };
                 let update = if is_tricrypto {
                     PoolUpdate::TricryptoRampAgamma {
                         initial_a,
@@ -596,8 +604,13 @@ impl LiquidityExEx {
                 out_fee,
                 fee_gamma,
             } => {
-                let is_tricrypto = _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
-                let protocol = if is_tricrypto { Protocol::CurveTricrypto } else { Protocol::CurveTwoCrypto };
+                let is_tricrypto =
+                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                let protocol = if is_tricrypto {
+                    Protocol::CurveTricrypto
+                } else {
+                    Protocol::CurveTwoCrypto
+                };
                 let update = if is_tricrypto {
                     PoolUpdate::TricryptoNewParameters {
                         mid_fee,
@@ -628,7 +641,7 @@ impl LiquidityExEx {
             // CURVE TRICRYPTO EVENTS (unique signatures)
             // ============================================================================
             DecodedEvent::TricryptoLiquidityChange { pool } => {
-                let (balances, packed_price_scale, d) = read_tricrypto_liquidity_state(provider, pool);
+                let (balances, packed_price_scale, d) = read_tricrypto_full_state(provider, pool);
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::CurveTricrypto,
@@ -638,7 +651,7 @@ impl LiquidityExEx {
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::TricryptoLiquidity {
+                    update: PoolUpdate::TricryptoState {
                         balances,
                         packed_price_scale,
                         d,
@@ -672,20 +685,19 @@ impl LiquidityExEx {
                 },
             }),
 
-            DecodedEvent::BalancerPoolBalanceChanged {
-                pool_id,
-                deltas,
-            } => Some(PoolUpdateMessage {
-                pool_id: PoolIdentifier::PoolId(pool_id),
-                protocol: Protocol::BalancerV2Weighted,
-                update_type: UpdateType::Mint,
-                block_number,
-                block_timestamp,
-                tx_index,
-                log_index,
-                is_revert,
-                update: PoolUpdate::BalancerLiquidity { deltas },
-            }),
+            DecodedEvent::BalancerPoolBalanceChanged { pool_id, deltas } => {
+                Some(PoolUpdateMessage {
+                    pool_id: PoolIdentifier::PoolId(pool_id),
+                    protocol: Protocol::BalancerV2Weighted,
+                    update_type: UpdateType::Mint,
+                    block_number,
+                    block_timestamp,
+                    tx_index,
+                    log_index,
+                    is_revert,
+                    update: PoolUpdate::BalancerLiquidity { deltas },
+                })
+            }
 
             // ============================================================================
             // FLUID DEX EVENTS
@@ -802,18 +814,16 @@ impl LiquidityExEx {
             }
 
             // Curve StableSwap events: check pool address
-            DecodedEvent::CurveSwap { pool, .. }
+            DecodedEvent::CurveSwap { pool }
             | DecodedEvent::CurveLiquidityChange { pool, .. }
             | DecodedEvent::CurveRampA { pool, .. }
-            | DecodedEvent::CurveApplyNewFee { pool, .. } => {
-                pool_tracker.is_tracked_address(pool)
-            }
+            | DecodedEvent::CurveApplyNewFee { pool, .. } => pool_tracker.is_tracked_address(pool),
 
             // Curve TwoCrypto events: check pool address
             // NOTE: Tricrypto pools share TokenExchange/RampAgamma/NewParameters
             // signatures with TwoCrypto — they are decoded as TwoCrypto variants
             // and disambiguated in create_pool_update.
-            DecodedEvent::TwoCryptoSwap { pool, .. }
+            DecodedEvent::TwoCryptoSwap { pool }
             | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
             | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
             | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
@@ -833,9 +843,7 @@ impl LiquidityExEx {
 
             // Fluid LogOperate: emitted by Liquidity Layer, `pool` is the
             // DEX pool address extracted from the indexed `user` topic.
-            DecodedEvent::FluidOperate { pool, .. } => {
-                pool_tracker.is_tracked_fluid_pool(pool)
-            }
+            DecodedEvent::FluidOperate { pool, .. } => pool_tracker.is_tracked_fluid_pool(pool),
         };
 
         // Log when events are filtered out to help with debugging
@@ -865,20 +873,26 @@ impl LiquidityExEx {
                         hex::encode(pool_id)
                     );
                 }
-                DecodedEvent::CurveSwap { pool, .. }
+                DecodedEvent::CurveSwap { pool }
                 | DecodedEvent::CurveLiquidityChange { pool, .. }
                 | DecodedEvent::CurveRampA { pool, .. }
                 | DecodedEvent::CurveApplyNewFee { pool, .. } => {
                     debug!("Filtered CurveStable event from untracked pool: {:?}", pool);
                 }
-                DecodedEvent::TwoCryptoSwap { pool, .. }
+                DecodedEvent::TwoCryptoSwap { pool }
                 | DecodedEvent::TwoCryptoLiquidityChange { pool, .. }
                 | DecodedEvent::TwoCryptoRampAgamma { pool, .. }
                 | DecodedEvent::TwoCryptoNewParameters { pool, .. } => {
-                    debug!("Filtered CurveTwoCrypto/Tricrypto event from untracked pool: {:?}", pool);
+                    debug!(
+                        "Filtered CurveTwoCrypto/Tricrypto event from untracked pool: {:?}",
+                        pool
+                    );
                 }
                 DecodedEvent::TricryptoLiquidityChange { pool, .. } => {
-                    debug!("Filtered CurveTricrypto event from untracked pool: {:?}", pool);
+                    debug!(
+                        "Filtered CurveTricrypto event from untracked pool: {:?}",
+                        pool
+                    );
                 }
                 DecodedEvent::BalancerSwap { pool_id, .. }
                 | DecodedEvent::BalancerPoolBalanceChanged { pool_id, .. } => {
@@ -917,11 +931,7 @@ const TRICRYPTO_D_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
 /// Read a single storage slot from the state at a given block.
 ///
 /// Returns `U256::ZERO` if the slot is empty or the read fails.
-fn read_storage_slot<P: StateProviderFactory>(
-    provider: &P,
-    address: Address,
-    slot: U256,
-) -> U256 {
+fn read_storage_slot<P: StateProviderFactory>(provider: &P, address: Address, slot: U256) -> U256 {
     use alloy_primitives::B256;
     use reth_provider::StateProvider;
     let slot_key: B256 = B256::from(slot);
@@ -930,7 +940,10 @@ fn read_storage_slot<P: StateProviderFactory>(
             Ok(Some(value)) => value,
             Ok(None) => U256::ZERO,
             Err(e) => {
-                warn!("Failed to read storage slot {} for {:?}: {}", slot, address, e);
+                warn!(
+                    "Failed to read storage slot {} for {:?}: {}",
+                    slot, address, e
+                );
                 U256::ZERO
             }
         },
@@ -941,7 +954,7 @@ fn read_storage_slot<P: StateProviderFactory>(
     }
 }
 
-fn read_twocrypto_liquidity_state<P: StateProviderFactory>(
+fn read_twocrypto_full_state<P: StateProviderFactory>(
     provider: &P,
     address: Address,
 ) -> ([u128; 2], U256, U256) {
@@ -954,7 +967,7 @@ fn read_twocrypto_liquidity_state<P: StateProviderFactory>(
     (balances, price_scale, d)
 }
 
-fn read_tricrypto_liquidity_state<P: StateProviderFactory>(
+fn read_tricrypto_full_state<P: StateProviderFactory>(
     provider: &P,
     address: Address,
 ) -> ([u128; 3], U256, U256) {
@@ -998,29 +1011,6 @@ fn read_curve_stable_liquidity_state<P: StateProviderFactory>(
         initial_a_time,
         future_a_time,
     )
-}
-
-/// Enrich a pool update message with storage-derived fields.
-///
-/// For Curve TwoCrypto/Tricrypto swap events, reads D from storage using the
-/// protocol-specific slot to avoid newton_D recomputation on the arena side.
-fn enrich_with_storage<P: StateProviderFactory>(
-    msg: &mut PoolUpdateMessage,
-    provider: &P,
-) {
-    match &mut msg.update {
-        PoolUpdate::TwoCryptoSwap { d, .. } => {
-            if let Some(address) = msg.pool_id.as_address() {
-                *d = read_storage_slot(provider, address, TWOCRYPTO_D_SLOT);
-            }
-        }
-        PoolUpdate::TricryptoSwap { d, .. } => {
-            if let Some(address) = msg.pool_id.as_address() {
-                *d = read_storage_slot(provider, address, TRICRYPTO_D_SLOT);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// V3 storage slots.
@@ -1069,7 +1059,7 @@ fn decode_ekubo_state_packed(value: U256) -> (U256, i32, u128) {
 
 /// Compute V4 pool base slot: keccak256(abi.encode(poolId, 6)).
 fn v4_pool_base_slot(pool_id: &[u8; 32]) -> U256 {
-    use alloy_primitives::{B256, keccak256};
+    use alloy_primitives::{keccak256, B256};
     use alloy_sol_types::SolValue;
     let encoded = (B256::from_slice(pool_id), V4_POOLS_SLOT).abi_encode();
     U256::from_be_bytes(*keccak256(&encoded))
@@ -1153,16 +1143,14 @@ fn send_slot0_finals<P: StateProviderFactory>(
     block_number: u64,
     block_timestamp: u64,
 ) {
-    use pool_tracker::UNISWAP_V4_POOL_MANAGER;
     use events::EKUBO_CORE;
+    use pool_tracker::UNISWAP_V4_POOL_MANAGER;
 
     let mut overrides_sent = 0u32;
 
     for (pool_id, protocol) in affected_pools {
         let slot0 = match (pool_id, protocol) {
-            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => {
-                read_v3_slot0(provider, *addr)
-            }
+            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => read_v3_slot0(provider, *addr),
             (PoolIdentifier::PoolId(id), Protocol::UniswapV4) => {
                 read_v4_slot0(provider, UNISWAP_V4_POOL_MANAGER, id)
             }
@@ -1173,7 +1161,10 @@ fn send_slot0_finals<P: StateProviderFactory>(
         };
 
         let Some((sqrt_price_x96, tick, liquidity)) = slot0 else {
-            warn!("Failed to read slot0 for {:?} during reorg override", pool_id);
+            warn!(
+                "Failed to read slot0 for {:?} during reorg override",
+                pool_id
+            );
             continue;
         };
 
@@ -1195,7 +1186,10 @@ fn send_slot0_finals<P: StateProviderFactory>(
     }
 
     if overrides_sent > 0 {
-        info!("Sent {} slot0 final epilogue updates after reorg", overrides_sent);
+        info!(
+            "Sent {} slot0 final epilogue updates after reorg",
+            overrides_sent
+        );
     }
 }
 
@@ -1212,7 +1206,6 @@ fn record_affected_slot0_pool(
         affected.insert((event.pool_id.clone(), event.protocol));
     }
 }
-
 
 /// Main ExEx entry point
 async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
@@ -1341,8 +1334,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
     // Spawn task to handle whitelist updates with reconnect.
     let pool_tracker = exex.pool_tracker.clone();
     let chain_for_task = chain.clone();
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "http://localhost:8545".to_string());
+    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "http://localhost:8545".to_string());
     tokio::spawn(async move {
         let mut current_sub = subscriber;
         loop {
@@ -1405,16 +1397,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 );
 
                 // Process each block with block boundaries.
-                // Storage enrichment (`D` for Curve crypto pools) is only applied on
-                // the final block in the notification batch. Consumers only read after
-                // arena processing completes, so per-intermediate-block `D` accuracy
-                // is intentionally skipped to reduce state reads.
-                let total_new_blocks = new.blocks().len();
-                for (block_idx, (block, receipts)) in new.blocks_and_receipts().enumerate() {
+                for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
                     let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
-                    let enrich_storage_for_block = block_idx + 1 == total_new_blocks;
 
                     // 🔒 Begin block - lock whitelist updates until block completes
                     {
@@ -1480,7 +1466,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
 
                             // Create and send update
-                            if let Some(mut update_msg) = exex.create_pool_update(
+                            if let Some(update_msg) = exex.create_pool_update(
                                 decoded_event,
                                 block_number,
                                 block_timestamp,
@@ -1490,9 +1476,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 ctx.provider(),
                                 &pool_tracker,
                             ) {
-                                if enrich_storage_for_block {
-                                    enrich_with_storage(&mut update_msg, ctx.provider());
-                                }
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -1508,7 +1491,15 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
                                 Some(reserves) => {
-                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, block_number, block_timestamp));
+                                    exex.send_pool_update(
+                                        &mut stream_seq,
+                                        fluid_update_msg(
+                                            *pool_addr,
+                                            &reserves,
+                                            block_number,
+                                            block_timestamp,
+                                        ),
+                                    );
                                     events_in_block += 1;
                                     exex.events_processed += 1;
                                     debug!(pool = %pool_addr, "Decoded Fluid reserves from storage");
@@ -1660,10 +1651,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 ctx.provider(),
                                 &pool_tracker,
                             ) {
-                                record_affected_slot0_pool(
-                                    &update_msg,
-                                    &mut affected_slot0_pools,
-                                );
+                                record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -1690,15 +1678,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
 
                 // Step 2: Process new blocks (same as ChainCommitted, with Fluid batch decode).
-                // Same policy as ChainCommitted: only enrich storage-derived fields
-                // on the final block in this batch.
                 info!("Step 2: Processing {} new blocks", new.blocks().len());
-                let total_new_blocks = new.blocks().len();
-                for (block_idx, (block, receipts)) in new.blocks_and_receipts().enumerate() {
+                for (block, receipts) in new.blocks_and_receipts() {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
                     let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
-                    let enrich_storage_for_block = block_idx + 1 == total_new_blocks;
 
                     // 🔒 Begin block
                     {
@@ -1749,7 +1733,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
 
                             // Create and send update
-                            if let Some(mut update_msg) = exex.create_pool_update(
+                            if let Some(update_msg) = exex.create_pool_update(
                                 decoded_event,
                                 block_number,
                                 block_timestamp,
@@ -1759,9 +1743,6 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 ctx.provider(),
                                 &pool_tracker,
                             ) {
-                                if enrich_storage_for_block {
-                                    enrich_with_storage(&mut update_msg, ctx.provider());
-                                }
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -1775,7 +1756,15 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
                                 Some(reserves) => {
-                                    exex.send_pool_update(&mut stream_seq, fluid_update_msg(*pool_addr, &reserves, block_number, block_timestamp));
+                                    exex.send_pool_update(
+                                        &mut stream_seq,
+                                        fluid_update_msg(
+                                            *pool_addr,
+                                            &reserves,
+                                            block_number,
+                                            block_timestamp,
+                                        ),
+                                    );
                                     events_in_block += 1;
                                     exex.events_processed += 1;
                                 }
@@ -1811,7 +1800,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 // ── Fluid: decode pools touched in old blocks but not new ──
                 if !reorg_fluid_touched.is_empty() {
                     let pool_tracker = exex.pool_tracker.read().await;
-                    let tip_timestamp = new.blocks().values().last()
+                    let tip_timestamp = new
+                        .blocks()
+                        .values()
+                        .last()
                         .map(|b| b.timestamp())
                         .unwrap_or_default();
                     for pool_addr in &reorg_fluid_touched {
@@ -1845,7 +1837,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     &exex,
                     &mut stream_seq,
                     final_tip_block,
-                    new.blocks().values().last().map(|b| b.timestamp()).unwrap_or(0),
+                    new.blocks()
+                        .values()
+                        .last()
+                        .map(|b| b.timestamp())
+                        .unwrap_or(0),
                 );
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
@@ -1938,10 +1934,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 ctx.provider(),
                                 &pool_tracker,
                             ) {
-                                record_affected_slot0_pool(
-                                    &update_msg,
-                                    &mut affected_slot0_pools,
-                                );
+                                record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -1971,7 +1964,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 if !revert_fluid_touched.is_empty() {
                     let pool_tracker = exex.pool_tracker.read().await;
                     // Provider reflects canonical state after revert
-                    let tip_timestamp = old.blocks().values().next()
+                    let tip_timestamp = old
+                        .blocks()
+                        .values()
+                        .next()
                         .map(|b| b.timestamp())
                         .unwrap_or_default();
                     for pool_addr in &revert_fluid_touched {
@@ -2160,12 +2156,47 @@ fn main() -> eyre::Result<()> {
             .install_exex("BalanceMonitor", async move |ctx| {
                 Ok(balance_monitor::balance_monitor_exex(ctx))
             })
-            // .install_exex("PoolCreations", async move |ctx| {
-            //     Ok(pool_creations::pool_creations_exex(ctx))
-            // })
             .launch()
             .await?;
 
         handle.wait_for_node_exit().await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::v2_swap_deltas;
+    use alloy_primitives::{I256, U256};
+
+    #[test]
+    fn v2_swap_deltas_handle_standard_one_sided_swap() {
+        let (delta0, delta1) = v2_swap_deltas(
+            U256::from(1_000u64),
+            U256::ZERO,
+            U256::ZERO,
+            U256::from(500u64),
+        );
+
+        assert_eq!(delta0, I256::try_from(1_000u64).unwrap());
+        assert_eq!(delta1, -I256::try_from(500u64).unwrap());
+    }
+
+    #[test]
+    fn v2_swap_deltas_keep_rare_nonzero_amount1_in_on_token0_to_token1_swap() {
+        let (delta0, delta1) = v2_swap_deltas(
+            U256::from(4_630_623_146_782_210_569u128),
+            U256::from(100u64),
+            U256::ZERO,
+            U256::from(8_101_991_724u64),
+        );
+
+        assert_eq!(
+            delta0,
+            I256::from_raw(U256::from(4_630_623_146_782_210_569u128))
+        );
+        assert_eq!(
+            delta1,
+            I256::try_from(100u64).unwrap() - I256::try_from(8_101_991_724u64).unwrap()
+        );
+    }
 }

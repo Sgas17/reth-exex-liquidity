@@ -204,24 +204,10 @@ pub enum PoolUpdate {
         offpeg_fee_multiplier: u64,
     },
 
-    /// Curve TwoCryptoNG TokenExchange event.
-    /// Balance deltas: pool gains `tokens_sold` of coin[sold_id],
-    /// sends `tokens_bought` of coin[bought_id].
-    /// `packed_price_scale` carries the updated price_scale from the event.
-    /// `d` is read from pool storage after the swap — avoids
-    /// newton_D recomputation on the arena side.
-    TwoCryptoSwap {
-        sold_id: u8,
-        tokens_sold: u128,
-        bought_id: u8,
-        tokens_bought: u128,
-        packed_price_scale: U256,
-        d: U256,
-    },
-
-    /// Curve TwoCryptoNG liquidity event (AddLiquidity / RemoveLiquidity / etc).
-    /// Carries the full post-state from storage so the arena never needs to rescrape.
-    TwoCryptoLiquidity {
+    /// Curve TwoCryptoNG full post-state update.
+    /// Used for swaps and liquidity events so the arena never replays
+    /// TwoCrypto balances locally.
+    TwoCryptoState {
         balances: [u128; 2],
         price_scale: U256,
         d: U256,
@@ -244,20 +230,12 @@ pub enum PoolUpdate {
         fee_gamma: u128,
     },
 
-    /// Curve TricryptoNG TokenExchange event.
-    TricryptoSwap {
-        sold_id: u8,
-        tokens_sold: u128,
-        bought_id: u8,
-        tokens_bought: u128,
-        /// Packed price_scale: ps[0] in lower 128, ps[1] in upper 128.
-        packed_price_scale: U256,
-        d: U256,
-    },
-
-    /// Curve TricryptoNG liquidity event (full post-state from storage).
-    TricryptoLiquidity {
+    /// Curve TricryptoNG full post-state update.
+    /// Used for swaps and liquidity events so the arena never replays
+    /// Tricrypto balances locally.
+    TricryptoState {
         balances: [u128; 3],
+        /// Packed price_scale: ps[0] in lower 128, ps[1] in upper 128.
         packed_price_scale: U256,
         d: U256,
     },

@@ -201,7 +201,7 @@ pub fn scan_receipt_for_swaps<R: TxReceipt<Log = Log>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, FixedBytes, I256, Uint};
+    use alloy_primitives::{address, FixedBytes, Uint, I256};
     use alloy_sol_types::SolEvent;
 
     const EXECUTOR: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");

@@ -41,14 +41,14 @@ const X40: u128 = 0xFF_FFFFFFFF;
 const X64: u128 = 0xFFFFFFFF_FFFFFFFF;
 
 // LiquiditySlotsLink bit positions for exchangePricesAndConfig slot
-const BITS_EXCHANGE_PRICES_BORROW_RATE: u32 = 0;        // 16 bits
-const BITS_EXCHANGE_PRICES_FEE: u32 = 16;               // 14 bits
-const BITS_EXCHANGE_PRICES_UTILIZATION: u32 = 30;        // 14 bits
-const BITS_EXCHANGE_PRICES_LAST_TIMESTAMP: u32 = 58;     // 33 bits
-const BITS_EXCHANGE_PRICES_SUPPLY_EXCHANGE_PRICE: u32 = 91;  // 64 bits
+const BITS_EXCHANGE_PRICES_BORROW_RATE: u32 = 0; // 16 bits
+const BITS_EXCHANGE_PRICES_FEE: u32 = 16; // 14 bits
+const BITS_EXCHANGE_PRICES_UTILIZATION: u32 = 30; // 14 bits
+const BITS_EXCHANGE_PRICES_LAST_TIMESTAMP: u32 = 58; // 33 bits
+const BITS_EXCHANGE_PRICES_SUPPLY_EXCHANGE_PRICE: u32 = 91; // 64 bits
 const BITS_EXCHANGE_PRICES_BORROW_EXCHANGE_PRICE: u32 = 155; // 64 bits
-const BITS_EXCHANGE_PRICES_SUPPLY_RATIO: u32 = 219;      // 15 bits
-const BITS_EXCHANGE_PRICES_BORROW_RATIO: u32 = 234;      // 15 bits
+const BITS_EXCHANGE_PRICES_SUPPLY_RATIO: u32 = 219; // 15 bits
+const BITS_EXCHANGE_PRICES_BORROW_RATIO: u32 = 234; // 15 bits
 
 // LiquiditySlotsLink bit positions for user supply/borrow
 const BITS_USER_SUPPLY_AMOUNT: u32 = 1; // starts at bit 1 (bit 0 is interest mode flag)
@@ -105,8 +105,8 @@ impl FluidPoolConfig {
     /// The 8 storage reads needed to decode reserves, as (address, slot) pairs.
     pub fn storage_reads(&self) -> [(Address, U256); 8] {
         [
-            (self.pool_address, U256::from(0)),                     // dexVariables
-            (self.pool_address, U256::from(1)),                     // dexVariables2
+            (self.pool_address, U256::from(0)), // dexVariables
+            (self.pool_address, U256::from(1)), // dexVariables2
             (self.liquidity_address, self.exchange_price_token0_slot),
             (self.liquidity_address, self.exchange_price_token1_slot),
             (self.liquidity_address, self.supply_token0_slot),
@@ -237,7 +237,8 @@ impl FluidPoolConfig {
     pub async fn resolve(pool_address: Address, rpc_url: &str) -> eyre::Result<Self> {
         let cv_data = eth_call(rpc_url, pool_address, &Self::constants_view_calldata()).await?;
         let cv2_data = eth_call(rpc_url, pool_address, &Self::constants_view2_calldata()).await?;
-        Self::from_abi(pool_address, &cv_data, &cv2_data).map_err(|e| eyre::eyre!("ABI decode: {e}"))
+        Self::from_abi(pool_address, &cv_data, &cv2_data)
+            .map_err(|e| eyre::eyre!("ABI decode: {e}"))
     }
 }
 
@@ -256,9 +257,15 @@ async fn eth_call(rpc_url: &str, to: Address, calldata: &[u8]) -> eyre::Result<V
     let body_str = body.to_string();
 
     // Parse URL: http://host:port/path
-    let stripped = rpc_url.trim_start_matches("http://").trim_start_matches("https://");
+    let stripped = rpc_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     let (host_port, path) = stripped.split_once('/').unwrap_or((stripped, ""));
-    let path = if path.is_empty() { "/" } else { &format!("/{path}") };
+    let path = if path.is_empty() {
+        "/"
+    } else {
+        &format!("/{path}")
+    };
     let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8545"));
     let port: u16 = port_str.parse().unwrap_or(8545);
 
@@ -274,7 +281,9 @@ async fn eth_call(rpc_url: &str, to: Address, calldata: &[u8]) -> eyre::Result<V
     let response_str = String::from_utf8_lossy(&response);
 
     // Extract JSON body after headers
-    let json_start = response_str.find('{').ok_or_else(|| eyre::eyre!("no JSON in response"))?;
+    let json_start = response_str
+        .find('{')
+        .ok_or_else(|| eyre::eyre!("no JSON in response"))?;
     let json_body: serde_json::Value = serde_json::from_str(&response_str[json_start..])?;
 
     let result_hex = json_body["result"]
@@ -287,14 +296,14 @@ async fn eth_call(rpc_url: &str, to: Address, calldata: &[u8]) -> eyre::Result<V
 /// Raw storage inputs needed for reserve computation.
 #[derive(Debug, Clone)]
 pub struct FluidStorageSlots {
-    pub dex_variables: U256,       // pool slot 0
-    pub dex_variables2: U256,      // pool slot 1
+    pub dex_variables: U256,         // pool slot 0
+    pub dex_variables2: U256,        // pool slot 1
     pub exchange_price_token0: U256, // Liquidity Layer
     pub exchange_price_token1: U256, // Liquidity Layer
-    pub supply_token0: U256,       // Liquidity Layer (user supply data for pool as user)
-    pub supply_token1: U256,       // Liquidity Layer
-    pub borrow_token0: U256,       // Liquidity Layer (user borrow data for pool as user)
-    pub borrow_token1: U256,       // Liquidity Layer
+    pub supply_token0: U256,         // Liquidity Layer (user supply data for pool as user)
+    pub supply_token1: U256,         // Liquidity Layer
+    pub borrow_token0: U256,         // Liquidity Layer (user borrow data for pool as user)
+    pub borrow_token1: U256,         // Liquidity Layer
 }
 
 // ============================================================================
@@ -374,18 +383,32 @@ pub fn calc_exchange_prices(
     exchange_prices_and_config: &U256,
     current_timestamp: u64,
 ) -> (u128, u128) {
-    let mut supply_exchange_price =
-        extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_SUPPLY_EXCHANGE_PRICE, X64);
-    let mut borrow_exchange_price =
-        extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_BORROW_EXCHANGE_PRICE, X64);
+    let mut supply_exchange_price = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_SUPPLY_EXCHANGE_PRICE,
+        X64,
+    );
+    let mut borrow_exchange_price = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_BORROW_EXCHANGE_PRICE,
+        X64,
+    );
 
     if supply_exchange_price == 0 || borrow_exchange_price == 0 {
         return (supply_exchange_price, borrow_exchange_price);
     }
 
-    let borrow_rate = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_BORROW_RATE, X16);
+    let borrow_rate = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_BORROW_RATE,
+        X16,
+    );
 
-    let last_timestamp = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_LAST_TIMESTAMP, X33);
+    let last_timestamp = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_LAST_TIMESTAMP,
+        X33,
+    );
     let seconds_since = (current_timestamp as u128).saturating_sub(last_timestamp);
     if current_timestamp != 0 && last_timestamp > current_timestamp as u128 {
         // Timestamp from storage is in the future — exchange prices may be stale or
@@ -393,23 +416,35 @@ pub fn calc_exchange_prices(
         return (supply_exchange_price, borrow_exchange_price);
     }
 
-    let borrow_ratio = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_BORROW_RATIO, X15);
+    let borrow_ratio = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_BORROW_RATIO,
+        X15,
+    );
 
     if seconds_since == 0 || borrow_rate == 0 || borrow_ratio == 1 {
         return (supply_exchange_price, borrow_exchange_price);
     }
 
     // Update borrow exchange price
-    borrow_exchange_price += (borrow_exchange_price * borrow_rate * seconds_since)
-        / (SECONDS_PER_YEAR * FOUR_DECIMALS);
+    borrow_exchange_price +=
+        (borrow_exchange_price * borrow_rate * seconds_since) / (SECONDS_PER_YEAR * FOUR_DECIMALS);
 
     // Calculate supply rate
-    let supply_ratio = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_SUPPLY_RATIO, X15);
+    let supply_ratio = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_SUPPLY_RATIO,
+        X15,
+    );
     if supply_ratio == 1 {
         return (supply_exchange_price, borrow_exchange_price);
     }
 
-    let utilization = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_UTILIZATION, X14);
+    let utilization = extract_u128(
+        exchange_prices_and_config,
+        BITS_EXCHANGE_PRICES_UTILIZATION,
+        X14,
+    );
     let fee = extract_u128(exchange_prices_and_config, BITS_EXCHANGE_PRICES_FEE, X14);
 
     // ratioSupplyYield calculation
@@ -425,8 +460,8 @@ pub fn calc_exchange_prices(
     } else {
         // supplyInterestFree / supplyWithInterest (with interest is bigger)
         let sr = supply_ratio >> 1;
-        ratio_supply_yield = (E27 * utilization * (FOUR_DECIMALS + sr))
-            / (FOUR_DECIMALS * FOUR_DECIMALS);
+        ratio_supply_yield =
+            (E27 * utilization * (FOUR_DECIMALS + sr)) / (FOUR_DECIMALS * FOUR_DECIMALS);
     }
 
     // borrowRatio contribution
@@ -440,8 +475,7 @@ pub fn calc_exchange_prices(
         borrow_ratio_yield = (br * E27) / (FOUR_DECIMALS + br);
     } else {
         let br = borrow_ratio >> 1;
-        borrow_ratio_yield = E27
-            - ((br * E27) / (FOUR_DECIMALS + br));
+        borrow_ratio_yield = E27 - ((br * E27) / (FOUR_DECIMALS + br));
     }
 
     // temp_ = ratioSupplyYield scaled to normal percent
@@ -481,7 +515,8 @@ fn get_liquidity_collateral(
 
     if extract_u128(supply_data, 0, 1) == 1 {
         // Use U256 to avoid overflow: supply * exchangePrice can exceed u128
-        supply = u128_from_u256(mul256(supply, exchange_price) / U256::from(EXCHANGE_PRICES_PRECISION));
+        supply =
+            u128_from_u256(mul256(supply, exchange_price) / U256::from(EXCHANGE_PRICES_PRECISION));
     }
 
     u128_from_u256(mul256(supply, numerator_precision) / U256::from(denominator_precision))
@@ -730,7 +765,12 @@ pub fn decode_fluid_reserves(
         );
 
         let (imag0, imag1) = if geometric_mean < E27 {
-            calculate_reserves_outside_range(geometric_mean, final_upper, token0_supply, token1_supply)
+            calculate_reserves_outside_range(
+                geometric_mean,
+                final_upper,
+                token0_supply,
+                token1_supply,
+            )
         } else {
             let inv_gm = inv_price(geometric_mean);
             let inv_lower = inv_price(final_lower);
@@ -873,8 +913,8 @@ mod tests {
 
         // Center price ≈ 1.229e27 — check within 1% (timestamp-dependent)
         let expected_center = 1_229_247_679_861_379_355_000_000_000u128;
-        let diff_pct =
-            (r.center_price as i128 - expected_center as i128).unsigned_abs() * 100 / expected_center;
+        let diff_pct = (r.center_price as i128 - expected_center as i128).unsigned_abs() * 100
+            / expected_center;
         assert!(
             diff_pct < 2,
             "center price off by {}%: got {}, expected {}",
@@ -885,17 +925,37 @@ mod tests {
 
         // Collateral reserves (1e12 adjusted) — check within 5% (timestamp-dependent exchange prices)
         let expected_col_t0_imag = 20_314_635_945_036_376_858u128;
-        check_within_pct(r.col_token0_imaginary_reserves, expected_col_t0_imag, 5, "col_t0_imag");
+        check_within_pct(
+            r.col_token0_imaginary_reserves,
+            expected_col_t0_imag,
+            5,
+            "col_t0_imag",
+        );
 
         let expected_col_t1_imag = 24_958_234_461_191_088_810u128;
-        check_within_pct(r.col_token1_imaginary_reserves, expected_col_t1_imag, 5, "col_t1_imag");
+        check_within_pct(
+            r.col_token1_imaginary_reserves,
+            expected_col_t1_imag,
+            5,
+            "col_t1_imag",
+        );
 
         // Debt imaginary reserves
         let expected_debt_t0_imag = 18_101_440_459_658_112_555u128;
-        check_within_pct(r.debt_token0_imaginary_reserves, expected_debt_t0_imag, 5, "debt_t0_imag");
+        check_within_pct(
+            r.debt_token0_imaginary_reserves,
+            expected_debt_t0_imag,
+            5,
+            "debt_t0_imag",
+        );
 
         let expected_debt_t1_imag = 22_239_138_093_276_344_183u128;
-        check_within_pct(r.debt_token1_imaginary_reserves, expected_debt_t1_imag, 5, "debt_t1_imag");
+        check_within_pct(
+            r.debt_token1_imaginary_reserves,
+            expected_debt_t1_imag,
+            5,
+            "debt_t1_imag",
+        );
 
         println!("Pool 1 decode results:");
         println!("  center_price: {}", r.center_price);
@@ -910,28 +970,31 @@ mod tests {
 
     /// Pool 1 (wstETH/ETH) config constructed from known constantsView() values.
     fn pool1_config() -> FluidPoolConfig {
-        let pool = Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
+        let pool =
+            Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
         FluidPoolConfig {
             pool_address: pool,
-            liquidity_address: Address::from_slice(&hex::decode("52Aa899454998Be5b000Ad077a46Bbe360F4e497").unwrap()),
-            exchange_price_token0_slot: U256::from_be_bytes(
-                hex_bytes32("c24eaceff5753c99066a839532d708a8661af7a9b01d44d0cd915c53969eb725"),
+            liquidity_address: Address::from_slice(
+                &hex::decode("52Aa899454998Be5b000Ad077a46Bbe360F4e497").unwrap(),
             ),
-            exchange_price_token1_slot: U256::from_be_bytes(
-                hex_bytes32("a1829a9003092132f585b6ccdd167c19fe9774dbdea4260287e8a8e8ca8185d7"),
-            ),
-            supply_token0_slot: U256::from_be_bytes(
-                hex_bytes32("a893c3ab5c5189a9bd276b29d25998250798d4f72dbb029d43e23884b0119a5a"),
-            ),
-            supply_token1_slot: U256::from_be_bytes(
-                hex_bytes32("236696efd8534ce144b358082d303ba190cad0c8d37e9f4802b2a5198019379b"),
-            ),
-            borrow_token0_slot: U256::from_be_bytes(
-                hex_bytes32("2cd14670f8a9e59d7c072449b534cc4ec6d89953cf20c518ba36d7fbdd468baf"),
-            ),
-            borrow_token1_slot: U256::from_be_bytes(
-                hex_bytes32("d943cec1dfc617bf9515058376abfab0217f98cce018735f02efd4abd3453ad8"),
-            ),
+            exchange_price_token0_slot: U256::from_be_bytes(hex_bytes32(
+                "c24eaceff5753c99066a839532d708a8661af7a9b01d44d0cd915c53969eb725",
+            )),
+            exchange_price_token1_slot: U256::from_be_bytes(hex_bytes32(
+                "a1829a9003092132f585b6ccdd167c19fe9774dbdea4260287e8a8e8ca8185d7",
+            )),
+            supply_token0_slot: U256::from_be_bytes(hex_bytes32(
+                "a893c3ab5c5189a9bd276b29d25998250798d4f72dbb029d43e23884b0119a5a",
+            )),
+            supply_token1_slot: U256::from_be_bytes(hex_bytes32(
+                "236696efd8534ce144b358082d303ba190cad0c8d37e9f4802b2a5198019379b",
+            )),
+            borrow_token0_slot: U256::from_be_bytes(hex_bytes32(
+                "2cd14670f8a9e59d7c072449b534cc4ec6d89953cf20c518ba36d7fbdd468baf",
+            )),
+            borrow_token1_slot: U256::from_be_bytes(hex_bytes32(
+                "d943cec1dfc617bf9515058376abfab0217f98cce018735f02efd4abd3453ad8",
+            )),
             token0_numerator_precision: 1,
             token0_denominator_precision: 1_000_000,
             token1_numerator_precision: 1,
@@ -949,7 +1012,8 @@ mod tests {
     /// Test that `from_abi` correctly parses raw returndata from pool 1.
     #[test]
     fn test_from_abi_pool1() {
-        let pool = Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
+        let pool =
+            Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
 
         // Raw returndata from `cast call $POOL constantsView()`
         let cv_returndata = hex::decode(
@@ -967,16 +1031,34 @@ mod tests {
         let expected = pool1_config();
         assert_eq!(config.pool_address, expected.pool_address);
         assert_eq!(config.liquidity_address, expected.liquidity_address);
-        assert_eq!(config.exchange_price_token0_slot, expected.exchange_price_token0_slot);
-        assert_eq!(config.exchange_price_token1_slot, expected.exchange_price_token1_slot);
+        assert_eq!(
+            config.exchange_price_token0_slot,
+            expected.exchange_price_token0_slot
+        );
+        assert_eq!(
+            config.exchange_price_token1_slot,
+            expected.exchange_price_token1_slot
+        );
         assert_eq!(config.supply_token0_slot, expected.supply_token0_slot);
         assert_eq!(config.supply_token1_slot, expected.supply_token1_slot);
         assert_eq!(config.borrow_token0_slot, expected.borrow_token0_slot);
         assert_eq!(config.borrow_token1_slot, expected.borrow_token1_slot);
-        assert_eq!(config.token0_numerator_precision, expected.token0_numerator_precision);
-        assert_eq!(config.token0_denominator_precision, expected.token0_denominator_precision);
-        assert_eq!(config.token1_numerator_precision, expected.token1_numerator_precision);
-        assert_eq!(config.token1_denominator_precision, expected.token1_denominator_precision);
+        assert_eq!(
+            config.token0_numerator_precision,
+            expected.token0_numerator_precision
+        );
+        assert_eq!(
+            config.token0_denominator_precision,
+            expected.token0_denominator_precision
+        );
+        assert_eq!(
+            config.token1_numerator_precision,
+            expected.token1_numerator_precision
+        );
+        assert_eq!(
+            config.token1_denominator_precision,
+            expected.token1_denominator_precision
+        );
     }
 
     /// Test that `storage_reads()` returns the correct addresses and slots.
@@ -1004,7 +1086,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires local reth node on localhost:8545"]
     async fn test_resolve_pool1() {
-        let pool = Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
+        let pool =
+            Address::from_slice(&hex::decode("0B1a513ee24972DAEf112bC777a5610d4325C9e7").unwrap());
         let config = FluidPoolConfig::resolve(pool, "http://localhost:8545")
             .await
             .expect("resolve should succeed");
@@ -1012,7 +1095,10 @@ mod tests {
         let expected = pool1_config();
         assert_eq!(config.liquidity_address, expected.liquidity_address);
         assert_eq!(config.supply_token0_slot, expected.supply_token0_slot);
-        assert_eq!(config.exchange_price_token0_slot, expected.exchange_price_token0_slot);
+        assert_eq!(
+            config.exchange_price_token0_slot,
+            expected.exchange_price_token0_slot
+        );
         assert_eq!(config.token0_denominator_precision, 1_000_000);
     }
 
@@ -1036,12 +1122,20 @@ mod tests {
     async fn rpc_request(rpc_url: &str, body: &serde_json::Value) -> Vec<u8> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let body_str = body.to_string();
-        let stripped = rpc_url.trim_start_matches("http://").trim_start_matches("https://");
+        let stripped = rpc_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
         let (host_port, path) = stripped.split_once('/').unwrap_or((stripped, ""));
-        let path = if path.is_empty() { "/" } else { &format!("/{path}") };
+        let path = if path.is_empty() {
+            "/"
+        } else {
+            &format!("/{path}")
+        };
         let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "8545"));
         let port: u16 = port_str.parse().unwrap_or(8545);
-        let mut stream = tokio::net::TcpStream::connect(format!("{host}:{port}")).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(format!("{host}:{port}"))
+            .await
+            .unwrap();
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
             body_str.len()
@@ -1051,8 +1145,11 @@ mod tests {
         stream.read_to_end(&mut response).await.unwrap();
         let response_str = String::from_utf8_lossy(&response);
         let json_start = response_str.find('{').expect("no JSON in response");
-        let json_body: serde_json::Value = serde_json::from_str(&response_str[json_start..]).unwrap();
-        let result_hex = json_body["result"].as_str().unwrap_or_else(|| panic!("RPC error: {json_body}"));
+        let json_body: serde_json::Value =
+            serde_json::from_str(&response_str[json_start..]).unwrap();
+        let result_hex = json_body["result"]
+            .as_str()
+            .unwrap_or_else(|| panic!("RPC error: {json_body}"));
         hex::decode(result_hex.trim_start_matches("0x")).unwrap()
     }
 
@@ -1101,8 +1198,8 @@ mod tests {
             rpc_pause().await;
         }
         let slots = config.to_storage_slots(&values);
-        let decoded = decode_fluid_reserves(&slots, &config, timestamp)
-            .expect("decoder should succeed");
+        let decoded =
+            decode_fluid_reserves(&slots, &config, timestamp).expect("decoder should succeed");
         (config, decoded)
     }
 
@@ -1110,9 +1207,8 @@ mod tests {
     /// Returns (t0Real, t1Real, t0Imag, t1Imag) — pool's struct field order.
     async fn resolver_collateral(pool_hex: &str, rpc: &str, block: u64) -> [u128; 4] {
         let pool_addr = Address::from_slice(&hex::decode(pool_hex).unwrap());
-        let resolver = Address::from_slice(
-            &hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap(),
-        );
+        let resolver =
+            Address::from_slice(&hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap());
         // getDexCollateralReserves(address) = 0x957755e6
         let mut cd = hex::decode("957755e6").unwrap();
         cd.extend_from_slice(&[0u8; 12]);
@@ -1120,9 +1216,7 @@ mod tests {
         rpc_pause().await;
         let ret = eth_call_at(rpc, resolver, &cd, block).await;
         // Returns (t0Real, t1Real, t0Imag, t1Imag) — 4 × 32 bytes
-        let w = |i: usize| -> u128 {
-            U256::from_be_slice(&ret[i * 32..(i + 1) * 32]).to::<u128>()
-        };
+        let w = |i: usize| -> u128 { U256::from_be_slice(&ret[i * 32..(i + 1) * 32]).to::<u128>() };
         [w(0), w(1), w(2), w(3)]
     }
 
@@ -1130,18 +1224,15 @@ mod tests {
     /// Returns (t0Debt, t1Debt, t0Real, t1Real, t0Imag, t1Imag).
     async fn resolver_debt(pool_hex: &str, rpc: &str, block: u64) -> [u128; 6] {
         let pool_addr = Address::from_slice(&hex::decode(pool_hex).unwrap());
-        let resolver = Address::from_slice(
-            &hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap(),
-        );
+        let resolver =
+            Address::from_slice(&hex::decode("05Bd8269A20C472b148246De20E6852091BF16Ff").unwrap());
         // getDexDebtReserves(address) = 0x55181f11
         let mut cd = hex::decode("55181f11").unwrap();
         cd.extend_from_slice(&[0u8; 12]);
         cd.extend_from_slice(pool_addr.as_slice());
         rpc_pause().await;
         let ret = eth_call_at(rpc, resolver, &cd, block).await;
-        let w = |i: usize| -> u128 {
-            U256::from_be_slice(&ret[i * 32..(i + 1) * 32]).to::<u128>()
-        };
+        let w = |i: usize| -> u128 { U256::from_be_slice(&ret[i * 32..(i + 1) * 32]).to::<u128>() };
         [w(0), w(1), w(2), w(3), w(4), w(5)]
     }
 
@@ -1167,27 +1258,73 @@ mod tests {
     ) {
         println!("\n=== {} collateral ===", label);
         let pairs: [(&str, u128, u128); 4] = [
-            ("col.t0_real", decoded.col_token0_real_reserves, rescale(col[0], n0, d0)),
-            ("col.t1_real", decoded.col_token1_real_reserves, rescale(col[1], n1, d1)),
-            ("col.t0_imag", decoded.col_token0_imaginary_reserves, rescale(col[2], n0, d0)),
-            ("col.t1_imag", decoded.col_token1_imaginary_reserves, rescale(col[3], n1, d1)),
+            (
+                "col.t0_real",
+                decoded.col_token0_real_reserves,
+                rescale(col[0], n0, d0),
+            ),
+            (
+                "col.t1_real",
+                decoded.col_token1_real_reserves,
+                rescale(col[1], n1, d1),
+            ),
+            (
+                "col.t0_imag",
+                decoded.col_token0_imaginary_reserves,
+                rescale(col[2], n0, d0),
+            ),
+            (
+                "col.t1_imag",
+                decoded.col_token1_imaginary_reserves,
+                rescale(col[3], n1, d1),
+            ),
         ];
         for (name, actual, expected) in &pairs {
-            println!("  {:14} decoder={:>20}  on-chain={:>20}", name, actual, expected);
+            println!(
+                "  {:14} decoder={:>20}  on-chain={:>20}",
+                name, actual, expected
+            );
             check_within_pct(*actual, *expected, pct, name);
         }
 
         println!("\n=== {} debt ===", label);
         let debt_pairs: [(&str, u128, u128); 6] = [
-            ("debt.t0_debt", decoded.debt_token0_debt, rescale(debt[0], n0, d0)),
-            ("debt.t1_debt", decoded.debt_token1_debt, rescale(debt[1], n1, d1)),
-            ("debt.t0_real", decoded.debt_token0_real_reserves, rescale(debt[2], n0, d0)),
-            ("debt.t1_real", decoded.debt_token1_real_reserves, rescale(debt[3], n1, d1)),
-            ("debt.t0_imag", decoded.debt_token0_imaginary_reserves, rescale(debt[4], n0, d0)),
-            ("debt.t1_imag", decoded.debt_token1_imaginary_reserves, rescale(debt[5], n1, d1)),
+            (
+                "debt.t0_debt",
+                decoded.debt_token0_debt,
+                rescale(debt[0], n0, d0),
+            ),
+            (
+                "debt.t1_debt",
+                decoded.debt_token1_debt,
+                rescale(debt[1], n1, d1),
+            ),
+            (
+                "debt.t0_real",
+                decoded.debt_token0_real_reserves,
+                rescale(debt[2], n0, d0),
+            ),
+            (
+                "debt.t1_real",
+                decoded.debt_token1_real_reserves,
+                rescale(debt[3], n1, d1),
+            ),
+            (
+                "debt.t0_imag",
+                decoded.debt_token0_imaginary_reserves,
+                rescale(debt[4], n0, d0),
+            ),
+            (
+                "debt.t1_imag",
+                decoded.debt_token1_imaginary_reserves,
+                rescale(debt[5], n1, d1),
+            ),
         ];
         for (name, actual, expected) in &debt_pairs {
-            println!("  {:14} decoder={:>20}  on-chain={:>20}", name, actual, expected);
+            println!(
+                "  {:14} decoder={:>20}  on-chain={:>20}",
+                name, actual, expected
+            );
             check_within_pct(*actual, *expected, pct, name);
         }
     }
@@ -1208,11 +1345,27 @@ mod tests {
         let col = resolver_collateral(pool, rpc, block).await;
         let debt = resolver_debt(pool, rpc, block).await;
 
-        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
-        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+        let (n0, d0) = (
+            config.token0_numerator_precision,
+            config.token0_denominator_precision,
+        );
+        let (n1, d1) = (
+            config.token1_numerator_precision,
+            config.token1_denominator_precision,
+        );
 
         assert_eq!(decoded.fee, 500, "fee mismatch");
-        compare_reserves("Pool 5 (USDC/ETH)", &decoded, &col, &debt, n0, d0, n1, d1, 1);
+        compare_reserves(
+            "Pool 5 (USDC/ETH)",
+            &decoded,
+            &col,
+            &debt,
+            n0,
+            d0,
+            n1,
+            d1,
+            1,
+        );
 
         println!("\n✅ Pool 5 all reserves match within 1%");
     }
@@ -1232,12 +1385,28 @@ mod tests {
         let col = resolver_collateral(pool, rpc, block).await;
         let debt = resolver_debt(pool, rpc, block).await;
 
-        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
-        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+        let (n0, d0) = (
+            config.token0_numerator_precision,
+            config.token0_denominator_precision,
+        );
+        let (n1, d1) = (
+            config.token1_numerator_precision,
+            config.token1_denominator_precision,
+        );
 
         assert_eq!(decoded.fee, 73, "fee mismatch");
         // Pool 1 uses oracle hook → center price ~0.01% off → reserves ~1% off.
-        compare_reserves("Pool 1 (wstETH/ETH)", &decoded, &col, &debt, n0, d0, n1, d1, 2);
+        compare_reserves(
+            "Pool 1 (wstETH/ETH)",
+            &decoded,
+            &col,
+            &debt,
+            n0,
+            d0,
+            n1,
+            d1,
+            2,
+        );
 
         println!("\n✅ Pool 1 all reserves match within 2%");
     }
@@ -1256,11 +1425,27 @@ mod tests {
         let col = resolver_collateral(pool, rpc, block).await;
         let debt = resolver_debt(pool, rpc, block).await;
 
-        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
-        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+        let (n0, d0) = (
+            config.token0_numerator_precision,
+            config.token0_denominator_precision,
+        );
+        let (n1, d1) = (
+            config.token1_numerator_precision,
+            config.token1_denominator_precision,
+        );
 
         assert_eq!(decoded.fee, 7, "fee mismatch");
-        compare_reserves("Pool ea734b (USDC/USDT)", &decoded, &col, &debt, n0, d0, n1, d1, 1);
+        compare_reserves(
+            "Pool ea734b (USDC/USDT)",
+            &decoded,
+            &col,
+            &debt,
+            n0,
+            d0,
+            n1,
+            d1,
+            1,
+        );
 
         println!("\n✅ Pool ea734b all reserves match within 1%");
     }
@@ -1280,16 +1465,38 @@ mod tests {
         let col = resolver_collateral(pool, rpc, block).await;
         let debt = resolver_debt(pool, rpc, block).await;
 
-        let (n0, d0) = (config.token0_numerator_precision, config.token0_denominator_precision);
-        let (n1, d1) = (config.token1_numerator_precision, config.token1_denominator_precision);
+        let (n0, d0) = (
+            config.token0_numerator_precision,
+            config.token0_denominator_precision,
+        );
+        let (n1, d1) = (
+            config.token1_numerator_precision,
+            config.token1_denominator_precision,
+        );
 
         println!("token0 prec: num={} denom={}", n0, d0);
         println!("token1 prec: num={} denom={}", n1, d1);
-        println!("decoded.debt_token0_real = {}", decoded.debt_token0_real_reserves);
-        println!("decoded.debt_token1_real = {}", decoded.debt_token1_real_reserves);
+        println!(
+            "decoded.debt_token0_real = {}",
+            decoded.debt_token0_real_reserves
+        );
+        println!(
+            "decoded.debt_token1_real = {}",
+            decoded.debt_token1_real_reserves
+        );
         println!("resolver debt: {:?}", debt);
 
-        compare_reserves("Pool 667701 (USDC/USDT)", &decoded, &col, &debt, n0, d0, n1, d1, 5);
+        compare_reserves(
+            "Pool 667701 (USDC/USDT)",
+            &decoded,
+            &col,
+            &debt,
+            n0,
+            d0,
+            n1,
+            d1,
+            5,
+        );
 
         println!("\n✅ Pool 667701 all reserves match within 5%");
     }
