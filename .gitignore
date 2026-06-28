@@ -1,7 +1,9 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is tracked: this is a binary crate, and the lock pins the reth/alloy
+# git-dependency versions (reth v2.3.0 needs the alloy 2.x family held at 2.0.5).
+# Without it, a fresh checkout re-resolves and fails to build.
 
 # Python
 __pycache__/

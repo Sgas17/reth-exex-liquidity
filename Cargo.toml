@@ -6,18 +6,23 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Reth ExEx framework
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", features = ["jemalloc"] }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", features = ["serde"] }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", features = ["jemalloc"] }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", features = ["serde"] }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
 
 # Alloy for type-safe event decoding
 alloy-consensus = { version = "2.0.4", default-features = false }
-alloy-sol-types = { version = "1.5.6", features = ["json"] }
-alloy-primitives = { version = "1.5.6", default-features = false }
+alloy-sol-types = { version = "1.6", features = ["json"] }
+alloy-primitives = { version = "1.6", default-features = false }
+
+# Pool-arena shared-memory layout (the reader contract). Self-contained crate
+# shared with the defi_arb_rust readers — its only shared dep is alloy-primitives.
+# Path dep during development; pin to a git rev for shipping.
+arena_layout = { path = "../../defi_arb_rust/ITE-16/libs/arena_layout" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

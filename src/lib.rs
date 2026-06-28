@@ -2,6 +2,7 @@
 //
 // Exposes modules for reuse and testing
 
+pub mod arena_writer;
 pub mod balance_monitor;
 pub mod events;
 pub mod fluid_decoder;
