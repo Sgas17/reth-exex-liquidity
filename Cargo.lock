@@ -1017,6 +1017,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arena_writer"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "arena_layout",
+ "const-hex",
+ "memmap2",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7992,6 +8004,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "arena_layout",
+ "arena_writer",
  "async-nats",
  "bincode",
  "chrono",

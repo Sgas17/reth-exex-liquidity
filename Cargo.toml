@@ -23,6 +23,7 @@ alloy-primitives = { version = "1.6", default-features = false }
 # shared with the defi_arb_rust readers — its only shared dep is alloy-primitives.
 # Path dep during development; pin to a git rev for shipping.
 arena_layout = { path = "../../defi_arb_rust/ITE-16/libs/arena_layout" }
+arena_writer = { path = "../../defi_arb_rust/ITE-16/libs/arena_writer" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
