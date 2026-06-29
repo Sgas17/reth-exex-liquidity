@@ -19,6 +19,7 @@ mod events;
 mod fluid_decoder;
 mod nats_client;
 mod pool_tracker;
+mod shadow_apply;
 mod shadow_arena;
 #[allow(dead_code)]
 mod socket;
@@ -108,6 +109,35 @@ impl LiquidityExEx {
     fn shadow_end_block(&mut self, block_number: u64) {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.end_block(block_number);
+        }
+    }
+
+    /// Apply a committed-block pool update into the shadow arena (ITE-16 step
+    /// 3c), if enabled. Mirrors arena_service's apply so the two writers stay in
+    /// lockstep for the pre-cutover diff. `PoolNotFound` means the pool is not in
+    /// the shadow topology yet (live-added pools are not hydrated into the shadow
+    /// — tracked as a follow-up) and is downgraded to a debug skip; the shadow is
+    /// a validation harness and must never crash the ExEx.
+    fn shadow_apply(&mut self, event: &PoolUpdateMessage) {
+        let Some(shadow) = self.shadow.as_mut() else {
+            return;
+        };
+        match shadow.apply_live_event(event) {
+            Ok(_) => {}
+            Err(shadow_apply::ApplyError::Writer(arena_writer::WriterError::PoolNotFound(_))) => {
+                debug!(
+                    pool = ?event.pool_id,
+                    block = event.block_number,
+                    "shadow apply: pool not in shadow topology, skipping"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pool = ?event.pool_id,
+                    block = event.block_number,
+                    "shadow arena live apply failed: {e}"
+                );
+            }
         }
     }
 
@@ -2604,6 +2634,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 state.as_ref(),
                                 &pool_tracker,
                             ) {
+                                exex.shadow_apply(&update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -2619,15 +2650,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(state.as_ref(), config, block_timestamp) {
                                 Some(reserves) => {
-                                    exex.send_pool_update(
-                                        &mut stream_seq,
-                                        fluid_update_msg(
-                                            *pool_addr,
-                                            &reserves,
-                                            block_number,
-                                            block_timestamp,
-                                        ),
+                                    let update_msg = fluid_update_msg(
+                                        *pool_addr,
+                                        &reserves,
+                                        block_number,
+                                        block_timestamp,
                                     );
+                                    exex.shadow_apply(&update_msg);
+                                    exex.send_pool_update(&mut stream_seq, update_msg);
                                     events_in_block += 1;
                                     exex.events_processed += 1;
                                     debug!(pool = %pool_addr, "Decoded Fluid reserves from storage");

@@ -7,6 +7,7 @@ pub mod events;
 pub mod fluid_decoder;
 pub mod nats_client;
 pub mod pool_tracker;
+pub mod shadow_apply;
 pub mod shadow_arena;
 pub mod socket;
 pub mod swap_monitor;

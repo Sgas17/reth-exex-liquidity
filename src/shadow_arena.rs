@@ -16,6 +16,7 @@
 //! a rich whitelist plus anchor-pinned storage reads. Live per-block apply lands
 //! in 3c; reorg writes in 3d.
 
+use crate::types::PoolUpdateMessage;
 use arena_layout::{
     AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
     CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
@@ -285,6 +286,25 @@ impl ShadowArena {
             .v2
     }
 
+    /// Apply one committed-block pool update (ITE-16 step 3c).
+    ///
+    /// Replay-guarded by the frozen hydration anchor: events at or below
+    /// `scraped_at_block` are already reflected in the hydrated state, so they
+    /// are skipped (`Ok(false)`). Because the ExEx hydrates every pool at one
+    /// anchor, a single global guard suffices (unlike arena_service's per-pool
+    /// guard). Applying delegates to [`shadow_apply::apply_live_event`], which
+    /// mirrors arena_service's writer calls exactly.
+    pub fn apply_live_event(
+        &mut self,
+        event: &PoolUpdateMessage,
+    ) -> std::result::Result<bool, crate::shadow_apply::ApplyError> {
+        if event.block_number <= self.scraped_at_block {
+            return Ok(false);
+        }
+        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        crate::shadow_apply::apply_live_event(&mut writer, event)
+    }
+
     /// Block boundary end. 3a: signal an empty block so a reader can confirm the
     /// shadow arena advances per block. Live per-block apply lands in 3c.
     pub fn end_block(&mut self, block_number: u64) {
@@ -300,7 +320,8 @@ impl ShadowArena {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::U256;
+    use crate::types::{PoolIdentifier, PoolUpdate, Protocol, UpdateType};
+    use alloy_primitives::{Address, I256, U256};
     use arena_layout::ekubo::EkuboLowPoolData;
     use arena_layout::{
         AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, SharedArenaRegion, UniswapV3LowPoolData,
@@ -570,6 +591,129 @@ mod tests {
         assert_eq!(got_v3.tick(), 10);
         assert!(writer.get_v4_pool(&v4_id).is_some());
         assert!(writer.contains_pool_v4(&ekubo_id));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn v2_swap_event(pool: [u8; 20], block: u64, a0: i64, a1: i64) -> PoolUpdateMessage {
+        PoolUpdateMessage {
+            pool_id: PoolIdentifier::Address(Address::from(pool)),
+            protocol: Protocol::UniswapV2,
+            update_type: UpdateType::Swap,
+            block_number: block,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: false,
+            update: PoolUpdate::V2Swap {
+                amount0: I256::try_from(a0).expect("a0"),
+                amount1: I256::try_from(a1).expect("a1"),
+            },
+        }
+    }
+
+    /// 3c: a V2 swap above the anchor folds reserve deltas; the replay guard
+    /// skips an event at the anchor block (already reflected in hydrated state).
+    #[test]
+    fn live_v2_swap_folds_reserve_deltas_after_anchor() {
+        let path = temp_arena_path("live_v2_swap");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: addr(0xC2),
+                token0: addr(0x11),
+                token1: addr(0x22),
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        // Replay guard: event at the anchor block is skipped.
+        let at_anchor = v2_swap_event(addr(0xC2), 100, 500, -300);
+        assert!(!shadow
+            .apply_live_event(&at_anchor)
+            .expect("apply at anchor"));
+
+        // Above the anchor: deltas fold into reserves (+500 / -300).
+        let after = v2_swap_event(addr(0xC2), 101, 500, -300);
+        assert!(shadow.apply_live_event(&after).expect("apply after anchor"));
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let pool = writer.get_v2_pool(&addr(0xC2)).expect("v2 pool");
+        assert_eq!(pool.reserve0, 1_500);
+        assert_eq!(pool.reserve1, 1_700);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3c: an event for a pool not in the shadow topology (e.g. live-added but
+    /// not yet hydrated) is skipped, not an error.
+    #[test]
+    fn live_event_for_unhydrated_pool_is_skipped() {
+        let path = temp_arena_path("live_v2_missing");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(100, &[]);
+        let ev = v2_swap_event(addr(0xDD), 101, 1, -1);
+        assert!(!shadow.apply_live_event(&ev).expect("apply"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3c: a V3 swap above the anchor overwrites slot0 with absolute post-state.
+    #[test]
+    fn live_v3_swap_overwrites_slot0_after_anchor() {
+        let path = temp_arena_path("live_v3_swap");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let mut v3 = UniswapV3LowPoolData::default();
+        v3.common.pool_id = addr(0xA3);
+        v3.common.is_active.store(true, Ordering::Release);
+        v3.sqrt_price_x96 = U256::from(1_000u64);
+        v3.tick = 10;
+        v3.liquidity = 100_000;
+        v3.fee = 500;
+        v3.tick_spacing = 10;
+        v3.token0_decimals = 6;
+        v3.token1_decimals = 18;
+
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: addr(0xA3),
+                pool: AnyUniswapV3Pool::Low(v3),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let ev = PoolUpdateMessage {
+            pool_id: PoolIdentifier::Address(Address::from(addr(0xA3))),
+            protocol: Protocol::UniswapV3,
+            update_type: UpdateType::Swap,
+            block_number: 101,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: false,
+            update: PoolUpdate::V3Swap {
+                sqrt_price_x96: U256::from(2_222u64),
+                liquidity: 250_000,
+                tick: 42,
+            },
+        };
+        assert!(shadow.apply_live_event(&ev).expect("apply v3 swap"));
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_v3_pool(&addr(0xA3)).expect("v3 pool");
+        assert_eq!(got.sqrt_price_x96(), U256::from(2_222u64));
+        assert_eq!(got.tick(), 42);
 
         let _ = std::fs::remove_file(&path);
     }
