@@ -19,9 +19,14 @@ alloy-consensus = { version = "2.0.4", default-features = false }
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-primitives = { version = "1.6", default-features = false }
 
-# Pool-arena shared-memory layout (the reader contract). Self-contained crate
-# shared with the defi_arb_rust readers — its only shared dep is alloy-primitives.
-# Path dep during development; pin to a git rev for shipping.
+# Pool-arena shared crates: arena_layout (mmap layout / reader contract) and
+# arena_writer (slot allocation + typed write API). Both are owned by
+# defi_arb_rust and shared with its readers.
+#
+# NOTE: these are WORKTREE-RELATIVE development path deps. They only resolve when
+# this ExEx worktree sits beside the paired defi_arb_rust/ITE-16 worktree at the
+# layout above; this branch must be built/tested in that paired layout. Before
+# CI/deploy/MR, pin both crates to a git rev instead.
 arena_layout = { path = "../../defi_arb_rust/ITE-16/libs/arena_layout" }
 arena_writer = { path = "../../defi_arb_rust/ITE-16/libs/arena_writer" }
 
