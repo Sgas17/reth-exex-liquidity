@@ -18,16 +18,32 @@
 //! 3c; reorg writes in 3d.
 
 use arena_layout::SIGNAL_REASON_LIVE_BLOCK_EMPTY;
-use arena_writer::ArenaMmap;
+use arena_writer::{ArenaMmap, SharedArenaWriter};
 use std::path::{Path, PathBuf};
 
 /// Env var naming the shadow arena mmap path. When unset, the shadow writer is
 /// disabled.
 pub const SHADOW_ARENA_PATH_ENV: &str = "SHADOW_ARENA_PATH";
 
+/// Scraped V2 pool state for shadow-arena hydration. Token addresses + decimals
+/// come from the rich whitelist; reserves are scraped from chain state at the
+/// frozen anchor block.
+pub struct V2Hydration {
+    pub address: [u8; 20],
+    pub token0: [u8; 20],
+    pub token1: [u8; 20],
+    pub reserve0: u128,
+    pub reserve1: u128,
+    pub token0_decimals: u8,
+    pub token1_decimals: u8,
+}
+
 /// In-process writer for the (shadow) pool arena.
 pub struct ShadowArena {
     arena: ArenaMmap,
+    /// Frozen anchor block all slots were hydrated at. Live apply (3c) skips
+    /// updates with `block <= scraped_at_block` (the replay guard).
+    scraped_at_block: u64,
 }
 
 impl ShadowArena {
@@ -49,9 +65,44 @@ impl ShadowArena {
         arena.init();
         tracing::info!(
             path = %path.display(),
-            "Shadow arena opened (ITE-16 3a: block-signal plumbing; topology + apply pending)"
+            "Shadow arena opened (ITE-16: block-signal plumbing + V2 hydration)"
         );
-        Ok(Self { arena })
+        Ok(Self {
+            arena,
+            scraped_at_block: 0,
+        })
+    }
+
+    /// Hydrate V2 pool slots from scraped reserves + whitelist metadata, frozen
+    /// at `anchor_block`. Creates a slot per pool and bumps `slot_version` once
+    /// so readers rebuild their lookup. Returns the number of slots created.
+    pub fn hydrate_v2(&mut self, anchor_block: u64, pools: &[V2Hydration]) -> usize {
+        self.scraped_at_block = anchor_block;
+        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        let mut created = 0;
+        for p in pools {
+            match writer.add_v2_pool(
+                p.address,
+                p.reserve0,
+                p.reserve1,
+                p.token0,
+                p.token1,
+                p.token0_decimals,
+                p.token1_decimals,
+            ) {
+                Ok(()) => created += 1,
+                Err(e) => {
+                    tracing::warn!(address = ?p.address, "shadow V2 hydration failed: {e}");
+                }
+            }
+        }
+        writer.signal_topology_change();
+        tracing::info!(
+            created,
+            anchor_block,
+            "Shadow arena V2 hydration complete"
+        );
+        created
     }
 
     /// Block boundary end. 3a: signal an empty block so a reader can confirm the
@@ -131,6 +182,37 @@ mod tests {
             "end_block must bump the update sequence"
         );
         assert_eq!(shadow.arena.region().header.get_block_number(), 100);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3b-1: hydrate_v2 creates a slot per pool (readable back) and records the
+    /// frozen anchor block.
+    #[test]
+    fn hydrate_v2_creates_readable_slots() {
+        let path = temp_arena_path("shadow_hydrate");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let pools = vec![V2Hydration {
+            address: [0xAB; 20],
+            token0: [0x11; 20],
+            token1: [0x22; 20],
+            reserve0: 1_000,
+            reserve1: 2_000,
+            token0_decimals: 6,
+            token1_decimals: 18,
+        }];
+        let created = shadow.hydrate_v2(12_345, &pools);
+        assert_eq!(created, 1);
+        assert_eq!(shadow.scraped_at_block, 12_345);
+
+        // Re-open a writer to read the slot back (rebuilds lookup from assignments).
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_v2_pool(&[0xAB; 20]).expect("slot exists");
+        assert_eq!(got.reserve0, 1_000);
+        assert_eq!(got.reserve1, 2_000);
+        assert_eq!(got.token0_decimals, 6);
+        assert_eq!(got.token1_decimals, 18);
 
         let _ = std::fs::remove_file(&path);
     }

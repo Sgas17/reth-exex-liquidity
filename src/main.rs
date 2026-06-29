@@ -38,7 +38,7 @@ use reth::providers::StateProviderFactory;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
-use shadow_arena::ShadowArena;
+use shadow_arena::{ShadowArena, V2Hydration};
 use socket::PoolUpdateSocketServer;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -46,8 +46,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use types::{
-    ControlMessage, FluidState, PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol,
-    ReorgEpilogueUpdate, ReorgRange, Slot0State, UpdateType,
+    ControlMessage, FluidState, PoolIdentifier, PoolMetadata, PoolUpdate, PoolUpdateMessage,
+    Protocol, ReorgEpilogueUpdate, ReorgRange, Slot0State, UpdateType,
 };
 
 /// Main ExEx state
@@ -971,6 +971,65 @@ fn read_storage_slot<P: StateProviderFactory>(provider: &P, address: Address, sl
     }
 }
 
+/// Read a UniswapV2Pair's `(reserve0, reserve1)` from storage slot 8 of a held
+/// state snapshot. Slot 8 packs `reserve0 (112) | reserve1 (112) | ts (32)`.
+fn read_v2_reserves(state: &dyn reth_provider::StateProvider, address: Address) -> (u128, u128) {
+    use alloy_primitives::B256;
+    let slot8: B256 = B256::from(U256::from(8u64));
+    let packed: U256 = match state.storage(address, slot8) {
+        Ok(Some(v)) => v,
+        _ => U256::ZERO,
+    };
+    let mask112: U256 = (U256::from(1u64) << 112usize) - U256::from(1u64);
+    let reserve0 = (packed & mask112).to::<u128>();
+    let reserve1 = ((packed >> 112usize) & mask112).to::<u128>();
+    (reserve0, reserve1)
+}
+
+/// 3b-1: hydrate the shadow arena's V2 slots from the rich startup snapshot,
+/// frozen at the current tip (decimals come from the whitelist, reserves from
+/// chain state). V2 only for now; other protocols follow in 3b-2+. No-op when
+/// the shadow writer is disabled.
+fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
+    ctx: &ExExContext<Node>,
+    pools: &[PoolMetadata],
+    shadow: Option<&mut ShadowArena>,
+) {
+    use reth_provider::BlockNumReader;
+    let Some(shadow) = shadow else {
+        return;
+    };
+    let state = match ctx.provider().latest() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "shadow hydration: no state provider");
+            return;
+        }
+    };
+    let anchor = ctx.provider().best_block_number().unwrap_or(0);
+
+    let v2: Vec<V2Hydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::UniswapV2)
+        .filter_map(|p| {
+            let addr = p.pool_id.as_address()?;
+            let (reserve0, reserve1) = read_v2_reserves(state.as_ref(), addr);
+            Some(V2Hydration {
+                address: addr.into_array(),
+                token0: p.token0.into_array(),
+                token1: p.token1.into_array(),
+                reserve0,
+                reserve1,
+                token0_decimals: p.token0_decimals?,
+                token1_decimals: p.token1_decimals?,
+            })
+        })
+        .collect();
+
+    let created = shadow.hydrate_v2(anchor, &v2);
+    info!(created, anchor, "shadow arena: hydrated V2 slots");
+}
+
 fn read_twocrypto_full_state<P: StateProviderFactory>(
     provider: &P,
     address: Address,
@@ -1326,6 +1385,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
+
+                // 3b-1: hydrate the shadow arena's V2 slots from this snapshot.
+                hydrate_shadow_from_snapshot(&ctx, &pools, exex.shadow.as_mut());
 
                 let update = crate::pool_tracker::WhitelistUpdate::Replace(pools);
 
