@@ -16,7 +16,7 @@
 //! a rich whitelist plus anchor-pinned storage reads. Live per-block apply lands
 //! in 3c; reorg writes in 3d.
 
-use crate::types::PoolUpdateMessage;
+use crate::types::{PoolUpdateMessage, ReorgEpilogueUpdate};
 use arena_layout::{
     AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
     CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_APPLY, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
@@ -316,6 +316,24 @@ impl ShadowArena {
         Ok(applied)
     }
 
+    /// Apply a reorg-epilogue update (ITE-16 step 3d): the definitive post-reorg
+    /// slot0/fluid state read from chain at the settled tip. Authoritative
+    /// absolute write — not replay-guarded — and counted toward the next block
+    /// signal so the epilogue resync is observable.
+    pub fn apply_reorg_epilogue(
+        &mut self,
+        update: &ReorgEpilogueUpdate,
+    ) -> std::result::Result<bool, crate::shadow_apply::ApplyError> {
+        let applied = {
+            let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+            crate::shadow_apply::apply_reorg_epilogue(&mut writer, update)?
+        };
+        if applied {
+            self.applied_this_block += 1;
+        }
+        Ok(applied)
+    }
+
     /// Block boundary end (3a plumbing, 3c apply count). Signals the header so a
     /// reader sees the shadow arena advance: LIVE_BLOCK_APPLY with the applied
     /// count for non-empty blocks, LIVE_BLOCK_EMPTY otherwise — matching
@@ -338,7 +356,9 @@ impl ShadowArena {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PoolIdentifier, PoolUpdate, Protocol, UpdateType};
+    use crate::types::{
+        PoolIdentifier, PoolUpdate, Protocol, ReorgEpilogueUpdate, Slot0State, UpdateType,
+    };
     use alloy_primitives::{Address, I256, U256};
     use arena_layout::ekubo::EkuboLowPoolData;
     use arena_layout::{
@@ -892,6 +912,103 @@ mod tests {
             assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_EMPTY);
             assert_eq!(h.get_pools_updated_count(), 0);
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3d: a reverted V2 swap (`is_revert = true`) un-applies the delta, returning
+    /// reserves to their pre-swap value.
+    #[test]
+    fn live_v2_swap_revert_unapplies_delta() {
+        let path = temp_arena_path("revert_v2");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: addr(0xC2),
+                token0: addr(0x11),
+                token1: addr(0x22),
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        // Forward swap at block 101: +500 / -300 → 1500 / 1700.
+        assert!(shadow
+            .apply_live_event(&v2_swap_event(addr(0xC2), 101, 500, -300))
+            .expect("forward"));
+
+        // Reorg reverts block 101 at block 102: applies the inverse → 1000 / 2000.
+        let mut revert = v2_swap_event(addr(0xC2), 102, 500, -300);
+        revert.is_revert = true;
+        assert!(shadow.apply_live_event(&revert).expect("revert"));
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let pool = writer.get_v2_pool(&addr(0xC2)).expect("v2 pool");
+        assert_eq!(pool.reserve0, 1_000);
+        assert_eq!(pool.reserve1, 2_000);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3d: a reorg-epilogue `Slot0Final` overwrites a V3 pool's slot0 with the
+    /// definitive post-reorg state (the mechanism that refreshes pools swapped in
+    /// the reverted chain but not the new one).
+    #[test]
+    fn reorg_epilogue_slot0_final_overwrites_v3() {
+        let path = temp_arena_path("epilogue_v3");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let mut v3 = UniswapV3LowPoolData::default();
+        v3.common.pool_id = addr(0xA3);
+        v3.common.is_active.store(true, Ordering::Release);
+        v3.sqrt_price_x96 = U256::from(1_000u64);
+        v3.tick = 10;
+        v3.liquidity = 100_000;
+        v3.fee = 500;
+        v3.tick_spacing = 10;
+        v3.token0_decimals = 6;
+        v3.token1_decimals = 18;
+
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: addr(0xA3),
+                pool: AnyUniswapV3Pool::Low(v3),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let epilogue = ReorgEpilogueUpdate::Slot0Final {
+            pool_id: PoolIdentifier::Address(Address::from(addr(0xA3))),
+            protocol: Protocol::UniswapV3,
+            state: Slot0State {
+                sqrt_price_x96: U256::from(7_777u64),
+                liquidity: 123_456,
+                tick: -5,
+            },
+        };
+        assert!(shadow.apply_reorg_epilogue(&epilogue).expect("epilogue"));
+
+        // Epilogue write counts toward the block signal.
+        shadow.end_block(120);
+        assert_eq!(
+            shadow.arena.region().header.get_signal_reason(),
+            SIGNAL_REASON_LIVE_BLOCK_APPLY
+        );
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_v3_pool(&addr(0xA3)).expect("v3 pool");
+        assert_eq!(got.sqrt_price_x96(), U256::from(7_777u64));
+        assert_eq!(got.tick(), -5);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -11,7 +11,9 @@
 //! — this module is driven only from the committed path, where `is_revert` is
 //! always `false`, but the revert handling is ported faithfully for reuse.
 
-use crate::types::{PoolIdentifier, PoolUpdate, PoolUpdateMessage, UpdateType};
+use crate::types::{
+    PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, ReorgEpilogueUpdate, UpdateType,
+};
 use alloy_primitives::{I256, U256};
 use arena_writer::{SharedArenaWriter, WriterError};
 
@@ -529,5 +531,68 @@ pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessag
         }
     }
 
+    Ok(true)
+}
+
+/// Apply a reorg-epilogue update (ITE-16 step 3d) to the shadow arena, mirroring
+/// arena_service's `apply_reorg_epilogue_updates`. The epilogue carries the
+/// definitive post-reorg state read from chain at the settled tip, so it is an
+/// authoritative absolute write (no replay guard). Returns `Ok(false)` for an
+/// update whose pool-id kind does not match its protocol's slot.
+pub fn apply_reorg_epilogue(
+    writer: &mut SharedArenaWriter,
+    update: &ReorgEpilogueUpdate,
+) -> Result<bool> {
+    match update {
+        ReorgEpilogueUpdate::Slot0Final {
+            pool_id,
+            protocol,
+            state,
+        } => match pool_id {
+            PoolIdentifier::Address(addr) => {
+                writer.update_v3_slot0(
+                    addr.into_array(),
+                    state.sqrt_price_x96,
+                    state.tick,
+                    state.liquidity,
+                )?;
+            }
+            PoolIdentifier::PoolId(id) => {
+                if *protocol == Protocol::Ekubo {
+                    writer.update_ekubo_slot0(
+                        *id,
+                        state.sqrt_price_x96,
+                        state.tick,
+                        state.liquidity,
+                    )?;
+                } else {
+                    writer.update_v4_slot0(
+                        *id,
+                        state.sqrt_price_x96,
+                        state.tick,
+                        state.liquidity,
+                    )?;
+                }
+            }
+        },
+        ReorgEpilogueUpdate::FluidStateFinal { pool_id, state } => {
+            let PoolIdentifier::Address(addr) = pool_id else {
+                return Ok(false);
+            };
+            writer.update_fluid_reserves(
+                addr.into_array(),
+                state.col_token0_real,
+                state.col_token1_real,
+                state.col_token0_imaginary,
+                state.col_token1_imaginary,
+                state.debt_token0_real,
+                state.debt_token1_real,
+                state.debt_token0_imaginary,
+                state.debt_token1_imaginary,
+                state.center_price,
+                state.fee,
+            )?;
+        }
+    }
     Ok(true)
 }

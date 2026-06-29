@@ -110,6 +110,18 @@ fn apply_to_shadow(shadow: &mut Option<ShadowArena>, event: &PoolUpdateMessage) 
     }
 }
 
+/// Apply a reorg-epilogue update (definitive post-reorg slot0/fluid state) into
+/// the shadow arena (ITE-16 step 3d), if enabled. Disjoint `shadow`-field borrow
+/// so it can run between immutable `exex` send calls; failures are logged only.
+fn apply_epilogue_to_shadow(shadow: &mut Option<ShadowArena>, update: &ReorgEpilogueUpdate) {
+    let Some(shadow) = shadow.as_mut() else {
+        return;
+    };
+    if let Err(e) = shadow.apply_reorg_epilogue(update) {
+        warn!("shadow arena reorg-epilogue apply failed: {e}");
+    }
+}
+
 fn v2_swap_deltas(
     amount0_in: U256,
     amount1_in: U256,
@@ -2241,7 +2253,7 @@ fn build_ekubo_pool(
 fn send_slot0_finals(
     state: &dyn StateProvider,
     affected_pools: &HashSet<(PoolIdentifier, Protocol)>,
-    exex: &LiquidityExEx,
+    exex: &mut LiquidityExEx,
     stream_seq: &mut u64,
     block_number: u64,
     block_timestamp: u64,
@@ -2271,20 +2283,17 @@ fn send_slot0_finals(
             continue;
         };
 
-        exex.send_reorg_epilogue(
-            stream_seq,
-            block_number,
-            block_timestamp,
-            ReorgEpilogueUpdate::Slot0Final {
-                pool_id: pool_id.clone(),
-                protocol: *protocol,
-                state: Slot0State {
-                    sqrt_price_x96,
-                    liquidity,
-                    tick,
-                },
+        let update = ReorgEpilogueUpdate::Slot0Final {
+            pool_id: pool_id.clone(),
+            protocol: *protocol,
+            state: Slot0State {
+                sqrt_price_x96,
+                liquidity,
+                tick,
             },
-        );
+        };
+        apply_epilogue_to_shadow(&mut exex.shadow, &update);
+        exex.send_reorg_epilogue(stream_seq, block_number, block_timestamp, update);
         overrides_sent += 1;
     }
 
@@ -2813,6 +2822,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
+                                apply_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -2824,6 +2834,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
+                    exex.shadow_end_block(block_number);
 
                     // 🔓 End block - apply pending updates
                     {
@@ -2906,6 +2917,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 state.as_ref(),
                                 &pool_tracker,
                             ) {
+                                apply_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -2919,15 +2931,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(state.as_ref(), config, block_timestamp) {
                                 Some(reserves) => {
-                                    exex.send_pool_update(
-                                        &mut stream_seq,
-                                        fluid_update_msg(
-                                            *pool_addr,
-                                            &reserves,
-                                            block_number,
-                                            block_timestamp,
-                                        ),
+                                    let update_msg = fluid_update_msg(
+                                        *pool_addr,
+                                        &reserves,
+                                        block_number,
+                                        block_timestamp,
                                     );
+                                    apply_to_shadow(&mut exex.shadow, &update_msg);
+                                    exex.send_pool_update(&mut stream_seq, update_msg);
                                     events_in_block += 1;
                                     exex.events_processed += 1;
                                 }
@@ -2944,6 +2955,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
+                    exex.shadow_end_block(block_number);
 
                     // 🔓 End block - apply pending updates
                     {
@@ -2977,14 +2989,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(final_state.as_ref(), config, tip_timestamp) {
                                 Some(reserves) => {
+                                    let update = ReorgEpilogueUpdate::FluidStateFinal {
+                                        pool_id: PoolIdentifier::Address(*pool_addr),
+                                        state: fluid_state_from_reserves(&reserves),
+                                    };
+                                    apply_epilogue_to_shadow(&mut exex.shadow, &update);
                                     exex.send_reorg_epilogue(
                                         &mut stream_seq,
                                         final_tip_block,
                                         tip_timestamp,
-                                        ReorgEpilogueUpdate::FluidStateFinal {
-                                            pool_id: PoolIdentifier::Address(*pool_addr),
-                                            state: fluid_state_from_reserves(&reserves),
-                                        },
+                                        update,
                                     );
                                     debug!(pool = %pool_addr, "Decoded Fluid reserves post-reorg epilogue (not in new chain)");
                                 }
@@ -3001,7 +3015,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 send_slot0_finals(
                     final_state.as_ref(),
                     &affected_slot0_pools,
-                    &exex,
+                    &mut exex,
                     &mut stream_seq,
                     final_tip_block,
                     new.blocks()
@@ -3010,6 +3024,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         .map(|b| b.timestamp())
                         .unwrap_or(0),
                 );
+                // Flush the reorg epilogue writes (slot0/fluid finals) into a
+                // shadow block signal at the settled tip.
+                exex.shadow_end_block(final_tip_block);
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
                 info!("✅ Reorg handled successfully");
@@ -3107,6 +3124,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
+                                apply_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -3117,6 +3135,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
+                    exex.shadow_end_block(block_number);
 
                     // 🔓 End block - apply pending updates
                     {
@@ -3146,14 +3165,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
                             match decode_fluid_pool(final_state.as_ref(), config, tip_timestamp) {
                                 Some(reserves) => {
+                                    let update = ReorgEpilogueUpdate::FluidStateFinal {
+                                        pool_id: PoolIdentifier::Address(*pool_addr),
+                                        state: fluid_state_from_reserves(&reserves),
+                                    };
+                                    apply_epilogue_to_shadow(&mut exex.shadow, &update);
                                     exex.send_reorg_epilogue(
                                         &mut stream_seq,
                                         final_tip_block,
                                         tip_timestamp,
-                                        ReorgEpilogueUpdate::FluidStateFinal {
-                                            pool_id: PoolIdentifier::Address(*pool_addr),
-                                            state: fluid_state_from_reserves(&reserves),
-                                        },
+                                        update,
                                     );
                                     debug!(pool = %pool_addr, "Decoded Fluid reserves post-revert epilogue");
                                 }
@@ -3170,11 +3191,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 send_slot0_finals(
                     final_state.as_ref(),
                     &affected_slot0_pools,
-                    &exex,
+                    &mut exex,
                     &mut stream_seq,
                     final_tip_block,
                     0, // No new blocks in ChainReverted
                 );
+                // Flush the reorg epilogue writes (slot0/fluid finals) into a
+                // shadow block signal at the settled tip.
+                exex.shadow_end_block(final_tip_block);
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
                 info!("✅ Revert handled successfully");
