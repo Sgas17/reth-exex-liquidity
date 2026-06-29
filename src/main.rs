@@ -999,14 +999,23 @@ fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
     let Some(shadow) = shadow else {
         return;
     };
-    let state = match ctx.provider().latest() {
-        Ok(s) => s,
+    // Pin the anchor block first, then read state pinned to that exact block, so
+    // reserves and the recorded `scraped_at_block` come from one snapshot — the
+    // frozen-anchor invariant the 3c replay guard relies on.
+    let anchor = match ctx.provider().best_block_number() {
+        Ok(n) => n,
         Err(e) => {
-            warn!(error = %e, "shadow hydration: no state provider");
+            warn!(error = %e, "shadow hydration: no best block number");
             return;
         }
     };
-    let anchor = ctx.provider().best_block_number().unwrap_or(0);
+    let state = match ctx.provider().history_by_block_number(anchor) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, anchor, "shadow hydration: no state at anchor block");
+            return;
+        }
+    };
 
     let v2: Vec<V2Hydration> = pools
         .iter()
@@ -1339,11 +1348,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
     let subscriber = loop {
         match nats_client.subscribe_whitelist(&chain).await {
             Ok(subscriber) => {
-                info!("✅ Subscribed to minimal whitelist deltas for {}", chain);
+                info!(
+                    "✅ Subscribed to canonical whitelist updates (.full/.add/.remove) for {}",
+                    chain
+                );
                 break subscriber;
             }
             Err(e) => {
-                warn!(error = %e, "Failed to subscribe to minimal whitelist deltas, retrying in 2s");
+                warn!(error = %e, "Failed to subscribe to canonical whitelist updates, retrying in 2s");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -1431,7 +1443,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 // dispatch on the suffix. The legacy `.minimal` (also matched by the
                 // wildcard subscription) returns None and is ignored.
                 let suffix = message.subject.rsplit('.').next().unwrap_or("");
-                match nats_client.canonical_update(suffix, &message.payload) {
+                match WhitelistNatsClient::canonical_update(suffix, &message.payload) {
                     Ok(Some(update)) => {
                         // Extract Fluid pool addresses before queueing
                         let fluid_addrs = extract_fluid_addresses(&update);

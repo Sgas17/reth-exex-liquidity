@@ -97,11 +97,7 @@ impl ShadowArena {
             }
         }
         writer.signal_topology_change();
-        tracing::info!(
-            created,
-            anchor_block,
-            "Shadow arena V2 hydration complete"
-        );
+        tracing::info!(created, anchor_block, "Shadow arena V2 hydration complete");
         created
     }
 

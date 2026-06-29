@@ -216,7 +216,6 @@ impl WhitelistNatsClient {
     /// (token addresses + decimals + protocol fields). Returns `Ok(None)` for
     /// ignored subjects (e.g. the legacy `.minimal`).
     pub fn canonical_update(
-        &self,
         subject_suffix: &str,
         payload: &[u8],
     ) -> Result<Option<crate::pool_tracker::WhitelistUpdate>> {
@@ -230,7 +229,6 @@ impl WhitelistNatsClient {
         };
         Ok(Some(update))
     }
-
 }
 
 #[cfg(test)]
@@ -265,5 +263,102 @@ mod tests {
         assert_eq!(p.token0_decimals, Some(6));
         assert_eq!(p.token1_decimals, Some(18));
         assert_eq!(p.fee, Some(3000));
+    }
+
+    const FULL_V2: &[u8] = br#"{"snapshot_id":1,"chain":"ethereum","pools":[{"address":"0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc","protocol":"v2","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18}}]}"#;
+
+    #[test]
+    fn canonical_update_dispatches_by_subject() {
+        use crate::pool_tracker::WhitelistUpdate;
+        match WhitelistNatsClient::canonical_update("full", FULL_V2)
+            .unwrap()
+            .unwrap()
+        {
+            WhitelistUpdate::Replace(p) => assert_eq!(p.len(), 1),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+        match WhitelistNatsClient::canonical_update("add", FULL_V2)
+            .unwrap()
+            .unwrap()
+        {
+            WhitelistUpdate::Add(p) => assert_eq!(p.len(), 1),
+            other => panic!("expected Add, got {other:?}"),
+        }
+        // Legacy/unknown subjects are ignored.
+        assert!(WhitelistNatsClient::canonical_update("minimal", FULL_V2)
+            .unwrap()
+            .is_none());
+        assert!(WhitelistNatsClient::canonical_update("other", FULL_V2)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_remove_parses_pool_id_and_address() {
+        use crate::pool_tracker::WhitelistUpdate;
+        // A 32-byte (V4-style) pool id and a 20-byte (V2-style) address.
+        let remove = br#"{"snapshot_id":1,"chain":"ethereum","pool_addresses":["0x0000000000000000000000000000000000000000000000000000000000000002","0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"]}"#;
+        match WhitelistNatsClient::canonical_update("remove", remove)
+            .unwrap()
+            .unwrap()
+        {
+            WhitelistUpdate::Remove(ids) => {
+                assert_eq!(ids.len(), 2);
+                assert!(
+                    matches!(ids[0], PoolIdentifier::PoolId(_)),
+                    "32-byte -> PoolId"
+                );
+                assert!(
+                    matches!(ids[1], PoolIdentifier::Address(_)),
+                    "20-byte -> Address"
+                );
+            }
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    /// End-to-end (round 04 regression): two V4 pools sharing one PoolManager
+    /// address are both tracked by `pool_id`, and a canonical remove by `pool_id`
+    /// drops exactly one of them.
+    #[test]
+    fn canonical_add_then_remove_v4_by_pool_id_updates_tracker() {
+        use crate::pool_tracker::{PoolTracker, WhitelistUpdate};
+        let add = br#"{"snapshot_id":1,"chain":"ethereum","pools":[
+            {"address":"0x000000000000000000000000000000000000beef","protocol":"v4","pool_id":"0x0000000000000000000000000000000000000000000000000000000000000001","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18}},
+            {"address":"0x000000000000000000000000000000000000beef","protocol":"v4","pool_id":"0x0000000000000000000000000000000000000000000000000000000000000002","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18}}]}"#;
+        let remove = br#"{"snapshot_id":2,"chain":"ethereum","pool_addresses":["0x0000000000000000000000000000000000000000000000000000000000000002"]}"#;
+
+        let mut id1 = [0u8; 32];
+        id1[31] = 1;
+        let mut id2 = [0u8; 32];
+        id2[31] = 2;
+
+        let mut tracker = PoolTracker::new();
+
+        let Some(WhitelistUpdate::Add(pools)) =
+            WhitelistNatsClient::canonical_update("add", add).unwrap()
+        else {
+            panic!("expected Add");
+        };
+        assert_eq!(
+            pools.len(),
+            2,
+            "both V4 pools must parse despite shared address"
+        );
+        tracker.queue_update(WhitelistUpdate::Add(pools));
+        assert!(tracker.get_by_pool_id(&id1).is_some());
+        assert!(tracker.get_by_pool_id(&id2).is_some());
+
+        let Some(WhitelistUpdate::Remove(ids)) =
+            WhitelistNatsClient::canonical_update("remove", remove).unwrap()
+        else {
+            panic!("expected Remove");
+        };
+        tracker.queue_update(WhitelistUpdate::Remove(ids));
+        assert!(tracker.get_by_pool_id(&id1).is_some(), "id1 must remain");
+        assert!(
+            tracker.get_by_pool_id(&id2).is_none(),
+            "id2 removed by pool_id"
+        );
     }
 }
