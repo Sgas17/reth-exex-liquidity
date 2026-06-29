@@ -78,6 +78,38 @@ struct LiquidityExEx {
     blocks_processed: u64,
 }
 
+/// Apply a committed-block pool update into the shadow arena (ITE-16 step 3c),
+/// if enabled. Mirrors arena_service's apply so the two writers stay in lockstep
+/// for the pre-cutover diff. `PoolNotFound` means the pool is not in the shadow
+/// topology yet (live-added pools are not hydrated into the shadow — tracked as a
+/// follow-up) and is downgraded to a debug skip; the shadow is a validation
+/// harness and must never crash the ExEx.
+///
+/// Takes the `shadow` field directly (not `&mut self`) so callers can apply while
+/// holding the `pool_tracker` read guard — a disjoint field borrow.
+fn apply_to_shadow(shadow: &mut Option<ShadowArena>, event: &PoolUpdateMessage) {
+    let Some(shadow) = shadow.as_mut() else {
+        return;
+    };
+    match shadow.apply_live_event(event) {
+        Ok(_) => {}
+        Err(shadow_apply::ApplyError::Writer(arena_writer::WriterError::PoolNotFound(_))) => {
+            debug!(
+                pool = ?event.pool_id,
+                block = event.block_number,
+                "shadow apply: pool not in shadow topology, skipping"
+            );
+        }
+        Err(e) => {
+            warn!(
+                pool = ?event.pool_id,
+                block = event.block_number,
+                "shadow arena live apply failed: {e}"
+            );
+        }
+    }
+}
+
 fn v2_swap_deltas(
     amount0_in: U256,
     amount1_in: U256,
@@ -109,35 +141,6 @@ impl LiquidityExEx {
     fn shadow_end_block(&mut self, block_number: u64) {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.end_block(block_number);
-        }
-    }
-
-    /// Apply a committed-block pool update into the shadow arena (ITE-16 step
-    /// 3c), if enabled. Mirrors arena_service's apply so the two writers stay in
-    /// lockstep for the pre-cutover diff. `PoolNotFound` means the pool is not in
-    /// the shadow topology yet (live-added pools are not hydrated into the shadow
-    /// — tracked as a follow-up) and is downgraded to a debug skip; the shadow is
-    /// a validation harness and must never crash the ExEx.
-    fn shadow_apply(&mut self, event: &PoolUpdateMessage) {
-        let Some(shadow) = self.shadow.as_mut() else {
-            return;
-        };
-        match shadow.apply_live_event(event) {
-            Ok(_) => {}
-            Err(shadow_apply::ApplyError::Writer(arena_writer::WriterError::PoolNotFound(_))) => {
-                debug!(
-                    pool = ?event.pool_id,
-                    block = event.block_number,
-                    "shadow apply: pool not in shadow topology, skipping"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    pool = ?event.pool_id,
-                    block = event.block_number,
-                    "shadow arena live apply failed: {e}"
-                );
-            }
         }
     }
 
@@ -1621,7 +1624,10 @@ const MIN_TICK: i32 = -887_272;
 const MAX_TICK: i32 = 887_272;
 const EKUBO_MIN_TICK: i32 = -88_722_835;
 const EKUBO_MAX_TICK: i32 = 88_722_835;
-const EKUBO_BITMAP_OFFSET: u32 = 89_421_695;
+// `EKUBO_BITMAP_OFFSET` + `ekubo_tick_to_word_and_index` are the canonical Ekubo
+// bitmap encoding in `arena_layout::ekubo` (single source of truth, shared with
+// the live writer's incremental bitmap flip).
+use arena_layout::ekubo::{ekubo_tick_to_word_and_index, EKUBO_BITMAP_OFFSET};
 
 /// Decode V3/V4 packed slot0: sqrtPriceX96 (bits 0-159), tick (bits 160-183, signed int24).
 fn decode_slot0_packed(value: U256) -> (U256, i32) {
@@ -1834,16 +1840,6 @@ fn extract_ticks_from_bitmap_u256(
         }
     }
     ticks
-}
-
-fn ekubo_tick_to_word_and_index(tick: i32, tick_spacing: i32) -> (u32, u8) {
-    let quotient = if tick < 0 && tick % tick_spacing != 0 {
-        tick / tick_spacing - 1
-    } else {
-        tick / tick_spacing
-    };
-    let raw_index = (i64::from(quotient) + i64::from(EKUBO_BITMAP_OFFSET)) as u32;
-    (raw_index >> 8, (raw_index & 0xff) as u8)
 }
 
 fn ekubo_word_and_index_to_tick(word: u32, index: u8, tick_spacing: i32) -> i32 {
@@ -2634,7 +2630,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 state.as_ref(),
                                 &pool_tracker,
                             ) {
-                                exex.shadow_apply(&update_msg);
+                                apply_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -2656,7 +2652,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                         block_number,
                                         block_timestamp,
                                     );
-                                    exex.shadow_apply(&update_msg);
+                                    apply_to_shadow(&mut exex.shadow, &update_msg);
                                     exex.send_pool_update(&mut stream_seq, update_msg);
                                     events_in_block += 1;
                                     exex.events_processed += 1;

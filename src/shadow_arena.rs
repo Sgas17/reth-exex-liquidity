@@ -19,7 +19,7 @@
 use crate::types::PoolUpdateMessage;
 use arena_layout::{
     AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
-    CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
+    CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_APPLY, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
 };
 use arena_writer::{ArenaMmap, SharedArenaWriter};
 use std::path::{Path, PathBuf};
@@ -120,6 +120,10 @@ pub struct ShadowArena {
     /// Frozen anchor block all slots were hydrated at. Live apply (3c) skips
     /// updates with `block <= scraped_at_block` (the replay guard).
     scraped_at_block: u64,
+    /// Pool updates applied since the last `end_block`, used to signal
+    /// LIVE_BLOCK_APPLY (with the count) vs LIVE_BLOCK_EMPTY, matching
+    /// arena_service so block signals stay diff-comparable.
+    applied_this_block: u64,
 }
 
 impl ShadowArena {
@@ -146,6 +150,7 @@ impl ShadowArena {
         Ok(Self {
             arena,
             scraped_at_block: 0,
+            applied_this_block: 0,
         })
     }
 
@@ -301,19 +306,32 @@ impl ShadowArena {
         if event.block_number <= self.scraped_at_block {
             return Ok(false);
         }
-        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-        crate::shadow_apply::apply_live_event(&mut writer, event)
+        let applied = {
+            let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+            crate::shadow_apply::apply_live_event(&mut writer, event)?
+        };
+        if applied {
+            self.applied_this_block += 1;
+        }
+        Ok(applied)
     }
 
-    /// Block boundary end. 3a: signal an empty block so a reader can confirm the
-    /// shadow arena advances per block. Live per-block apply lands in 3c.
+    /// Block boundary end (3a plumbing, 3c apply count). Signals the header so a
+    /// reader sees the shadow arena advance: LIVE_BLOCK_APPLY with the applied
+    /// count for non-empty blocks, LIVE_BLOCK_EMPTY otherwise — matching
+    /// arena_service so the block signal stays diff-comparable. Resets the
+    /// per-block applied counter.
     pub fn end_block(&mut self, block_number: u64) {
-        self.arena.region().header.signal_update_complete(
-            block_number,
-            0,
-            SIGNAL_REASON_LIVE_BLOCK_EMPTY,
-            0,
-        );
+        let applied = std::mem::take(&mut self.applied_this_block);
+        let reason = if applied == 0 {
+            SIGNAL_REASON_LIVE_BLOCK_EMPTY
+        } else {
+            SIGNAL_REASON_LIVE_BLOCK_APPLY
+        };
+        self.arena
+            .region()
+            .header
+            .signal_update_complete(block_number, applied, reason, 0);
     }
 }
 
@@ -714,6 +732,166 @@ mod tests {
         let got = writer.get_v3_pool(&addr(0xA3)).expect("v3 pool");
         assert_eq!(got.sqrt_price_x96(), U256::from(2_222u64));
         assert_eq!(got.tick(), 42);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3c (round-07/08 fix): an Ekubo PositionUpdated (`EkuboLiquidity`, emitted
+    /// as Mint/Burn) must (a) overwrite slot0 with the authoritative post-state
+    /// and (b) fold the tick-range liquidity delta into the arena tick array +
+    /// bitmap (downstream Ekubo quote context reads both), and (c) signal a
+    /// non-empty live block. Regression for round-07 dropping the tick fields.
+    #[test]
+    fn live_ekubo_position_update_overwrites_slot0() {
+        let path = temp_arena_path("live_ekubo_pos");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let ekubo_id = [0xE0; 32];
+        let mut ekubo = EkuboLowPoolData::default();
+        ekubo.pool_id = ekubo_id;
+        ekubo.common.pool_id.copy_from_slice(&ekubo_id[..20]);
+        ekubo.common.is_active.store(true, Ordering::Release);
+        ekubo.sqrt_price_x96 = U256::from(3_000u64);
+        ekubo.tick = 30;
+        ekubo.liquidity = 300_000;
+        ekubo.fee = 42;
+        ekubo.tick_spacing = 10;
+        ekubo.type_config = 0x8000_000a;
+        ekubo.token0_decimals = 6;
+        ekubo.token1_decimals = 18;
+
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[],
+            &[],
+            &[EkuboHydration {
+                pool_id: ekubo_id,
+                pool: AnyEkuboPool::Low(ekubo),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let ev = PoolUpdateMessage {
+            pool_id: PoolIdentifier::PoolId(ekubo_id),
+            protocol: Protocol::Ekubo,
+            update_type: UpdateType::Mint,
+            block_number: 101,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: false,
+            update: PoolUpdate::EkuboLiquidity {
+                tick_lower: -10,
+                tick_upper: 10,
+                liquidity_delta: 5_000,
+                sqrt_ratio: U256::from(9_999u64),
+                liquidity: 350_000,
+                tick: 33,
+            },
+        };
+        assert!(shadow
+            .apply_live_event(&ev)
+            .expect("apply ekubo position update"));
+        // One applied event → non-empty block signal with count 1.
+        shadow.end_block(101);
+        assert_eq!(
+            shadow.arena.region().header.get_signal_reason(),
+            SIGNAL_REASON_LIVE_BLOCK_APPLY
+        );
+        assert_eq!(shadow.arena.region().header.get_pools_updated_count(), 1);
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_ekubo_pool(&ekubo_id).expect("ekubo pool");
+        // (a) authoritative slot0 post-state.
+        assert_eq!(got.sqrt_price_x96(), U256::from(9_999u64));
+        assert_eq!(got.tick(), 33);
+        assert_eq!(got.liquidity(), 350_000);
+
+        // (b) tick array + bitmap folded the delta.
+        let AnyEkuboPool::Low(p) = got else {
+            panic!("expected Low-tier Ekubo pool");
+        };
+        let n = p.tick_count as usize;
+        let lower = p.ticks[..n]
+            .iter()
+            .find(|(t, _, _)| *t == -10)
+            .expect("lower tick present");
+        assert_eq!(lower.1, 5_000, "lower gross");
+        assert_eq!(lower.2, 5_000, "lower net (+delta)");
+        let upper = p.ticks[..n]
+            .iter()
+            .find(|(t, _, _)| *t == 10)
+            .expect("upper tick present");
+        assert_eq!(upper.1, 5_000, "upper gross");
+        assert_eq!(upper.2, -5_000, "upper net (-delta)");
+
+        for tick in [-10i32, 10] {
+            let (word, idx) = arena_layout::ekubo::ekubo_tick_to_word_and_index(tick, 10);
+            let bm = p.tick_bitmap[..p.bitmap_count as usize]
+                .iter()
+                .find(|(w, _)| *w == word)
+                .unwrap_or_else(|| panic!("bitmap word present for tick {tick}"));
+            let val = U256::from_be_bytes(bm.1);
+            assert_eq!(
+                (val >> idx as usize) & U256::from(1),
+                U256::from(1),
+                "bitmap bit set for tick {tick}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3c (round-07 fix): a non-empty live block signals LIVE_BLOCK_APPLY with the
+    /// applied count, while an empty block signals LIVE_BLOCK_EMPTY — matching
+    /// arena_service so the header signal stays diff-comparable.
+    #[test]
+    fn live_apply_signals_block_apply_with_count() {
+        let path = temp_arena_path("live_signal");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: addr(0xC2),
+                token0: addr(0x11),
+                token1: addr(0x22),
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        // No applies this block → empty signal, count 0.
+        shadow.end_block(101);
+        {
+            let h = &shadow.arena.region().header;
+            assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_EMPTY);
+            assert_eq!(h.get_pools_updated_count(), 0);
+        }
+
+        // One applied update → apply signal, count 1, counter reset for next block.
+        let ev = v2_swap_event(addr(0xC2), 102, 500, -300);
+        assert!(shadow.apply_live_event(&ev).expect("apply"));
+        shadow.end_block(102);
+        {
+            let h = &shadow.arena.region().header;
+            assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_APPLY);
+            assert_eq!(h.get_pools_updated_count(), 1);
+            assert_eq!(h.get_block_number(), 102);
+        }
+
+        // Next block with no applies → back to empty, count 0 (counter was reset).
+        shadow.end_block(103);
+        {
+            let h = &shadow.arena.region().header;
+            assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_EMPTY);
+            assert_eq!(h.get_pools_updated_count(), 0);
+        }
 
         let _ = std::fs::remove_file(&path);
     }

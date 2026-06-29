@@ -132,18 +132,15 @@ fn extract_slot0(event: &PoolUpdateMessage) -> Option<Slot0> {
             sqrt_ratio,
             liquidity,
             tick,
-        }
-        | PoolUpdate::EkuboLiquidity {
-            sqrt_ratio,
-            liquidity,
-            tick,
-            ..
         } => Some(Slot0 {
             // Ekubo sqrtRatio is native uint96 stored in a U256, not Q64.96.
             sqrt_price_x96: *sqrt_ratio,
             tick: *tick,
             liquidity: *liquidity,
         }),
+        // EkuboLiquidity (PositionUpdated) also carries post-state but is emitted
+        // with a Mint/Burn update_type, so it is applied directly in its arm
+        // rather than through this swap-gated helper.
         _ => None,
     }
 }
@@ -155,9 +152,8 @@ struct LiquidityChange {
 }
 
 /// Mirrors arena_service `extract_liquidity_update`: only V3/V4 mint/burn carry
-/// a tick-range liquidity delta. EkuboLiquidity deliberately returns `None` here
-/// (matching arena_service), so Ekubo tick liquidity is not folded from the live
-/// path — its slot0 update already carries the active-tick liquidity.
+/// a tick-range liquidity delta. (Ekubo's PositionUpdated is handled in its own
+/// arm via the post-state slot0, not through this helper.)
 fn extract_liquidity(event: &PoolUpdateMessage) -> Option<LiquidityChange> {
     match event.update_type {
         UpdateType::Mint | UpdateType::Burn => {}
@@ -273,25 +269,24 @@ pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessag
                 }
             }
         }
-        PoolUpdate::EkuboLiquidity { .. } => {
-            // PositionUpdated carries post-state — update slot0 first.
-            if let Some(s) = extract_slot0(event) {
-                if let PoolIdentifier::PoolId(id) = &event.pool_id {
-                    writer.update_ekubo_slot0(*id, s.sqrt_price_x96, s.tick, s.liquidity)?;
-                }
-            }
-            // Then any tick-level liquidity change (no-op for Ekubo today, see
-            // extract_liquidity — kept to mirror arena_service exactly).
-            if let Some(liq) = extract_liquidity(event) {
-                let delta = maybe_negate_liquidity_delta(liq.liquidity_delta, event.is_revert)?;
-                if let PoolIdentifier::PoolId(id) = &event.pool_id {
-                    writer.update_ekubo_tick_liquidity(
-                        *id,
-                        liq.tick_lower,
-                        liq.tick_upper,
-                        delta,
-                    )?;
-                }
+        PoolUpdate::EkuboLiquidity {
+            tick_lower,
+            tick_upper,
+            liquidity_delta,
+            sqrt_ratio,
+            liquidity,
+            tick,
+        } => {
+            // PositionUpdated carries both a tick-range liquidity delta and the
+            // post-state (`stateAfter`), but is emitted with a Mint/Burn
+            // update_type. Downstream Ekubo quote context is built from the arena
+            // tick array + bitmap, so fold the tick delta first (maintaining ticks
+            // and the bitmap), then overwrite slot0 with the authoritative
+            // post-state active liquidity.
+            if let PoolIdentifier::PoolId(id) = &event.pool_id {
+                let delta = maybe_negate_liquidity_delta(*liquidity_delta, event.is_revert)?;
+                writer.update_ekubo_tick_liquidity(*id, *tick_lower, *tick_upper, delta)?;
+                writer.update_ekubo_slot0(*id, *sqrt_ratio, *tick, *liquidity)?;
             }
         }
 
