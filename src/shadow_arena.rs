@@ -306,6 +306,28 @@ impl ShadowArena {
         if event.block_number <= self.scraped_at_block {
             return Ok(false);
         }
+        self.apply_event_unguarded(event)
+    }
+
+    /// Apply a reorg revert/replay pool update (ITE-16 step 3d), **bypassing** the
+    /// replay guard. A reorg can cross the startup hydration anchor; its
+    /// revert/replay events must still adjust state baked into the hydration
+    /// snapshot. This is correct because relative-delta protocols (V2/Balancer/
+    /// tick liquidity) invert exactly regardless of baseline, and absolute-state
+    /// protocols (V3/V4/Ekubo slot0, Fluid) are restored by the slot0/fluid-final
+    /// epilogue. For reorgs that do not cross the anchor the bypass is a no-op
+    /// (all blocks are already `> scraped_at_block`).
+    pub fn apply_reorg_event(
+        &mut self,
+        event: &PoolUpdateMessage,
+    ) -> std::result::Result<bool, crate::shadow_apply::ApplyError> {
+        self.apply_event_unguarded(event)
+    }
+
+    fn apply_event_unguarded(
+        &mut self,
+        event: &PoolUpdateMessage,
+    ) -> std::result::Result<bool, crate::shadow_apply::ApplyError> {
         let applied = {
             let mut writer = SharedArenaWriter::new(self.arena.region_mut());
             crate::shadow_apply::apply_live_event(&mut writer, event)?
@@ -1011,5 +1033,322 @@ mod tests {
         assert_eq!(got.tick(), -5);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn ekubo_liquidity_event(
+        pool_id: [u8; 32],
+        block: u64,
+        delta: i128,
+        sqrt_ratio: u64,
+        tick: i32,
+        liquidity: u128,
+        is_revert: bool,
+    ) -> PoolUpdateMessage {
+        PoolUpdateMessage {
+            pool_id: PoolIdentifier::PoolId(pool_id),
+            protocol: Protocol::Ekubo,
+            update_type: if delta >= 0 {
+                UpdateType::Mint
+            } else {
+                UpdateType::Burn
+            },
+            block_number: block,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert,
+            update: PoolUpdate::EkuboLiquidity {
+                tick_lower: -10,
+                tick_upper: 10,
+                liquidity_delta: delta,
+                sqrt_ratio: U256::from(sqrt_ratio),
+                liquidity,
+                tick,
+            },
+        }
+    }
+
+    /// 3d (round-10 fix): reverting an Ekubo `PositionUpdated` inverts the tick
+    /// delta but must NOT write the reverted fork's `stateAfter` into slot0; the
+    /// reorg slot0-final epilogue restores the canonical slot0 instead.
+    #[test]
+    fn ekubo_position_revert_keeps_slot0_until_epilogue() {
+        let path = temp_arena_path("ekubo_revert");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let ekubo_id = [0xE0; 32];
+        let mut ekubo = EkuboLowPoolData::default();
+        ekubo.pool_id = ekubo_id;
+        ekubo.common.pool_id.copy_from_slice(&ekubo_id[..20]);
+        ekubo.common.is_active.store(true, Ordering::Release);
+        ekubo.sqrt_price_x96 = U256::from(3_000u64);
+        ekubo.tick = 30;
+        ekubo.liquidity = 300_000;
+        ekubo.fee = 42;
+        ekubo.tick_spacing = 10;
+        ekubo.type_config = 0x8000_000a;
+        ekubo.token0_decimals = 6;
+        ekubo.token1_decimals = 18;
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[],
+            &[],
+            &[EkuboHydration {
+                pool_id: ekubo_id,
+                pool: AnyEkuboPool::Low(ekubo),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        // Forward position update: ticks gain +5000, slot0 → stateAfter (9999).
+        assert!(shadow
+            .apply_reorg_event(&ekubo_liquidity_event(
+                ekubo_id, 101, 5_000, 9_999, 33, 350_000, false,
+            ))
+            .expect("forward"));
+
+        // Revert (same position): tick delta inverted, but the revert's stateAfter
+        // (1234 here) must NOT be written — slot0 stays at the forward value.
+        assert!(shadow
+            .apply_reorg_event(&ekubo_liquidity_event_revert(
+                ekubo_id, 102, 5_000, 1_234, 7, 1,
+            ))
+            .expect("revert"));
+
+        {
+            let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            let got = writer.get_ekubo_pool(&ekubo_id).expect("ekubo pool");
+            assert_eq!(
+                got.sqrt_price_x96(),
+                U256::from(9_999u64),
+                "revert must not write reverted stateAfter"
+            );
+            let AnyEkuboPool::Low(p) = got else {
+                panic!("expected Low Ekubo");
+            };
+            assert_eq!(p.tick_count, 0, "tick delta inverted back to empty");
+        }
+
+        // Epilogue restores the canonical post-reorg slot0 (5555).
+        let epilogue = ReorgEpilogueUpdate::Slot0Final {
+            pool_id: PoolIdentifier::PoolId(ekubo_id),
+            protocol: Protocol::Ekubo,
+            state: Slot0State {
+                sqrt_price_x96: U256::from(5_555u64),
+                liquidity: 222_000,
+                tick: 12,
+            },
+        };
+        assert!(shadow.apply_reorg_epilogue(&epilogue).expect("epilogue"));
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_ekubo_pool(&ekubo_id).expect("ekubo pool");
+        assert_eq!(got.sqrt_price_x96(), U256::from(5_555u64));
+        assert_eq!(got.tick(), 12);
+        assert_eq!(got.liquidity(), 222_000);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3d (round-10 fix): reorg revert/replay events bypass the startup replay
+    /// guard, so an anchor-crossing reorg still adjusts hydrated state — whereas
+    /// the normal live path skips events at/below the anchor.
+    #[test]
+    fn reorg_event_bypasses_replay_guard() {
+        let path = temp_arena_path("anchor_cross");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: addr(0xC2),
+                token0: addr(0x11),
+                token1: addr(0x22),
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        // Live path at the anchor block is guarded → skipped, reserves unchanged.
+        assert!(!shadow
+            .apply_live_event(&v2_swap_event(addr(0xC2), 100, 500, -300))
+            .expect("guarded"));
+        {
+            let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            let pool = writer.get_v2_pool(&addr(0xC2)).expect("v2 pool");
+            assert_eq!(pool.reserve0, 1_000);
+        }
+
+        // Reorg path at the same anchor block bypasses the guard → applies.
+        assert!(shadow
+            .apply_reorg_event(&v2_swap_event(addr(0xC2), 100, 500, -300))
+            .expect("bypass"));
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let pool = writer.get_v2_pool(&addr(0xC2)).expect("v2 pool");
+        assert_eq!(pool.reserve0, 1_500);
+        assert_eq!(pool.reserve1, 1_700);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn ekubo_liquidity_event_revert(
+        pool_id: [u8; 32],
+        block: u64,
+        delta: i128,
+        sqrt_ratio: u64,
+        tick: i32,
+        liquidity: u128,
+    ) -> PoolUpdateMessage {
+        ekubo_liquidity_event(pool_id, block, delta, sqrt_ratio, tick, liquidity, true)
+    }
+
+    fn v3_low_pool(address: [u8; 20]) -> UniswapV3LowPoolData {
+        let mut v3 = UniswapV3LowPoolData::default();
+        v3.common.pool_id = address;
+        v3.common.is_active.store(true, Ordering::Release);
+        v3.sqrt_price_x96 = U256::from(1_000u64);
+        v3.tick = 0;
+        v3.liquidity = 100_000;
+        v3.fee = 500;
+        v3.tick_spacing = 10;
+        v3.token0_decimals = 6;
+        v3.token1_decimals = 18;
+        v3
+    }
+
+    fn v3_liquidity_event(
+        address: [u8; 20],
+        block: u64,
+        delta: i128,
+        is_revert: bool,
+    ) -> PoolUpdateMessage {
+        PoolUpdateMessage {
+            pool_id: PoolIdentifier::Address(Address::from(address)),
+            protocol: Protocol::UniswapV3,
+            update_type: if delta >= 0 {
+                UpdateType::Mint
+            } else {
+                UpdateType::Burn
+            },
+            block_number: block,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert,
+            update: PoolUpdate::V3Liquidity {
+                tick_lower: -10,
+                tick_upper: 10,
+                liquidity_delta: delta,
+            },
+        }
+    }
+
+    fn v3_tick_count(shadow: &mut ShadowArena, address: &[u8; 20]) -> u16 {
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        match writer.get_v3_pool(address).expect("v3 pool") {
+            AnyUniswapV3Pool::Low(p) => p.tick_count,
+            _ => panic!("expected Low-tier V3 pool"),
+        }
+    }
+
+    fn v3_tick_gross(shadow: &mut ShadowArena, address: &[u8; 20], tick: i32) -> Option<u128> {
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        match writer.get_v3_pool(address).expect("v3 pool") {
+            AnyUniswapV3Pool::Low(p) => {
+                let n = p.tick_count as usize;
+                p.ticks[..n]
+                    .iter()
+                    .find(|(t, _, _)| *t == tick)
+                    .map(|(_, gross, _)| *gross)
+            }
+            _ => panic!("expected Low-tier V3 pool"),
+        }
+    }
+
+    fn v3_shadow_after_old_fork_mint_burn(
+        tag: &str,
+        address: [u8; 20],
+        mint: &PoolUpdateMessage,
+        burn: &PoolUpdateMessage,
+    ) -> (ShadowArena, PathBuf) {
+        let path = temp_arena_path(tag);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(address)),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        // Old fork: mint then burn the same range → ticks end empty (gross 0).
+        shadow.apply_reorg_event(mint).expect("old-fork mint");
+        shadow.apply_reorg_event(burn).expect("old-fork burn");
+        (shadow, path)
+    }
+
+    /// 3d (round-11 fix): reorg old-block reverts must un-apply in REVERSE
+    /// execution order. An old fork that mints then burns the same tick range ends
+    /// with gross 0 (tick removed). Reverting the burn FIRST re-adds the tick with
+    /// a plausible gross; reverting the mint first (the old forward order) re-adds
+    /// the absent tick with a NEGATIVE delta that wraps through `as u128` to a huge
+    /// gross — observable at the per-block reorg signal between the two reverts.
+    /// The final state self-heals once both reverts land, so the corruption is the
+    /// transient mid-reorg value, which the reverse order avoids.
+    #[test]
+    fn reorg_revert_reverse_order_keeps_v3_ticks_clean() {
+        let a = addr(0x37);
+        let mint = v3_liquidity_event(a, 101, 5_000, false);
+        let burn = v3_liquidity_event(a, 102, -5_000, false);
+        let mut mint_rev = mint.clone();
+        mint_rev.is_revert = true;
+        let mut burn_rev = burn.clone();
+        burn_rev.is_revert = true;
+
+        // FIXED order (what the reversed reorg loop now emits): revert burn first.
+        {
+            let (mut shadow, path) =
+                v3_shadow_after_old_fork_mint_burn("v3order_rev", a, &mint, &burn);
+            assert_eq!(v3_tick_count(&mut shadow, &a), 0, "old fork ends clean");
+
+            shadow.apply_reorg_event(&burn_rev).expect("revert burn");
+            // Intermediate state (what a reader sees at this block's signal) is
+            // plausible: the re-added tick carries the burned liquidity, not a wrap.
+            assert_eq!(
+                v3_tick_gross(&mut shadow, &a, -10),
+                Some(5_000),
+                "reverse order: plausible intermediate gross"
+            );
+            shadow.apply_reorg_event(&mint_rev).expect("revert mint");
+            assert_eq!(v3_tick_count(&mut shadow, &a), 0, "ends clean");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // BUGGY forward order (for contrast): reverting the mint first re-inserts
+        // the absent tick with a negative delta, wrapping gross to a huge value.
+        {
+            let (mut shadow, path) =
+                v3_shadow_after_old_fork_mint_burn("v3order_fwd", a, &mint, &burn);
+            shadow
+                .apply_reorg_event(&mint_rev)
+                .expect("revert mint (forward)");
+            let gross = v3_tick_gross(&mut shadow, &a, -10).expect("tick re-inserted");
+            assert!(
+                gross > u128::from(u64::MAX),
+                "forward order wraps gross to a huge value (the bug the reversal fixes), got {gross}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

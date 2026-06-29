@@ -110,6 +110,33 @@ fn apply_to_shadow(shadow: &mut Option<ShadowArena>, event: &PoolUpdateMessage) 
     }
 }
 
+/// Apply a reorg revert/replay pool update into the shadow arena (ITE-16 step
+/// 3d), bypassing the startup replay guard so anchor-crossing reorgs still adjust
+/// hydrated state. Same disjoint-field-borrow + log-only-failure contract as
+/// [`apply_to_shadow`].
+fn apply_reorg_to_shadow(shadow: &mut Option<ShadowArena>, event: &PoolUpdateMessage) {
+    let Some(shadow) = shadow.as_mut() else {
+        return;
+    };
+    match shadow.apply_reorg_event(event) {
+        Ok(_) => {}
+        Err(shadow_apply::ApplyError::Writer(arena_writer::WriterError::PoolNotFound(_))) => {
+            debug!(
+                pool = ?event.pool_id,
+                block = event.block_number,
+                "shadow reorg apply: pool not in shadow topology, skipping"
+            );
+        }
+        Err(e) => {
+            warn!(
+                pool = ?event.pool_id,
+                block = event.block_number,
+                "shadow arena reorg apply failed: {e}"
+            );
+        }
+    }
+}
+
 /// Apply a reorg-epilogue update (definitive post-reorg slot0/fluid state) into
 /// the shadow arena (ITE-16 step 3d), if enabled. Disjoint `shadow`-field borrow
 /// so it can run between immutable `exex` send calls; failures are logged only.
@@ -2305,14 +2332,21 @@ fn send_slot0_finals(
     }
 }
 
-/// Record a V3/V4/Ekubo swap pool affected by a reorg (for slot0 override).
+/// Record a pool whose slot0 must be restored from the final-tip snapshot after a
+/// reorg. Covers V3/V4/Ekubo swaps (slot0 is absolute, not delta-reverted) and
+/// Ekubo `PositionUpdated`, whose forward apply also writes slot0 from `stateAfter`
+/// — so a revert leaves slot0 at the reverted fork's state until the epilogue
+/// restores it. (V3/V4 mint/burn do not write slot0, so they need no override.)
 fn record_affected_slot0_pool(
     event: &PoolUpdateMessage,
     affected: &mut HashSet<(PoolIdentifier, Protocol)>,
 ) {
     let dominated_by_slot0 = matches!(
         event.update,
-        PoolUpdate::V3Swap { .. } | PoolUpdate::V4Swap { .. } | PoolUpdate::EkuboSwap { .. }
+        PoolUpdate::V3Swap { .. }
+            | PoolUpdate::V4Swap { .. }
+            | PoolUpdate::EkuboSwap { .. }
+            | PoolUpdate::EkuboLiquidity { .. }
     );
     if dominated_by_slot0 {
         affected.insert((event.pool_id.clone(), event.protocol));
@@ -2749,7 +2783,14 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                 // Step 1: Revert old blocks
                 info!("Step 1: Reverting {} old blocks", old.blocks().len());
-                for (block, receipts) in old.blocks_and_receipts() {
+                // Revert in reverse execution order: newest old block first (and,
+                // below, newest tx/log first) so inverse tick-liquidity ops
+                // un-apply in the exact reverse of how they were applied.
+                // Otherwise reverting an earlier mint before the later burn that
+                // zeroed the tick wraps `gross` through `as u128`.
+                let mut reverted_blocks: Vec<_> = old.blocks_and_receipts().collect();
+                reverted_blocks.reverse();
+                for (block, receipts) in reverted_blocks {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
                     let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
@@ -2776,8 +2817,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         state_at_block(ctx.provider(), final_tip_block, "ChainReorged revert")?;
                     let mut events_reverted = 0;
 
-                    for (tx_index, receipt) in receipts.iter().enumerate() {
-                        for (log_index, log) in receipt.logs().iter().enumerate() {
+                    // Reverse tx/log order, keeping the original tx/log indexes in
+                    // the emitted messages.
+                    for (tx_index, receipt) in receipts.iter().enumerate().rev() {
+                        for (log_index, log) in receipt.logs().iter().enumerate().rev() {
                             let log_address = log.address;
 
                             // Fluid: collect touched pools — will decode from
@@ -2822,7 +2865,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
-                                apply_to_shadow(&mut exex.shadow, &update_msg);
+                                apply_reorg_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -2917,7 +2960,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 state.as_ref(),
                                 &pool_tracker,
                             ) {
-                                apply_to_shadow(&mut exex.shadow, &update_msg);
+                                apply_reorg_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_in_block += 1;
@@ -2937,7 +2980,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                         block_number,
                                         block_timestamp,
                                     );
-                                    apply_to_shadow(&mut exex.shadow, &update_msg);
+                                    apply_reorg_to_shadow(&mut exex.shadow, &update_msg);
                                     exex.send_pool_update(&mut stream_seq, update_msg);
                                     events_in_block += 1;
                                     exex.events_processed += 1;
@@ -3062,7 +3105,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 let final_state =
                     state_at_block(ctx.provider(), final_tip_block, "ChainReverted final")?;
 
-                for (block, receipts) in old.blocks_and_receipts() {
+                // Revert in reverse execution order (see ChainReorged Step 1): newest
+                // old block first, and newest tx/log first within each block.
+                let mut reverted_blocks: Vec<_> = old.blocks_and_receipts().collect();
+                reverted_blocks.reverse();
+                for (block, receipts) in reverted_blocks {
                     let block_number = block.number();
                     let block_timestamp = block.timestamp();
                     let base_fee_per_gas = block.base_fee_per_gas().unwrap_or(0);
@@ -3084,8 +3131,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     let pool_tracker = exex.pool_tracker.read().await;
                     let mut events_reverted = 0;
 
-                    for (tx_index, receipt) in receipts.iter().enumerate() {
-                        for (log_index, log) in receipt.logs().iter().enumerate() {
+                    // Reverse tx/log order, keeping the original tx/log indexes in
+                    // the emitted messages.
+                    for (tx_index, receipt) in receipts.iter().enumerate().rev() {
+                        for (log_index, log) in receipt.logs().iter().enumerate().rev() {
                             let log_address = log.address;
 
                             // Fluid: collect touched pools — decode from
@@ -3124,7 +3173,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
-                                apply_to_shadow(&mut exex.shadow, &update_msg);
+                                apply_reorg_to_shadow(&mut exex.shadow, &update_msg);
                                 exex.send_pool_update(&mut stream_seq, update_msg);
 
                                 events_reverted += 1;
@@ -3366,11 +3415,66 @@ fn main() -> eyre::Result<()> {
 mod tests {
     use super::{
         determine_tier, extract_ekubo_ticks_from_bitmap, extract_ticks_from_bitmap_u256,
-        twocrypto_storage_slots, v2_swap_deltas, v3_slots_for_factory, TwoCryptoStorageSlots,
-        V3StorageSlots, PANCAKE_V3_FACTORY_ETHEREUM,
+        record_affected_slot0_pool, twocrypto_storage_slots, v2_swap_deltas, v3_slots_for_factory,
+        TwoCryptoStorageSlots, V3StorageSlots, PANCAKE_V3_FACTORY_ETHEREUM,
     };
+    use crate::types::{PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, UpdateType};
     use alloy_primitives::{I256, U256};
     use arena_layout::PoolTier;
+    use std::collections::HashSet;
+
+    fn slot0_event(update: PoolUpdate, protocol: Protocol) -> PoolUpdateMessage {
+        PoolUpdateMessage {
+            pool_id: PoolIdentifier::PoolId([0xE0; 32]),
+            protocol,
+            update_type: UpdateType::Burn,
+            block_number: 1,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: true,
+            update,
+        }
+    }
+
+    /// Round-10 fix: Ekubo `PositionUpdated` (`EkuboLiquidity`) writes slot0 from
+    /// `stateAfter` on the forward apply, so a revert must enter the affected
+    /// slot0 set for the reorg epilogue — unlike V3/V4 mint/burn, which never
+    /// touch slot0.
+    #[test]
+    fn record_affected_slot0_includes_ekubo_liquidity() {
+        let mut affected = HashSet::new();
+        record_affected_slot0_pool(
+            &slot0_event(
+                PoolUpdate::EkuboLiquidity {
+                    tick_lower: -10,
+                    tick_upper: 10,
+                    liquidity_delta: 5,
+                    sqrt_ratio: U256::from(1u64),
+                    liquidity: 1,
+                    tick: 0,
+                },
+                Protocol::Ekubo,
+            ),
+            &mut affected,
+        );
+        assert_eq!(affected.len(), 1, "Ekubo PositionUpdated must be recorded");
+
+        // V4 mint/burn does not write slot0 → not recorded.
+        let mut v4 = HashSet::new();
+        record_affected_slot0_pool(
+            &slot0_event(
+                PoolUpdate::V4Liquidity {
+                    tick_lower: -10,
+                    tick_upper: 10,
+                    liquidity_delta: 5,
+                },
+                Protocol::UniswapV4,
+            ),
+            &mut v4,
+        );
+        assert!(v4.is_empty(), "V4 mint/burn must not be recorded");
+    }
 
     #[test]
     fn twocrypto_storage_slots_follow_versioned_layouts() {

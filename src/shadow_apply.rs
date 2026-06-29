@@ -282,13 +282,20 @@ pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessag
             // PositionUpdated carries both a tick-range liquidity delta and the
             // post-state (`stateAfter`), but is emitted with a Mint/Burn
             // update_type. Downstream Ekubo quote context is built from the arena
-            // tick array + bitmap, so fold the tick delta first (maintaining ticks
-            // and the bitmap), then overwrite slot0 with the authoritative
-            // post-state active liquidity.
+            // tick array + bitmap, so always fold the (revert-negated) tick delta.
+            //
+            // slot0 (`stateAfter`) is authoritative only for the FORWARD apply. On
+            // a revert the `stateAfter` belongs to the reverted fork, so writing it
+            // would pin slot0 to old-fork state; instead the pool is added to the
+            // affected-slot0 set (see `record_affected_slot0_pool`) and the reorg
+            // slot0-final epilogue restores the canonical post-reorg slot0 — the
+            // same model as V3/V4/Ekubo swap reverts.
             if let PoolIdentifier::PoolId(id) = &event.pool_id {
                 let delta = maybe_negate_liquidity_delta(*liquidity_delta, event.is_revert)?;
                 writer.update_ekubo_tick_liquidity(*id, *tick_lower, *tick_upper, delta)?;
-                writer.update_ekubo_slot0(*id, *sqrt_ratio, *tick, *liquidity)?;
+                if !event.is_revert {
+                    writer.update_ekubo_slot0(*id, *sqrt_ratio, *tick, *liquidity)?;
+                }
             }
         }
 
