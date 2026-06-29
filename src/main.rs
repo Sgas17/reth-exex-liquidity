@@ -19,6 +19,7 @@ mod events;
 mod fluid_decoder;
 mod nats_client;
 mod pool_tracker;
+mod shadow_arena;
 #[allow(dead_code)]
 mod socket;
 mod swap_monitor;
@@ -34,6 +35,7 @@ use futures::{StreamExt, TryStreamExt};
 use nats_client::WhitelistNatsClient;
 use pool_tracker::PoolTracker;
 use reth::providers::StateProviderFactory;
+use shadow_arena::ShadowArena;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
@@ -56,6 +58,10 @@ struct LiquidityExEx {
     /// Socket sender for outgoing messages
     socket_tx: tokio::sync::mpsc::Sender<ControlMessage>,
 
+    /// In-process shadow arena writer (ITE-16). `None` unless `SHADOW_ARENA_PATH`
+    /// is set; when present, block boundaries are mirrored into the shadow arena.
+    shadow: Option<ShadowArena>,
+
     /// Statistics
     events_processed: u64,
     blocks_processed: u64,
@@ -75,12 +81,23 @@ fn v2_swap_deltas(
 }
 
 impl LiquidityExEx {
-    fn new(socket_tx: tokio::sync::mpsc::Sender<ControlMessage>) -> Self {
+    fn new(
+        socket_tx: tokio::sync::mpsc::Sender<ControlMessage>,
+        shadow: Option<ShadowArena>,
+    ) -> Self {
         Self {
             pool_tracker: Arc::new(RwLock::new(PoolTracker::new())),
             socket_tx,
+            shadow,
             events_processed: 0,
             blocks_processed: 0,
+        }
+    }
+
+    /// Mirror a block end into the shadow arena (signal), if enabled.
+    fn shadow_end_block(&mut self, block_number: u64) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.end_block(block_number);
         }
     }
 
@@ -1222,8 +1239,12 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
         }
     });
 
+    // Open the shadow arena writer if SHADOW_ARENA_PATH is set (ITE-16). Disabled
+    // by default — when unset the ExEx behaves exactly as before.
+    let shadow = ShadowArena::from_env()?;
+
     // Initialize ExEx state
-    let mut exex = LiquidityExEx::new(socket_tx);
+    let mut exex = LiquidityExEx::new(socket_tx, shadow);
 
     info!("Socket protocol configured: v2 (cutover, legacy v1 removed)");
 
@@ -1517,6 +1538,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
+                    exex.shadow_end_block(block_number);
 
                     // 🔓 End block - apply any pending whitelist updates atomically
                     {

@@ -2,12 +2,12 @@
 //
 // Exposes modules for reuse and testing
 
-pub mod arena_writer;
 pub mod balance_monitor;
 pub mod events;
 pub mod fluid_decoder;
 pub mod nats_client;
 pub mod pool_tracker;
+pub mod shadow_arena;
 pub mod socket;
 pub mod swap_monitor;
 pub mod transfers;
