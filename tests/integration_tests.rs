@@ -27,6 +27,8 @@ mod event_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         }
     }
 
@@ -43,6 +45,8 @@ mod event_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         }
     }
 
@@ -59,6 +63,8 @@ mod event_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         }
     }
 
@@ -341,6 +347,8 @@ mod event_decoding_and_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -388,6 +396,8 @@ mod event_decoding_and_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -425,6 +435,8 @@ mod event_decoding_and_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -474,6 +486,8 @@ mod event_decoding_and_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -521,6 +535,8 @@ mod event_decoding_and_filtering {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));

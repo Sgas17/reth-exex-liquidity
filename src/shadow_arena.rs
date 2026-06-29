@@ -17,8 +17,8 @@
 //! in 3c; reorg writes in 3d.
 
 use arena_layout::{
-    CurveStablePoolData, CurveTricryptoPoolData, CurveTwoCryptoPoolData,
-    SIGNAL_REASON_LIVE_BLOCK_EMPTY,
+    AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
+    CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
 };
 use arena_writer::{ArenaMmap, SharedArenaWriter};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,21 @@ pub struct V2Hydration {
     pub reserve1: u128,
     pub token0_decimals: u8,
     pub token1_decimals: u8,
+}
+
+pub struct UniswapV3Hydration {
+    pub address: [u8; 20],
+    pub pool: AnyUniswapV3Pool,
+}
+
+pub struct UniswapV4Hydration {
+    pub pool_id: [u8; 32],
+    pub pool: AnyUniswapV4Pool,
+}
+
+pub struct EkuboHydration {
+    pub pool_id: [u8; 32],
+    pub pool: AnyEkuboPool,
 }
 
 pub struct CurveStableHydration {
@@ -76,6 +91,9 @@ pub struct FluidHydration {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StartupHydrationCounts {
     pub v2: usize,
+    pub v3: usize,
+    pub v4: usize,
+    pub ekubo: usize,
     pub curve_stable: usize,
     pub curve_twocrypto: usize,
     pub curve_tricrypto: usize,
@@ -84,7 +102,14 @@ pub struct StartupHydrationCounts {
 
 impl StartupHydrationCounts {
     pub fn total(self) -> usize {
-        self.v2 + self.curve_stable + self.curve_twocrypto + self.curve_tricrypto + self.fluid
+        self.v2
+            + self.v3
+            + self.v4
+            + self.ekubo
+            + self.curve_stable
+            + self.curve_twocrypto
+            + self.curve_tricrypto
+            + self.fluid
     }
 }
 
@@ -131,6 +156,9 @@ impl ShadowArena {
         &mut self,
         anchor_block: u64,
         v2: &[V2Hydration],
+        v3: &[UniswapV3Hydration],
+        v4: &[UniswapV4Hydration],
+        ekubo: &[EkuboHydration],
         curve_stable: &[CurveStableHydration],
         curve_twocrypto: &[CurveTwoCryptoHydration],
         curve_tricrypto: &[CurveTricryptoHydration],
@@ -152,6 +180,29 @@ impl ShadowArena {
             ) {
                 Ok(()) => counts.v2 += 1,
                 Err(e) => tracing::warn!(address = ?p.address, "shadow V2 hydration failed: {e}"),
+            }
+        }
+
+        for p in v3 {
+            match writer.add_v3_pool(p.pool.clone()) {
+                Ok(()) => counts.v3 += 1,
+                Err(e) => tracing::warn!(address = ?p.address, "shadow V3 hydration failed: {e}"),
+            }
+        }
+
+        for p in v4 {
+            match writer.add_v4_pool(p.pool.clone()) {
+                Ok(()) => counts.v4 += 1,
+                Err(e) => tracing::warn!(pool_id = ?p.pool_id, "shadow V4 hydration failed: {e}"),
+            }
+        }
+
+        for p in ekubo {
+            match writer.add_ekubo_pool(p.pool.clone()) {
+                Ok(()) => counts.ekubo += 1,
+                Err(e) => {
+                    tracing::warn!(pool_id = ?p.pool_id, "shadow Ekubo hydration failed: {e}")
+                }
             }
         }
 
@@ -230,7 +281,7 @@ impl ShadowArena {
     /// wrapper around the multi-protocol startup path.
     #[allow(dead_code)]
     pub fn hydrate_v2(&mut self, anchor_block: u64, pools: &[V2Hydration]) -> usize {
-        self.hydrate_startup(anchor_block, pools, &[], &[], &[], &[])
+        self.hydrate_startup(anchor_block, pools, &[], &[], &[], &[], &[], &[], &[])
             .v2
     }
 
@@ -250,8 +301,13 @@ impl ShadowArena {
 mod tests {
     use super::*;
     use alloy_primitives::U256;
-    use arena_layout::{SharedArenaRegion, UniswapV3LowPoolData, SHARED_ARENA_VERSION};
+    use arena_layout::ekubo::EkuboLowPoolData;
+    use arena_layout::{
+        AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, SharedArenaRegion, UniswapV3LowPoolData,
+        UniswapV4LowPoolData, SHARED_ARENA_VERSION,
+    };
     use arena_writer::SharedArenaWriter;
+    use std::sync::atomic::Ordering;
 
     fn temp_arena_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ite16_{tag}_{}.arena", std::process::id()))
@@ -392,6 +448,9 @@ mod tests {
         let counts = shadow.hydrate_startup(
             12_345,
             &[],
+            &[],
+            &[],
+            &[],
             &[CurveStableHydration {
                 address: addr(0xAA),
                 pool: stable,
@@ -428,6 +487,89 @@ mod tests {
         assert_eq!(fluid.col_token0_real, 1);
         assert_eq!(fluid.debt_token1_imaginary, 8);
         assert_eq!(fluid.token0_decimals, 6);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hydrate_startup_creates_v3_v4_ekubo_slots() {
+        let path = temp_arena_path("shadow_hydrate_ticks");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let mut v3 = UniswapV3LowPoolData::default();
+        v3.common.pool_id = addr(0xA3);
+        v3.common.is_active.store(true, Ordering::Release);
+        v3.sqrt_price_x96 = U256::from(1_000u64);
+        v3.tick = 10;
+        v3.liquidity = 100_000;
+        v3.fee = 500;
+        v3.tick_spacing = 10;
+        v3.token0_decimals = 6;
+        v3.token1_decimals = 18;
+        v3.tick_count = 1;
+        v3.ticks[0] = (0, 100, 100);
+        v3.bitmap_count = 1;
+        v3.tick_bitmap[0] = (0, [1u8; 32]);
+
+        let v4_id = [0xB4; 32];
+        let mut v4 = UniswapV4LowPoolData::default();
+        v4.pool_id = v4_id;
+        v4.common.pool_id.copy_from_slice(&v4_id[..20]);
+        v4.common.is_active.store(true, Ordering::Release);
+        v4.sqrt_price_x96 = U256::from(2_000u64);
+        v4.tick = 20;
+        v4.liquidity = 200_000;
+        v4.fee = 500;
+        v4.tick_spacing = 10;
+        v4.token0_decimals = 6;
+        v4.token1_decimals = 18;
+
+        let ekubo_id = [0xE0; 32];
+        let mut ekubo = EkuboLowPoolData::default();
+        ekubo.pool_id = ekubo_id;
+        ekubo.common.pool_id.copy_from_slice(&ekubo_id[..20]);
+        ekubo.common.is_active.store(true, Ordering::Release);
+        ekubo.sqrt_price_x96 = U256::from(3_000u64);
+        ekubo.tick = 30;
+        ekubo.liquidity = 300_000;
+        ekubo.fee = 42;
+        ekubo.tick_spacing = 10;
+        ekubo.type_config = 0x8000_000a;
+        ekubo.token0_decimals = 6;
+        ekubo.token1_decimals = 18;
+
+        let counts = shadow.hydrate_startup(
+            12_346,
+            &[],
+            &[UniswapV3Hydration {
+                address: addr(0xA3),
+                pool: AnyUniswapV3Pool::Low(v3),
+            }],
+            &[UniswapV4Hydration {
+                pool_id: v4_id,
+                pool: AnyUniswapV4Pool::Low(v4),
+            }],
+            &[EkuboHydration {
+                pool_id: ekubo_id,
+                pool: AnyEkuboPool::Low(ekubo),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        assert_eq!(counts.v3, 1);
+        assert_eq!(counts.v4, 1);
+        assert_eq!(counts.ekubo, 1);
+        assert_eq!(counts.total(), 3);
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got_v3 = writer.get_v3_pool(&addr(0xA3)).expect("v3 slot");
+        assert_eq!(got_v3.sqrt_price_x96(), U256::from(1_000u64));
+        assert_eq!(got_v3.tick(), 10);
+        assert!(writer.get_v4_pool(&v4_id).is_some());
+        assert!(writer.contains_pool_v4(&ekubo_id));
 
         let _ = std::fs::remove_file(&path);
     }

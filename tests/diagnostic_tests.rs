@@ -96,6 +96,8 @@ fn test_diagnostic_v2_event_processing() {
         token1_decimals: None,
         extra_tokens: vec![],
         twocrypto_version: None,
+        ekubo_fee: None,
+        ekubo_type_config: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -180,6 +182,8 @@ fn test_diagnostic_v2_event_wrong_pool() {
         token1_decimals: None,
         extra_tokens: vec![],
         twocrypto_version: None,
+        ekubo_fee: None,
+        ekubo_type_config: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -244,6 +248,8 @@ fn test_diagnostic_v3_event_processing() {
         token1_decimals: None,
         extra_tokens: vec![],
         twocrypto_version: None,
+        ekubo_fee: None,
+        ekubo_type_config: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -304,6 +310,8 @@ fn test_diagnostic_v4_event_processing() {
         token1_decimals: None,
         extra_tokens: vec![],
         twocrypto_version: None,
+        ekubo_fee: None,
+        ekubo_type_config: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -394,6 +402,8 @@ fn test_diagnostic_v4_wrong_pool_id() {
         token1_decimals: None,
         extra_tokens: vec![],
         twocrypto_version: None,
+        ekubo_fee: None,
+        ekubo_type_config: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -529,6 +539,8 @@ fn test_diagnostic_whitelist_not_applied() {
         token1_decimals: None,
         extra_tokens: vec![],
         twocrypto_version: None,
+        ekubo_fee: None,
+        ekubo_type_config: None,
     };
 
     // Begin block BEFORE queuing update

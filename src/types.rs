@@ -335,6 +335,14 @@ pub struct PoolMetadata {
     /// `None` means the default v2.1.x layout; `Some("v2.0.0")` uses the legacy slots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twocrypto_version: Option<String>,
+
+    /// Ekubo fee: 0.64 fixed-point. Required for Ekubo arena hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ekubo_fee: Option<u64>,
+
+    /// Ekubo PoolConfig type_config (packed u32). Required for Ekubo arena hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ekubo_type_config: Option<u32>,
 }
 
 /// Whitelist control message sent from dynamicWhitelist to ExEx

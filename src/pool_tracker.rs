@@ -469,6 +469,8 @@ mod tests {
             token1_decimals: None,
             extra_tokens: vec![],
             twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
         }
     }
 

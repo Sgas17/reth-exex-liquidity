@@ -57,6 +57,10 @@ struct CanonicalPool {
     #[serde(default)]
     extra_tokens: Vec<CanonicalToken>,
     #[serde(default)]
+    ekubo_fee: Option<u64>,
+    #[serde(default)]
+    ekubo_type_config: Option<u32>,
+    #[serde(default)]
     additional_data: Option<serde_json::Value>,
 }
 
@@ -129,6 +133,8 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         token1_decimals: Some(p.token1.decimals),
         extra_tokens,
         twocrypto_version,
+        ekubo_fee: p.ekubo_fee,
+        ekubo_type_config: p.ekubo_type_config,
     })
 }
 
@@ -299,6 +305,18 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].protocol, Protocol::CurveTwoCrypto);
         assert_eq!(pools[0].twocrypto_version.as_deref(), Some("v2.0.0"));
+    }
+
+    #[test]
+    fn parse_full_snapshot_carries_ekubo_metadata() {
+        let json = br#"{"snapshot_id":1,"chain":"ethereum","pools":[{"address":"0x00000000000014aA86C5d3c41765bb24e11bd701","protocol":"ekubo","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18},"tick_spacing":10,"pool_id":"0x1111111111111111111111111111111111111111111111111111111111111111","factory":"0x00000000000014aA86C5d3c41765bb24e11bd701","ekubo_fee":42,"ekubo_type_config":2147483658}]}"#;
+
+        let pools = super::parse_full_snapshot(json).expect("parse full snapshot");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].protocol, Protocol::Ekubo);
+        assert_eq!(pools[0].tick_spacing, Some(10));
+        assert_eq!(pools[0].ekubo_fee, Some(42));
+        assert_eq!(pools[0].ekubo_type_config, Some(0x8000_000a));
     }
 
     #[test]

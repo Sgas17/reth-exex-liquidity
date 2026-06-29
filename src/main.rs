@@ -29,7 +29,11 @@ mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
 use alloy_primitives::{Address, I256, U256};
-use arena_layout::{CurveStablePoolData, CurveTricryptoPoolData, CurveTwoCryptoPoolData};
+use arena_layout::ekubo::EkuboPoolData;
+use arena_layout::{
+    AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
+    CurveTwoCryptoPoolData, PoolTier, UniswapV3PoolData, UniswapV4PoolData,
+};
 use events::{decode_log, fluid_log_operate_pool, DecodedEvent};
 use fluid_decoder::FluidPoolConfig;
 use futures::{StreamExt, TryStreamExt};
@@ -41,11 +45,12 @@ use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
 use reth_provider::StateProvider;
 use shadow_arena::{
-    CurveStableHydration, CurveTricryptoHydration, CurveTwoCryptoHydration, FluidHydration,
-    ShadowArena, V2Hydration,
+    CurveStableHydration, CurveTricryptoHydration, CurveTwoCryptoHydration, EkuboHydration,
+    FluidHydration, ShadowArena, UniswapV3Hydration, UniswapV4Hydration, V2Hydration,
 };
 use socket::PoolUpdateSocketServer;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -966,6 +971,22 @@ fn pool_address(pool: &PoolMetadata) -> Option<Address> {
     pool.pool_id.as_address()
 }
 
+fn pool_id_32(pool: &PoolMetadata) -> Option<[u8; 32]> {
+    pool.pool_id.as_pool_id()
+}
+
+fn v3_factory(pool: &PoolMetadata) -> Option<Address> {
+    (pool.factory != Address::ZERO).then_some(pool.factory)
+}
+
+fn singleton_contract_or(pool: &PoolMetadata, fallback: Address) -> Address {
+    if pool.factory == Address::ZERO {
+        fallback
+    } else {
+        pool.factory
+    }
+}
+
 fn pool_tokens(pool: &PoolMetadata) -> Option<Vec<TokenMetadata>> {
     let mut tokens = Vec::with_capacity(2 + pool.extra_tokens.len());
     tokens.push(TokenMetadata {
@@ -1027,6 +1048,76 @@ fn v2_hydration_from_snapshot(
         reserve1,
         token0_decimals: pool.token0_decimals?,
         token1_decimals: pool.token1_decimals?,
+    })
+}
+
+fn v3_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<UniswapV3Hydration> {
+    let addr = pool_address(pool)?;
+    if pool.tick_spacing.is_none()
+        || pool.fee.is_none()
+        || pool.token0_decimals.is_none()
+        || pool.token1_decimals.is_none()
+    {
+        warn!(pool = %addr, "Skipping V3 hydration: missing fee/tick/decimal metadata");
+        return None;
+    }
+    let snapshot = read_v3_full_state(state, addr, pool.tick_spacing?, v3_factory(pool))?;
+    let arena_pool = build_v3_pool(addr.into_array(), pool, &snapshot)?;
+    Some(UniswapV3Hydration {
+        address: addr.into_array(),
+        pool: arena_pool,
+    })
+}
+
+fn v4_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<UniswapV4Hydration> {
+    use pool_tracker::UNISWAP_V4_POOL_MANAGER;
+
+    let pool_id = pool_id_32(pool)?;
+    if pool.tick_spacing.is_none()
+        || pool.fee.is_none()
+        || pool.token0_decimals.is_none()
+        || pool.token1_decimals.is_none()
+    {
+        warn!(pool_id = ?pool_id, "Skipping V4 hydration: missing fee/tick/decimal metadata");
+        return None;
+    }
+    let pool_manager = singleton_contract_or(pool, UNISWAP_V4_POOL_MANAGER);
+    let snapshot = read_v4_full_state(state, pool_manager, &pool_id, pool.tick_spacing?)?;
+    let arena_pool = build_v4_pool(pool_id, pool, &snapshot)?;
+    Some(UniswapV4Hydration {
+        pool_id,
+        pool: arena_pool,
+    })
+}
+
+fn ekubo_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<EkuboHydration> {
+    use events::EKUBO_CORE;
+
+    let pool_id = pool_id_32(pool)?;
+    if pool.tick_spacing.is_none()
+        || pool.ekubo_fee.is_none()
+        || pool.ekubo_type_config.is_none()
+        || pool.token0_decimals.is_none()
+        || pool.token1_decimals.is_none()
+    {
+        warn!(pool_id = ?pool_id, "Skipping Ekubo hydration: missing fee/type_config/tick/decimal metadata");
+        return None;
+    }
+    let ekubo_core = singleton_contract_or(pool, EKUBO_CORE);
+    let snapshot = read_ekubo_full_state(state, ekubo_core, &pool_id, pool.tick_spacing?)?;
+    let arena_pool = build_ekubo_pool(pool_id, pool, &snapshot)?;
+    Some(EkuboHydration {
+        pool_id,
+        pool: arena_pool,
     })
 }
 
@@ -1238,6 +1329,21 @@ fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
         .filter(|p| p.protocol == Protocol::UniswapV2)
         .filter_map(|p| v2_hydration_from_snapshot(state.as_ref(), p))
         .collect();
+    let v3: Vec<UniswapV3Hydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::UniswapV3)
+        .filter_map(|p| v3_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
+    let v4: Vec<UniswapV4Hydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::UniswapV4)
+        .filter_map(|p| v4_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
+    let ekubo: Vec<EkuboHydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::Ekubo)
+        .filter_map(|p| ekubo_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
     let curve_stable: Vec<CurveStableHydration> = pools
         .iter()
         .filter(|p| p.protocol == Protocol::CurveStable)
@@ -1264,6 +1370,9 @@ fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
     let counts = shadow.hydrate_startup(
         anchor,
         &v2,
+        &v3,
+        &v4,
+        &ekubo,
         &curve_stable,
         &curve_twocrypto,
         &curve_tricrypto,
@@ -1432,9 +1541,57 @@ fn read_curve_stable_liquidity_state(
 const V3_SLOT0: U256 = U256::from_limbs([0, 0, 0, 0]);
 const V3_LIQUIDITY_VANILLA: U256 = U256::from_limbs([4, 0, 0, 0]);
 const V3_LIQUIDITY_PANCAKE: U256 = U256::from_limbs([5, 0, 0, 0]);
+const PANCAKE_V3_FACTORY_ETHEREUM: Address =
+    alloy_primitives::address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V3StorageSlots {
+    slot0: u64,
+    liquidity: u64,
+    ticks: u64,
+    tick_bitmap: u64,
+}
+
+fn v3_slots_for_factory(factory: Option<Address>) -> V3StorageSlots {
+    if factory == Some(PANCAKE_V3_FACTORY_ETHEREUM) {
+        V3StorageSlots {
+            slot0: 0,
+            liquidity: 5,
+            ticks: 6,
+            tick_bitmap: 7,
+        }
+    } else {
+        V3StorageSlots {
+            slot0: 0,
+            liquidity: 4,
+            ticks: 5,
+            tick_bitmap: 6,
+        }
+    }
+}
 
 /// V4 PoolManager mapping slot (pools mapping at slot 6).
 const V4_POOLS_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+
+/// Ekubo Core additive storage offsets.
+const EKUBO_TICKS_OFFSET: U256 = U256::from_limbs([
+    0x8e7acd6efb28c568,
+    0xfca683928d56726d,
+    0x174331cf5a3902d9,
+    0x435a5eb89a296820,
+]);
+const EKUBO_BITMAPS_OFFSET: U256 = U256::from_limbs([
+    0x737975db05a2e3a5,
+    0x5a0f42fdd4c53e1c,
+    0xf515ce5eba4b363b,
+    0x3def450d0010a2fe,
+]);
+
+const MIN_TICK: i32 = -887_272;
+const MAX_TICK: i32 = 887_272;
+const EKUBO_MIN_TICK: i32 = -88_722_835;
+const EKUBO_MAX_TICK: i32 = 88_722_835;
+const EKUBO_BITMAP_OFFSET: u32 = 89_421_695;
 
 /// Decode V3/V4 packed slot0: sqrtPriceX96 (bits 0-159), tick (bits 160-183, signed int24).
 fn decode_slot0_packed(value: U256) -> (U256, i32) {
@@ -1541,6 +1698,514 @@ fn read_ekubo_state(
     }
     let (sqrt_ratio, tick, liquidity) = decode_ekubo_state_packed(state_raw);
     Some((sqrt_ratio, tick, liquidity))
+}
+
+#[derive(Debug, Clone)]
+struct TickBitmapSnapshot {
+    sqrt_price_x96: U256,
+    tick: i32,
+    liquidity: u128,
+    ticks: Vec<(i32, u128, i128)>,
+    tick_bitmaps: Vec<(i16, [u8; 32])>,
+}
+
+#[derive(Debug, Clone)]
+struct EkuboTickBitmapSnapshot {
+    sqrt_ratio: U256,
+    tick: i32,
+    liquidity: u128,
+    ticks: Vec<(i32, u128, i128)>,
+    tick_bitmaps: Vec<(u32, [u8; 32])>,
+}
+
+fn keccak_slot(encoded: Vec<u8>) -> U256 {
+    U256::from_be_bytes(*alloy_primitives::keccak256(encoded))
+}
+
+fn v3_bitmap_slot(word_pos: i16, mapping_slot: u64) -> U256 {
+    use alloy_sol_types::SolValue;
+    keccak_slot((word_pos, U256::from(mapping_slot)).abi_encode())
+}
+
+fn v3_tick_slot(tick: i32, mapping_slot: u64) -> U256 {
+    use alloy_sol_types::SolValue;
+    keccak_slot((tick, U256::from(mapping_slot)).abi_encode())
+}
+
+fn v4_mapping_slot(pool_id: &[u8; 32], offset: u64) -> U256 {
+    v4_pool_base_slot(pool_id) + U256::from(offset)
+}
+
+fn v4_bitmap_slot(pool_id: &[u8; 32], word_pos: i16) -> U256 {
+    use alloy_sol_types::SolValue;
+    let mapping_slot = v4_mapping_slot(pool_id, 5);
+    keccak_slot((word_pos, mapping_slot).abi_encode())
+}
+
+fn v4_tick_slot(pool_id: &[u8; 32], tick: i32) -> U256 {
+    use alloy_sol_types::SolValue;
+    let mapping_slot = v4_mapping_slot(pool_id, 4);
+    keccak_slot((tick, mapping_slot).abi_encode())
+}
+
+fn signed_i32_to_u256(value: i32) -> U256 {
+    if value >= 0 {
+        U256::from(value as u64)
+    } else {
+        U256::MAX - U256::from((-(i64::from(value)) - 1) as u64)
+    }
+}
+
+fn ekubo_tick_slot(pool_id: &[u8; 32], tick: i32) -> U256 {
+    U256::from_be_bytes(*pool_id)
+        .wrapping_add(EKUBO_TICKS_OFFSET)
+        .wrapping_add(signed_i32_to_u256(tick))
+}
+
+fn ekubo_bitmap_slot(pool_id: &[u8; 32], word: u32) -> U256 {
+    U256::from_be_bytes(*pool_id)
+        .wrapping_add(EKUBO_BITMAPS_OFFSET)
+        .wrapping_add(U256::from(word))
+}
+
+fn tick_to_word_pos(tick: i32, tick_spacing: i32) -> i16 {
+    let compressed = tick / tick_spacing;
+    (compressed >> 8) as i16
+}
+
+fn generate_word_positions(tick_spacing: i32) -> Option<Vec<i16>> {
+    (tick_spacing > 0).then(|| {
+        let min_word = tick_to_word_pos(MIN_TICK, tick_spacing);
+        let max_word = tick_to_word_pos(MAX_TICK, tick_spacing);
+        (min_word..=max_word).collect()
+    })
+}
+
+fn extract_ticks_from_bitmap_u256(
+    word_pos: i16,
+    bitmap_bytes: &[u8; 32],
+    tick_spacing: i32,
+) -> Vec<i32> {
+    let mut ticks = Vec::new();
+    for byte_idx in 0..32 {
+        let byte = bitmap_bytes[31 - byte_idx];
+        if byte == 0 {
+            continue;
+        }
+        for bit_in_byte in 0..8u8 {
+            if byte & (1 << bit_in_byte) != 0 {
+                let bit_pos = (byte_idx as u16 * 8) + u16::from(bit_in_byte);
+                let compressed = (i32::from(word_pos) << 8) | i32::from(bit_pos);
+                let tick = compressed * tick_spacing;
+                if (MIN_TICK..=MAX_TICK).contains(&tick) {
+                    ticks.push(tick);
+                }
+            }
+        }
+    }
+    ticks
+}
+
+fn ekubo_tick_to_word_and_index(tick: i32, tick_spacing: i32) -> (u32, u8) {
+    let quotient = if tick < 0 && tick % tick_spacing != 0 {
+        tick / tick_spacing - 1
+    } else {
+        tick / tick_spacing
+    };
+    let raw_index = (i64::from(quotient) + i64::from(EKUBO_BITMAP_OFFSET)) as u32;
+    (raw_index >> 8, (raw_index & 0xff) as u8)
+}
+
+fn ekubo_word_and_index_to_tick(word: u32, index: u8, tick_spacing: i32) -> i32 {
+    let raw_index = i64::from(word) * 256 + i64::from(index);
+    ((raw_index - i64::from(EKUBO_BITMAP_OFFSET)) * i64::from(tick_spacing)) as i32
+}
+
+fn generate_ekubo_word_positions(tick_spacing: i32) -> Option<(u32, u32)> {
+    (tick_spacing > 0).then(|| {
+        let (min_word, _) = ekubo_tick_to_word_and_index(EKUBO_MIN_TICK, tick_spacing);
+        let (max_word, _) = ekubo_tick_to_word_and_index(EKUBO_MAX_TICK, tick_spacing);
+        (min_word, max_word)
+    })
+}
+
+fn extract_ekubo_ticks_from_bitmap(
+    word: u32,
+    bitmap_bytes: &[u8; 32],
+    tick_spacing: i32,
+) -> Vec<i32> {
+    let mut ticks = Vec::new();
+    for byte_idx in 0..32usize {
+        let byte = bitmap_bytes[31 - byte_idx];
+        if byte == 0 {
+            continue;
+        }
+        for bit_in_byte in 0..8u8 {
+            if byte & (1 << bit_in_byte) != 0 {
+                let index = (byte_idx as u8 * 8) + bit_in_byte;
+                let tick = ekubo_word_and_index_to_tick(word, index, tick_spacing);
+                if (EKUBO_MIN_TICK..=EKUBO_MAX_TICK).contains(&tick) {
+                    ticks.push(tick);
+                }
+            }
+        }
+    }
+    ticks
+}
+
+fn decode_tick_liquidity(tick: i32, storage_value: U256) -> Option<(i32, u128, i128)> {
+    let liquidity_gross = (storage_value & U256::from(u128::MAX)).to::<u128>();
+    let liquidity_net_raw = (storage_value >> 128usize).to::<u128>();
+    let liquidity_net = i128::from_be_bytes(liquidity_net_raw.to_be_bytes());
+    Some((tick, liquidity_gross, liquidity_net))
+}
+
+fn decode_ekubo_tick_liquidity(tick: i32, storage_value: U256) -> (i32, u128, i128) {
+    let bytes = storage_value.to_be_bytes::<32>();
+    let liquidity_gross = u128::from_be_bytes({
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&bytes[0..16]);
+        buf
+    });
+    let liquidity_net = i128::from_be_bytes({
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&bytes[16..32]);
+        buf
+    });
+    (tick, liquidity_gross, liquidity_net)
+}
+
+fn read_v3_full_state(
+    state: &dyn StateProvider,
+    address: Address,
+    tick_spacing: i32,
+    factory: Option<Address>,
+) -> Option<TickBitmapSnapshot> {
+    let slots = v3_slots_for_factory(factory);
+    let slot0_raw = read_storage_slot(state, address, U256::from(slots.slot0));
+    if slot0_raw.is_zero() {
+        return None;
+    }
+    let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
+    let liquidity = u256_to_u128_checked(read_storage_slot(
+        state,
+        address,
+        U256::from(slots.liquidity),
+    ))?;
+
+    let mut tick_bitmaps = Vec::new();
+    for word_pos in generate_word_positions(tick_spacing)? {
+        let bitmap = read_storage_slot(state, address, v3_bitmap_slot(word_pos, slots.tick_bitmap));
+        if !bitmap.is_zero() {
+            tick_bitmaps.push((word_pos, bitmap.to_be_bytes::<32>()));
+        }
+    }
+
+    let mut tick_values = Vec::new();
+    for (word_pos, bitmap) in &tick_bitmaps {
+        tick_values.extend(extract_ticks_from_bitmap_u256(
+            *word_pos,
+            bitmap,
+            tick_spacing,
+        ));
+    }
+
+    let mut ticks = Vec::new();
+    for tick_value in tick_values {
+        let value = read_storage_slot(state, address, v3_tick_slot(tick_value, slots.ticks));
+        if !value.is_zero() {
+            ticks.push(decode_tick_liquidity(tick_value, value)?);
+        }
+    }
+
+    Some(TickBitmapSnapshot {
+        sqrt_price_x96,
+        tick,
+        liquidity,
+        ticks,
+        tick_bitmaps,
+    })
+}
+
+fn read_v4_full_state(
+    state: &dyn StateProvider,
+    pool_manager: Address,
+    pool_id: &[u8; 32],
+    tick_spacing: i32,
+) -> Option<TickBitmapSnapshot> {
+    let slot0_raw = read_storage_slot(state, pool_manager, v4_mapping_slot(pool_id, 0));
+    if slot0_raw.is_zero() {
+        return None;
+    }
+    let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
+    let liquidity = u256_to_u128_checked(read_storage_slot(
+        state,
+        pool_manager,
+        v4_mapping_slot(pool_id, 3),
+    ))?;
+
+    let mut tick_bitmaps = Vec::new();
+    for word_pos in generate_word_positions(tick_spacing)? {
+        let bitmap = read_storage_slot(state, pool_manager, v4_bitmap_slot(pool_id, word_pos));
+        if !bitmap.is_zero() {
+            tick_bitmaps.push((word_pos, bitmap.to_be_bytes::<32>()));
+        }
+    }
+
+    let mut tick_values = Vec::new();
+    for (word_pos, bitmap) in &tick_bitmaps {
+        tick_values.extend(extract_ticks_from_bitmap_u256(
+            *word_pos,
+            bitmap,
+            tick_spacing,
+        ));
+    }
+
+    let mut ticks = Vec::new();
+    for tick_value in tick_values {
+        let value = read_storage_slot(state, pool_manager, v4_tick_slot(pool_id, tick_value));
+        if !value.is_zero() {
+            ticks.push(decode_tick_liquidity(tick_value, value)?);
+        }
+    }
+
+    Some(TickBitmapSnapshot {
+        sqrt_price_x96,
+        tick,
+        liquidity,
+        ticks,
+        tick_bitmaps,
+    })
+}
+
+fn read_ekubo_full_state(
+    state: &dyn StateProvider,
+    ekubo_core: Address,
+    pool_id: &[u8; 32],
+    tick_spacing: i32,
+) -> Option<EkuboTickBitmapSnapshot> {
+    let (sqrt_ratio, tick, liquidity) = read_ekubo_state(state, ekubo_core, pool_id)?;
+
+    if tick_spacing == 0 {
+        return Some(EkuboTickBitmapSnapshot {
+            sqrt_ratio,
+            tick,
+            liquidity,
+            ticks: Vec::new(),
+            tick_bitmaps: Vec::new(),
+        });
+    }
+
+    let (min_word, max_word) = generate_ekubo_word_positions(tick_spacing)?;
+    let mut tick_bitmaps = Vec::new();
+    for word in min_word..=max_word {
+        let bitmap = read_storage_slot(state, ekubo_core, ekubo_bitmap_slot(pool_id, word));
+        if !bitmap.is_zero() {
+            tick_bitmaps.push((word, bitmap.to_be_bytes::<32>()));
+        }
+    }
+
+    let mut tick_values = Vec::new();
+    for (word, bitmap) in &tick_bitmaps {
+        tick_values.extend(extract_ekubo_ticks_from_bitmap(*word, bitmap, tick_spacing));
+    }
+
+    let mut ticks = Vec::new();
+    for tick_value in tick_values {
+        let value = read_storage_slot(state, ekubo_core, ekubo_tick_slot(pool_id, tick_value));
+        if !value.is_zero() {
+            ticks.push(decode_ekubo_tick_liquidity(tick_value, value));
+        }
+    }
+
+    Some(EkuboTickBitmapSnapshot {
+        sqrt_ratio,
+        tick,
+        liquidity,
+        ticks,
+        tick_bitmaps,
+    })
+}
+
+fn determine_tier(tick_count: usize, bitmap_count: usize) -> PoolTier {
+    let tick_tier = if tick_count <= 50 {
+        PoolTier::Low
+    } else if tick_count <= 200 {
+        PoolTier::Active
+    } else if tick_count <= 500 {
+        PoolTier::Popular
+    } else {
+        PoolTier::Major
+    };
+    let bitmap_tier = if bitmap_count <= 10 {
+        PoolTier::Low
+    } else if bitmap_count <= 25 {
+        PoolTier::Active
+    } else if bitmap_count <= 50 {
+        PoolTier::Popular
+    } else {
+        PoolTier::Major
+    };
+    tick_tier.max(bitmap_tier)
+}
+
+fn fill_v3_pool<const TICK_CAP: usize, const BITMAP_CAP: usize>(
+    mut data: UniswapV3PoolData<TICK_CAP, BITMAP_CAP>,
+    address: [u8; 20],
+    pool: &PoolMetadata,
+    snapshot: &TickBitmapSnapshot,
+) -> Option<UniswapV3PoolData<TICK_CAP, BITMAP_CAP>> {
+    if snapshot.ticks.len() > TICK_CAP || snapshot.tick_bitmaps.len() > BITMAP_CAP {
+        return None;
+    }
+    data.common.pool_id = address;
+    data.common.is_active.store(true, Ordering::Release);
+    data.token0 = pool.token0.into_array();
+    data.token1 = pool.token1.into_array();
+    data.token0_decimals = pool.token0_decimals?;
+    data.token1_decimals = pool.token1_decimals?;
+    data.fee = pool.fee?;
+    data.tick_spacing = pool.tick_spacing?;
+    data.sqrt_price_x96 = snapshot.sqrt_price_x96;
+    data.tick = snapshot.tick;
+    data.liquidity = snapshot.liquidity;
+    for (i, tick) in snapshot.ticks.iter().enumerate() {
+        data.ticks[i] = *tick;
+    }
+    data.tick_count = snapshot.ticks.len() as u16;
+    for (i, bitmap) in snapshot.tick_bitmaps.iter().enumerate() {
+        data.tick_bitmap[i] = *bitmap;
+    }
+    data.bitmap_count = snapshot.tick_bitmaps.len() as u16;
+    Some(data)
+}
+
+fn build_v3_pool(
+    address: [u8; 20],
+    pool: &PoolMetadata,
+    snapshot: &TickBitmapSnapshot,
+) -> Option<AnyUniswapV3Pool> {
+    match determine_tier(snapshot.ticks.len(), snapshot.tick_bitmaps.len()) {
+        PoolTier::Low => {
+            fill_v3_pool(Default::default(), address, pool, snapshot).map(AnyUniswapV3Pool::Low)
+        }
+        PoolTier::Active => {
+            fill_v3_pool(Default::default(), address, pool, snapshot).map(AnyUniswapV3Pool::Active)
+        }
+        PoolTier::Popular => {
+            fill_v3_pool(Default::default(), address, pool, snapshot).map(AnyUniswapV3Pool::Popular)
+        }
+        PoolTier::Major => {
+            fill_v3_pool(Default::default(), address, pool, snapshot).map(AnyUniswapV3Pool::Major)
+        }
+    }
+}
+
+fn fill_v4_pool<const TICK_CAP: usize, const BITMAP_CAP: usize>(
+    mut data: UniswapV4PoolData<TICK_CAP, BITMAP_CAP>,
+    pool_id: [u8; 32],
+    pool: &PoolMetadata,
+    snapshot: &TickBitmapSnapshot,
+) -> Option<UniswapV4PoolData<TICK_CAP, BITMAP_CAP>> {
+    if snapshot.ticks.len() > TICK_CAP || snapshot.tick_bitmaps.len() > BITMAP_CAP {
+        return None;
+    }
+    data.pool_id = pool_id;
+    data.common.pool_id.copy_from_slice(&pool_id[..20]);
+    data.common.is_active.store(true, Ordering::Release);
+    data.token0 = pool.token0.into_array();
+    data.token1 = pool.token1.into_array();
+    data.token0_decimals = pool.token0_decimals?;
+    data.token1_decimals = pool.token1_decimals?;
+    data.fee = pool.fee?;
+    data.tick_spacing = pool.tick_spacing?;
+    data.sqrt_price_x96 = snapshot.sqrt_price_x96;
+    data.tick = snapshot.tick;
+    data.liquidity = snapshot.liquidity;
+    for (i, tick) in snapshot.ticks.iter().enumerate() {
+        data.ticks[i] = *tick;
+    }
+    data.tick_count = snapshot.ticks.len() as u16;
+    for (i, bitmap) in snapshot.tick_bitmaps.iter().enumerate() {
+        data.tick_bitmap[i] = *bitmap;
+    }
+    data.bitmap_count = snapshot.tick_bitmaps.len() as u16;
+    Some(data)
+}
+
+fn build_v4_pool(
+    pool_id: [u8; 32],
+    pool: &PoolMetadata,
+    snapshot: &TickBitmapSnapshot,
+) -> Option<AnyUniswapV4Pool> {
+    match determine_tier(snapshot.ticks.len(), snapshot.tick_bitmaps.len()) {
+        PoolTier::Low => {
+            fill_v4_pool(Default::default(), pool_id, pool, snapshot).map(AnyUniswapV4Pool::Low)
+        }
+        PoolTier::Active => {
+            fill_v4_pool(Default::default(), pool_id, pool, snapshot).map(AnyUniswapV4Pool::Active)
+        }
+        PoolTier::Popular => {
+            fill_v4_pool(Default::default(), pool_id, pool, snapshot).map(AnyUniswapV4Pool::Popular)
+        }
+        PoolTier::Major => {
+            fill_v4_pool(Default::default(), pool_id, pool, snapshot).map(AnyUniswapV4Pool::Major)
+        }
+    }
+}
+
+fn fill_ekubo_pool<const TICK_CAP: usize, const BITMAP_CAP: usize>(
+    mut data: EkuboPoolData<TICK_CAP, BITMAP_CAP>,
+    pool_id: [u8; 32],
+    pool: &PoolMetadata,
+    snapshot: &EkuboTickBitmapSnapshot,
+) -> Option<EkuboPoolData<TICK_CAP, BITMAP_CAP>> {
+    if snapshot.ticks.len() > TICK_CAP || snapshot.tick_bitmaps.len() > BITMAP_CAP {
+        return None;
+    }
+    data.pool_id = pool_id;
+    data.common.pool_id.copy_from_slice(&pool_id[..20]);
+    data.common.is_active.store(true, Ordering::Release);
+    data.token0 = pool.token0.into_array();
+    data.token1 = pool.token1.into_array();
+    data.token0_decimals = pool.token0_decimals?;
+    data.token1_decimals = pool.token1_decimals?;
+    data.fee = pool.ekubo_fee?;
+    data.tick_spacing = pool.tick_spacing?;
+    data.type_config = pool.ekubo_type_config?;
+    data.sqrt_price_x96 = snapshot.sqrt_ratio;
+    data.tick = snapshot.tick;
+    data.liquidity = snapshot.liquidity;
+    for (i, tick) in snapshot.ticks.iter().enumerate() {
+        data.ticks[i] = *tick;
+    }
+    data.tick_count = snapshot.ticks.len() as u16;
+    for (i, bitmap) in snapshot.tick_bitmaps.iter().enumerate() {
+        data.tick_bitmap[i] = *bitmap;
+    }
+    data.bitmap_count = snapshot.tick_bitmaps.len() as u16;
+    Some(data)
+}
+
+fn build_ekubo_pool(
+    pool_id: [u8; 32],
+    pool: &PoolMetadata,
+    snapshot: &EkuboTickBitmapSnapshot,
+) -> Option<AnyEkuboPool> {
+    match determine_tier(snapshot.ticks.len(), snapshot.tick_bitmaps.len()) {
+        PoolTier::Low => {
+            fill_ekubo_pool(Default::default(), pool_id, pool, snapshot).map(AnyEkuboPool::Low)
+        }
+        PoolTier::Active => {
+            fill_ekubo_pool(Default::default(), pool_id, pool, snapshot).map(AnyEkuboPool::Active)
+        }
+        PoolTier::Popular => {
+            fill_ekubo_pool(Default::default(), pool_id, pool, snapshot).map(AnyEkuboPool::Popular)
+        }
+        PoolTier::Major => {
+            fill_ekubo_pool(Default::default(), pool_id, pool, snapshot).map(AnyEkuboPool::Major)
+        }
+    }
 }
 
 /// Send final slot0 epilogue messages for all affected pools after a reorg.
@@ -2649,8 +3314,13 @@ fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{twocrypto_storage_slots, v2_swap_deltas, TwoCryptoStorageSlots};
+    use super::{
+        determine_tier, extract_ekubo_ticks_from_bitmap, extract_ticks_from_bitmap_u256,
+        twocrypto_storage_slots, v2_swap_deltas, v3_slots_for_factory, TwoCryptoStorageSlots,
+        V3StorageSlots, PANCAKE_V3_FACTORY_ETHEREUM,
+    };
     use alloy_primitives::{I256, U256};
+    use arena_layout::PoolTier;
 
     #[test]
     fn twocrypto_storage_slots_follow_versioned_layouts() {
@@ -2680,6 +3350,48 @@ mod tests {
                 packed_fee_params: 16,
             }
         );
+    }
+
+    #[test]
+    fn v3_storage_slots_follow_factory_layouts() {
+        assert_eq!(
+            v3_slots_for_factory(None),
+            V3StorageSlots {
+                slot0: 0,
+                liquidity: 4,
+                ticks: 5,
+                tick_bitmap: 6,
+            }
+        );
+        assert_eq!(
+            v3_slots_for_factory(Some(PANCAKE_V3_FACTORY_ETHEREUM)),
+            V3StorageSlots {
+                slot0: 0,
+                liquidity: 5,
+                ticks: 6,
+                tick_bitmap: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn tick_bitmap_helpers_extract_initialized_ticks() {
+        let mut bitmap = [0u8; 32];
+        bitmap[31] = 0b0010_0001;
+        assert_eq!(extract_ticks_from_bitmap_u256(0, &bitmap, 60), vec![0, 300]);
+
+        let mut ekubo_bitmap = [0u8; 32];
+        ekubo_bitmap[31] = 0b0000_0001;
+        let ticks = extract_ekubo_ticks_from_bitmap(349_303, &ekubo_bitmap, 10);
+        assert_eq!(ticks, vec![-1_270]);
+    }
+
+    #[test]
+    fn determine_tier_uses_tick_and_bitmap_capacity() {
+        assert_eq!(determine_tier(50, 10), PoolTier::Low);
+        assert_eq!(determine_tier(51, 10), PoolTier::Active);
+        assert_eq!(determine_tier(200, 26), PoolTier::Popular);
+        assert_eq!(determine_tier(501, 51), PoolTier::Major);
     }
 
     #[test]
