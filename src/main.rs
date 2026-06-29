@@ -29,6 +29,7 @@ mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
 use alloy_primitives::{Address, I256, U256};
+use arena_layout::{CurveStablePoolData, CurveTricryptoPoolData, CurveTwoCryptoPoolData};
 use events::{decode_log, fluid_log_operate_pool, DecodedEvent};
 use fluid_decoder::FluidPoolConfig;
 use futures::{StreamExt, TryStreamExt};
@@ -38,16 +39,20 @@ use reth::providers::StateProviderFactory;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
-use shadow_arena::{ShadowArena, V2Hydration};
+use reth_provider::StateProvider;
+use shadow_arena::{
+    CurveStableHydration, CurveTricryptoHydration, CurveTwoCryptoHydration, FluidHydration,
+    ShadowArena, V2Hydration,
+};
 use socket::PoolUpdateSocketServer;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use types::{
     ControlMessage, FluidState, PoolIdentifier, PoolMetadata, PoolUpdate, PoolUpdateMessage,
-    Protocol, ReorgEpilogueUpdate, ReorgRange, Slot0State, UpdateType,
+    Protocol, ReorgEpilogueUpdate, ReorgRange, Slot0State, TokenMetadata, UpdateType,
 };
 
 /// Main ExEx state
@@ -102,7 +107,7 @@ impl LiquidityExEx {
     }
 
     /// Convert a decoded event into a PoolUpdateMessage
-    fn create_pool_update<P: StateProviderFactory>(
+    fn create_pool_update(
         &self,
         event: DecodedEvent,
         block_number: u64,
@@ -110,7 +115,7 @@ impl LiquidityExEx {
         tx_index: u64,
         log_index: u64,
         is_revert: bool,
-        provider: &P,
+        state: &dyn StateProvider,
         _pool_tracker: &PoolTracker,
     ) -> Option<PoolUpdateMessage> {
         match event {
@@ -382,15 +387,7 @@ impl LiquidityExEx {
             // CURVE STABLESWAP-NG EVENTS
             // ============================================================================
             DecodedEvent::CurveSwap { pool } => {
-                let (
-                    effective_balances,
-                    fee,
-                    offpeg_fee_multiplier,
-                    initial_a,
-                    future_a,
-                    initial_a_time,
-                    future_a_time,
-                ) = read_curve_stable_liquidity_state(provider, pool);
+                let curve_state = read_curve_stable_liquidity_state(state, pool);
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::CurveStable,
@@ -401,27 +398,19 @@ impl LiquidityExEx {
                     log_index,
                     is_revert,
                     update: PoolUpdate::CurveLiquidity {
-                        effective_balances,
-                        fee,
-                        offpeg_fee_multiplier,
-                        initial_a,
-                        future_a,
-                        initial_a_time,
-                        future_a_time,
+                        effective_balances: curve_state.effective_balances,
+                        fee: curve_state.fee,
+                        offpeg_fee_multiplier: curve_state.offpeg_fee_multiplier,
+                        initial_a: curve_state.initial_a,
+                        future_a: curve_state.future_a,
+                        initial_a_time: curve_state.initial_a_time,
+                        future_a_time: curve_state.future_a_time,
                     },
                 })
             }
 
             DecodedEvent::CurveLiquidityChange { pool } => {
-                let (
-                    effective_balances,
-                    fee,
-                    offpeg_fee_multiplier,
-                    initial_a,
-                    future_a,
-                    initial_a_time,
-                    future_a_time,
-                ) = read_curve_stable_liquidity_state(provider, pool);
+                let curve_state = read_curve_stable_liquidity_state(state, pool);
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::CurveStable,
@@ -432,13 +421,13 @@ impl LiquidityExEx {
                     log_index,
                     is_revert,
                     update: PoolUpdate::CurveLiquidity {
-                        effective_balances,
-                        fee,
-                        offpeg_fee_multiplier,
-                        initial_a,
-                        future_a,
-                        initial_a_time,
-                        future_a_time,
+                        effective_balances: curve_state.effective_balances,
+                        fee: curve_state.fee,
+                        offpeg_fee_multiplier: curve_state.offpeg_fee_multiplier,
+                        initial_a: curve_state.initial_a,
+                        future_a: curve_state.future_a,
+                        initial_a_time: curve_state.initial_a_time,
+                        future_a_time: curve_state.future_a_time,
                     },
                 })
             }
@@ -502,19 +491,21 @@ impl LiquidityExEx {
                     Protocol::CurveTwoCrypto
                 };
                 let update = if is_tricrypto {
-                    let (balances, packed_price_scale, d) =
-                        read_tricrypto_full_state(provider, pool);
+                    let crypto_state = read_tricrypto_full_state(state, pool);
                     PoolUpdate::TricryptoState {
-                        balances,
-                        packed_price_scale,
-                        d,
+                        balances: crypto_state.balances,
+                        packed_price_scale: crypto_state.packed_price_scale,
+                        d: crypto_state.d,
                     }
                 } else {
-                    let (balances, price_scale, d) = read_twocrypto_full_state(provider, pool);
+                    let version = _pool_tracker
+                        .get_by_address(&pool)
+                        .and_then(|meta| meta.twocrypto_version.as_deref());
+                    let crypto_state = read_twocrypto_full_state(state, pool, version);
                     PoolUpdate::TwoCryptoState {
-                        balances,
-                        price_scale,
-                        d,
+                        balances: crypto_state.balances,
+                        price_scale: crypto_state.price_scale,
+                        d: crypto_state.d,
                     }
                 };
                 Some(PoolUpdateMessage {
@@ -539,19 +530,21 @@ impl LiquidityExEx {
                     Protocol::CurveTwoCrypto
                 };
                 let update = if is_tricrypto {
-                    let (balances, packed_price_scale, d) =
-                        read_tricrypto_full_state(provider, pool);
+                    let crypto_state = read_tricrypto_full_state(state, pool);
                     PoolUpdate::TricryptoState {
-                        balances,
-                        packed_price_scale,
-                        d,
+                        balances: crypto_state.balances,
+                        packed_price_scale: crypto_state.packed_price_scale,
+                        d: crypto_state.d,
                     }
                 } else {
-                    let (balances, price_scale, d) = read_twocrypto_full_state(provider, pool);
+                    let version = _pool_tracker
+                        .get_by_address(&pool)
+                        .and_then(|meta| meta.twocrypto_version.as_deref());
+                    let crypto_state = read_twocrypto_full_state(state, pool, version);
                     PoolUpdate::TwoCryptoState {
-                        balances,
-                        price_scale,
-                        d,
+                        balances: crypto_state.balances,
+                        price_scale: crypto_state.price_scale,
+                        d: crypto_state.d,
                     }
                 };
                 Some(PoolUpdateMessage {
@@ -658,7 +651,7 @@ impl LiquidityExEx {
             // CURVE TRICRYPTO EVENTS (unique signatures)
             // ============================================================================
             DecodedEvent::TricryptoLiquidityChange { pool } => {
-                let (balances, packed_price_scale, d) = read_tricrypto_full_state(provider, pool);
+                let crypto_state = read_tricrypto_full_state(state, pool);
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::CurveTricrypto,
@@ -669,9 +662,9 @@ impl LiquidityExEx {
                     log_index,
                     is_revert,
                     update: PoolUpdate::TricryptoState {
-                        balances,
-                        packed_price_scale,
-                        d,
+                        balances: crypto_state.balances,
+                        packed_price_scale: crypto_state.packed_price_scale,
+                        d: crypto_state.d,
                     },
                 })
             }
@@ -928,14 +921,6 @@ impl LiquidityExEx {
     }
 }
 
-/// TwoCryptoNG D slot (Vyper 0.4.1 layout).
-///   slot 9  = balances[0]
-///   slot 10 = balances[1]
-///   slot 11 = D              ← correct
-///   slot 14 = virtual_price  ← was incorrectly used before fix
-/// Matches scrape_reth/src/twocrypto_storage.rs slots::D = 11.
-const TWOCRYPTO_D_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
-
 /// TricryptoNG D slot (Vyper 0.3.10 layout — different from TwoCrypto).
 ///   slot 11 = balances[0]   ← NOT D
 ///   slot 12 = balances[1]
@@ -945,27 +930,23 @@ const TWOCRYPTO_D_SLOT: U256 = U256::from_limbs([11, 0, 0, 0]);
 /// Matches scrape_reth/src/tricrypto_storage.rs slots::D = 14.
 const TRICRYPTO_D_SLOT: U256 = U256::from_limbs([14, 0, 0, 0]);
 
-/// Read a single storage slot from the state at a given block.
+/// Read a single storage slot from a held state snapshot.
 ///
-/// Returns `U256::ZERO` if the slot is empty or the read fails.
-fn read_storage_slot<P: StateProviderFactory>(provider: &P, address: Address, slot: U256) -> U256 {
+/// Returns `U256::ZERO` if the slot is empty or the read fails. Callers choose
+/// the snapshot once (startup anchor, block post-state, or final reorg tip) and
+/// then thread it through all per-protocol readers; no reader re-fetches
+/// `latest()` internally.
+fn read_storage_slot(state: &dyn StateProvider, address: Address, slot: U256) -> U256 {
     use alloy_primitives::B256;
-    use reth_provider::StateProvider;
     let slot_key: B256 = B256::from(slot);
-    match provider.latest() {
-        Ok(state) => match state.storage(address, slot_key.into()) {
-            Ok(Some(value)) => value,
-            Ok(None) => U256::ZERO,
-            Err(e) => {
-                warn!(
-                    "Failed to read storage slot {} for {:?}: {}",
-                    slot, address, e
-                );
-                U256::ZERO
-            }
-        },
+    match state.storage(address, slot_key) {
+        Ok(Some(value)) => value,
+        Ok(None) => U256::ZERO,
         Err(e) => {
-            warn!("Failed to get latest state provider: {}", e);
+            warn!(
+                "Failed to read storage slot {} for {:?}: {}",
+                slot, address, e
+            );
             U256::ZERO
         }
     }
@@ -973,39 +954,274 @@ fn read_storage_slot<P: StateProviderFactory>(provider: &P, address: Address, sl
 
 /// Read a UniswapV2Pair's `(reserve0, reserve1)` from storage slot 8 of a held
 /// state snapshot. Slot 8 packs `reserve0 (112) | reserve1 (112) | ts (32)`.
-fn read_v2_reserves(state: &dyn reth_provider::StateProvider, address: Address) -> (u128, u128) {
-    use alloy_primitives::B256;
-    let slot8: B256 = B256::from(U256::from(8u64));
-    let packed: U256 = match state.storage(address, slot8) {
-        Ok(Some(v)) => v,
-        _ => U256::ZERO,
-    };
+fn read_v2_reserves(state: &dyn StateProvider, address: Address) -> (u128, u128) {
+    let packed = read_storage_slot(state, address, U256::from(8u64));
     let mask112: U256 = (U256::from(1u64) << 112usize) - U256::from(1u64);
     let reserve0 = (packed & mask112).to::<u128>();
     let reserve1 = ((packed >> 112usize) & mask112).to::<u128>();
     (reserve0, reserve1)
 }
 
-/// 3b-1: hydrate the shadow arena's V2 slots from the rich startup snapshot,
-/// frozen at the current tip (decimals come from the whitelist, reserves from
-/// chain state). V2 only for now; other protocols follow in 3b-2+. No-op when
-/// the shadow writer is disabled.
+fn pool_address(pool: &PoolMetadata) -> Option<Address> {
+    pool.pool_id.as_address()
+}
+
+fn pool_tokens(pool: &PoolMetadata) -> Option<Vec<TokenMetadata>> {
+    let mut tokens = Vec::with_capacity(2 + pool.extra_tokens.len());
+    tokens.push(TokenMetadata {
+        address: pool.token0,
+        decimals: pool.token0_decimals?,
+    });
+    tokens.push(TokenMetadata {
+        address: pool.token1,
+        decimals: pool.token1_decimals?,
+    });
+    tokens.extend(pool.extra_tokens.iter().cloned());
+    Some(tokens)
+}
+
+fn pow10_u128(exp: u32) -> Option<u128> {
+    10u128.checked_pow(exp)
+}
+
+fn stable_rate_multiplier(decimals: u8) -> Option<u128> {
+    (decimals <= 36).then_some(())?;
+    pow10_u128(u32::from(36 - decimals))
+}
+
+fn crypto_precision(decimals: u8) -> Option<u128> {
+    (decimals <= 18).then_some(())?;
+    pow10_u128(u32::from(18 - decimals))
+}
+
+fn u256_to_u128_checked(value: U256) -> Option<u128> {
+    (value <= U256::from(u128::MAX)).then(|| value.to::<u128>())
+}
+
+fn unpack_packed_a_gamma(packed: U256) -> Option<(u64, u128)> {
+    let mask128 = U256::from(u128::MAX);
+    let gamma = (packed & mask128).to::<u128>();
+    let a: U256 = packed >> 128usize;
+    (a <= U256::from(u64::MAX)).then(|| (a.to::<u64>(), gamma))
+}
+
+fn unpack_packed_fee_params(packed: U256) -> (u64, u64, u128) {
+    let mask64 = U256::from(u64::MAX);
+    let fee_gamma = (packed & mask64).to::<u128>();
+    let out_fee = ((packed >> 64usize) & mask64).to::<u64>();
+    let mid_fee = ((packed >> 128usize) & mask64).to::<u64>();
+    (mid_fee, out_fee, fee_gamma)
+}
+
+fn v2_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<V2Hydration> {
+    let addr = pool_address(pool)?;
+    let (reserve0, reserve1) = read_v2_reserves(state, addr);
+    Some(V2Hydration {
+        address: addr.into_array(),
+        token0: pool.token0.into_array(),
+        token1: pool.token1.into_array(),
+        reserve0,
+        reserve1,
+        token0_decimals: pool.token0_decimals?,
+        token1_decimals: pool.token1_decimals?,
+    })
+}
+
+fn curve_stable_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<CurveStableHydration> {
+    let addr = pool_address(pool)?;
+    let tokens = pool_tokens(pool)?;
+    let scraped = read_curve_stable_liquidity_state(state, addr);
+    let n = scraped.effective_balances.len();
+    if n == 0 || tokens.len() < n {
+        warn!(pool = %addr, n_coins = n, tokens = tokens.len(), "Skipping CurveStable hydration: incomplete token metadata");
+        return None;
+    }
+
+    let mut data = CurveStablePoolData::default();
+    data.n_coins = n as u8;
+    data.fee = scraped.fee;
+    data.offpeg_fee_multiplier = scraped.offpeg_fee_multiplier;
+    data.initial_a = scraped.initial_a;
+    data.future_a = scraped.future_a;
+    data.initial_a_time = scraped.initial_a_time;
+    data.future_a_time = scraped.future_a_time;
+    for (i, balance) in scraped.effective_balances.iter().enumerate() {
+        data.balances[i] = *balance;
+        data.coins[i] = tokens[i].address.into_array();
+        data.rate_multipliers[i] = match stable_rate_multiplier(tokens[i].decimals) {
+            Some(v) => v,
+            None => {
+                warn!(pool = %addr, decimals = tokens[i].decimals, "Skipping CurveStable hydration: invalid token decimals");
+                return None;
+            }
+        };
+    }
+
+    Some(CurveStableHydration {
+        address: addr.into_array(),
+        pool: data,
+    })
+}
+
+fn curve_twocrypto_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<CurveTwoCryptoHydration> {
+    let addr = pool_address(pool)?;
+    let tokens = pool_tokens(pool)?;
+    if tokens.len() < 2 {
+        return None;
+    }
+    let scraped = read_twocrypto_full_state(state, addr, pool.twocrypto_version.as_deref());
+    let (initial_a, initial_gamma) = unpack_packed_a_gamma(scraped.initial_a_gamma)?;
+    let (future_a, future_gamma) = unpack_packed_a_gamma(scraped.future_a_gamma)?;
+    let (mid_fee, out_fee, fee_gamma) = unpack_packed_fee_params(scraped.packed_fee_params);
+
+    let mut data = CurveTwoCryptoPoolData::default();
+    data.balances = scraped.balances;
+    data.price_scale = u256_to_u128_checked(scraped.price_scale)?;
+    data.d = u256_to_u128_checked(scraped.d)?;
+    data.initial_a = initial_a;
+    data.initial_gamma = initial_gamma;
+    data.future_a = future_a;
+    data.future_gamma = future_gamma;
+    data.initial_a_gamma_time = scraped.initial_a_gamma_time;
+    data.future_a_gamma_time = scraped.future_a_gamma_time;
+    data.mid_fee = mid_fee;
+    data.out_fee = out_fee;
+    data.fee_gamma = fee_gamma;
+    data.coins = [
+        tokens[0].address.into_array(),
+        tokens[1].address.into_array(),
+    ];
+    data.precisions = [
+        crypto_precision(tokens[0].decimals)?,
+        crypto_precision(tokens[1].decimals)?,
+    ];
+
+    Some(CurveTwoCryptoHydration {
+        address: addr.into_array(),
+        pool: data,
+    })
+}
+
+fn curve_tricrypto_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<CurveTricryptoHydration> {
+    let addr = pool_address(pool)?;
+    let tokens = pool_tokens(pool)?;
+    if tokens.len() < 3 {
+        warn!(pool = %addr, tokens = tokens.len(), "Skipping CurveTricrypto hydration: missing extra token metadata");
+        return None;
+    }
+    let scraped = read_tricrypto_full_state(state, addr);
+    let (initial_a, initial_gamma) = unpack_packed_a_gamma(scraped.initial_a_gamma)?;
+    let (future_a, future_gamma) = unpack_packed_a_gamma(scraped.future_a_gamma)?;
+    let (mid_fee, out_fee, fee_gamma) = unpack_packed_fee_params(scraped.packed_fee_params);
+    let mask128 = U256::from(u128::MAX);
+
+    let mut data = CurveTricryptoPoolData::default();
+    data.balances = scraped.balances;
+    data.price_scale = [
+        u256_to_u128_checked(scraped.packed_price_scale & mask128)?,
+        u256_to_u128_checked(scraped.packed_price_scale >> 128usize)?,
+    ];
+    data.d = u256_to_u128_checked(scraped.d)?;
+    data.initial_a = initial_a;
+    data.initial_gamma = initial_gamma;
+    data.future_a = future_a;
+    data.future_gamma = future_gamma;
+    data.initial_a_gamma_time = scraped.initial_a_gamma_time;
+    data.future_a_gamma_time = scraped.future_a_gamma_time;
+    data.mid_fee = mid_fee;
+    data.out_fee = out_fee;
+    data.fee_gamma = fee_gamma;
+    data.coins = [
+        tokens[0].address.into_array(),
+        tokens[1].address.into_array(),
+        tokens[2].address.into_array(),
+    ];
+    data.precisions = [
+        crypto_precision(tokens[0].decimals)?,
+        crypto_precision(tokens[1].decimals)?,
+        crypto_precision(tokens[2].decimals)?,
+    ];
+
+    Some(CurveTricryptoHydration {
+        address: addr.into_array(),
+        pool: data,
+    })
+}
+
+fn fluid_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+    configs: &HashMap<Address, FluidPoolConfig>,
+    block_timestamp: u64,
+) -> Option<FluidHydration> {
+    let addr = pool_address(pool)?;
+    let config = configs.get(&addr)?;
+    let reserves = decode_fluid_pool(state, config, block_timestamp)?;
+    let fee = u32::try_from(reserves.fee).ok()?;
+    Some(FluidHydration {
+        address: addr.into_array(),
+        token0: pool.token0.into_array(),
+        token1: pool.token1.into_array(),
+        token0_decimals: pool.token0_decimals?,
+        token1_decimals: pool.token1_decimals?,
+        col_token0_real: reserves.col_token0_real_reserves,
+        col_token1_real: reserves.col_token1_real_reserves,
+        col_token0_imaginary: reserves.col_token0_imaginary_reserves,
+        col_token1_imaginary: reserves.col_token1_imaginary_reserves,
+        debt_token0_real: reserves.debt_token0_real_reserves,
+        debt_token1_real: reserves.debt_token1_real_reserves,
+        debt_token0_imaginary: reserves.debt_token0_imaginary_reserves,
+        debt_token1_imaginary: reserves.debt_token1_imaginary_reserves,
+        center_price: reserves.center_price,
+        fee,
+    })
+}
+
+/// 3b startup hydration: hydrate shadow arena slots from the rich startup
+/// snapshot, frozen at one anchor. Decimals/token metadata come from the
+/// whitelist; reserves and dynamic Curve/Fluid state come from a single held
+/// `history_by_block_number(anchor)` snapshot. No-op when the shadow writer is
+/// disabled.
 fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
     ctx: &ExExContext<Node>,
     pools: &[PoolMetadata],
+    fluid_configs: &HashMap<Address, FluidPoolConfig>,
     shadow: Option<&mut ShadowArena>,
 ) {
-    use reth_provider::BlockNumReader;
+    use reth_provider::{BlockNumReader, HeaderProvider};
     let Some(shadow) = shadow else {
         return;
     };
     // Pin the anchor block first, then read state pinned to that exact block, so
-    // reserves and the recorded `scraped_at_block` come from one snapshot — the
-    // frozen-anchor invariant the 3c replay guard relies on.
+    // all hydrated protocols and the recorded `scraped_at_block` come from one
+    // snapshot — the frozen-anchor invariant the 3c replay guard relies on.
     let anchor = match ctx.provider().best_block_number() {
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "shadow hydration: no best block number");
+            return;
+        }
+    };
+    let anchor_timestamp = match ctx.provider().header_by_number(anchor) {
+        Ok(Some(header)) => header.timestamp(),
+        Ok(None) => {
+            warn!(anchor, "shadow hydration: no header at anchor block");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, anchor, "shadow hydration: failed to read anchor header");
             return;
         }
     };
@@ -1020,82 +1236,196 @@ fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
     let v2: Vec<V2Hydration> = pools
         .iter()
         .filter(|p| p.protocol == Protocol::UniswapV2)
+        .filter_map(|p| v2_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
+    let curve_stable: Vec<CurveStableHydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::CurveStable)
+        .filter_map(|p| curve_stable_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
+    let curve_twocrypto: Vec<CurveTwoCryptoHydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::CurveTwoCrypto)
+        .filter_map(|p| curve_twocrypto_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
+    let curve_tricrypto: Vec<CurveTricryptoHydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::CurveTricrypto)
+        .filter_map(|p| curve_tricrypto_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
+    let fluid: Vec<FluidHydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::Fluid)
         .filter_map(|p| {
-            let addr = p.pool_id.as_address()?;
-            let (reserve0, reserve1) = read_v2_reserves(state.as_ref(), addr);
-            Some(V2Hydration {
-                address: addr.into_array(),
-                token0: p.token0.into_array(),
-                token1: p.token1.into_array(),
-                reserve0,
-                reserve1,
-                token0_decimals: p.token0_decimals?,
-                token1_decimals: p.token1_decimals?,
-            })
+            fluid_hydration_from_snapshot(state.as_ref(), p, fluid_configs, anchor_timestamp)
         })
         .collect();
 
-    let created = shadow.hydrate_v2(anchor, &v2);
-    info!(created, anchor, "shadow arena: hydrated V2 slots");
+    let counts = shadow.hydrate_startup(
+        anchor,
+        &v2,
+        &curve_stable,
+        &curve_twocrypto,
+        &curve_tricrypto,
+        &fluid,
+    );
+    info!(?counts, anchor, "shadow arena: hydrated startup slots");
 }
 
-fn read_twocrypto_full_state<P: StateProviderFactory>(
-    provider: &P,
+#[derive(Debug, Clone)]
+struct TwoCryptoSnapshot {
+    balances: [u128; 2],
+    price_scale: U256,
+    d: U256,
+    initial_a_gamma: U256,
+    initial_a_gamma_time: u64,
+    future_a_gamma: U256,
+    future_a_gamma_time: u64,
+    packed_fee_params: U256,
+}
+
+#[derive(Debug, Clone)]
+struct TricryptoSnapshot {
+    balances: [u128; 3],
+    packed_price_scale: U256,
+    d: U256,
+    initial_a_gamma: U256,
+    initial_a_gamma_time: u64,
+    future_a_gamma: U256,
+    future_a_gamma_time: u64,
+    packed_fee_params: U256,
+}
+
+#[derive(Debug, Clone)]
+struct CurveStableSnapshot {
+    effective_balances: Vec<u128>,
+    fee: u64,
+    offpeg_fee_multiplier: u64,
+    initial_a: u64,
+    future_a: u64,
+    initial_a_time: u64,
+    future_a_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TwoCryptoStorageSlots {
+    initial_a_gamma: u64,
+    initial_a_gamma_time: u64,
+    future_a_gamma: u64,
+    future_a_gamma_time: u64,
+    balance_0: u64,
+    balance_1: u64,
+    d: u64,
+    packed_fee_params: u64,
+}
+
+fn twocrypto_storage_slots(version: Option<&str>) -> TwoCryptoStorageSlots {
+    // Mirrors scrape_reth::twocrypto_storage: v2.0.0 uses a legacy layout;
+    // None and all newer versions default to the v2.1.x Vyper 0.4.1 layout.
+    if version == Some("v2.0.0") {
+        TwoCryptoStorageSlots {
+            initial_a_gamma: 8,
+            initial_a_gamma_time: 20,
+            future_a_gamma: 10,
+            future_a_gamma_time: 20,
+            balance_0: 12,
+            balance_1: 13,
+            d: 14,
+            packed_fee_params: 16,
+        }
+    } else {
+        TwoCryptoStorageSlots {
+            initial_a_gamma: 5,
+            initial_a_gamma_time: 6,
+            future_a_gamma: 7,
+            future_a_gamma_time: 8,
+            balance_0: 9,
+            balance_1: 10,
+            d: 11,
+            packed_fee_params: 16,
+        }
+    }
+}
+
+fn read_twocrypto_full_state(
+    state: &dyn StateProvider,
     address: Address,
-) -> ([u128; 2], U256, U256) {
+    version: Option<&str>,
+) -> TwoCryptoSnapshot {
+    let slots = twocrypto_storage_slots(version);
     let balances = [
-        read_storage_slot(provider, address, U256::from_limbs([9, 0, 0, 0])).to::<u128>(),
-        read_storage_slot(provider, address, U256::from_limbs([10, 0, 0, 0])).to::<u128>(),
+        read_storage_slot(state, address, U256::from(slots.balance_0)).to::<u128>(),
+        read_storage_slot(state, address, U256::from(slots.balance_1)).to::<u128>(),
     ];
-    let price_scale = read_storage_slot(provider, address, U256::from_limbs([1, 0, 0, 0]));
-    let d = read_storage_slot(provider, address, TWOCRYPTO_D_SLOT);
-    (balances, price_scale, d)
+    let price_scale = read_storage_slot(state, address, U256::from(1u64));
+    let d = read_storage_slot(state, address, U256::from(slots.d));
+    let initial_a_gamma = read_storage_slot(state, address, U256::from(slots.initial_a_gamma));
+    let initial_a_gamma_time =
+        read_storage_slot(state, address, U256::from(slots.initial_a_gamma_time)).to::<u64>();
+    let future_a_gamma = read_storage_slot(state, address, U256::from(slots.future_a_gamma));
+    let future_a_gamma_time =
+        read_storage_slot(state, address, U256::from(slots.future_a_gamma_time)).to::<u64>();
+    let packed_fee_params = read_storage_slot(state, address, U256::from(slots.packed_fee_params));
+    TwoCryptoSnapshot {
+        balances,
+        price_scale,
+        d,
+        initial_a_gamma,
+        initial_a_gamma_time,
+        future_a_gamma,
+        future_a_gamma_time,
+        packed_fee_params,
+    }
 }
 
-fn read_tricrypto_full_state<P: StateProviderFactory>(
-    provider: &P,
-    address: Address,
-) -> ([u128; 3], U256, U256) {
+fn read_tricrypto_full_state(state: &dyn StateProvider, address: Address) -> TricryptoSnapshot {
     let balances = [
-        read_storage_slot(provider, address, U256::from_limbs([11, 0, 0, 0])).to::<u128>(),
-        read_storage_slot(provider, address, U256::from_limbs([12, 0, 0, 0])).to::<u128>(),
-        read_storage_slot(provider, address, U256::from_limbs([13, 0, 0, 0])).to::<u128>(),
+        read_storage_slot(state, address, U256::from(11u64)).to::<u128>(),
+        read_storage_slot(state, address, U256::from(12u64)).to::<u128>(),
+        read_storage_slot(state, address, U256::from(13u64)).to::<u128>(),
     ];
-    let packed_price_scale = read_storage_slot(provider, address, U256::from_limbs([3, 0, 0, 0]));
-    let d = read_storage_slot(provider, address, TRICRYPTO_D_SLOT);
-    (balances, packed_price_scale, d)
+    let packed_price_scale = read_storage_slot(state, address, U256::from(3u64));
+    let d = read_storage_slot(state, address, TRICRYPTO_D_SLOT);
+    let initial_a_gamma = read_storage_slot(state, address, U256::from(7u64));
+    let initial_a_gamma_time = read_storage_slot(state, address, U256::from(8u64)).to::<u64>();
+    let future_a_gamma = read_storage_slot(state, address, U256::from(9u64));
+    let future_a_gamma_time = read_storage_slot(state, address, U256::from(10u64)).to::<u64>();
+    let packed_fee_params = read_storage_slot(state, address, U256::from(20u64));
+    TricryptoSnapshot {
+        balances,
+        packed_price_scale,
+        d,
+        initial_a_gamma,
+        initial_a_gamma_time,
+        future_a_gamma,
+        future_a_gamma_time,
+        packed_fee_params,
+    }
 }
 
-fn read_curve_stable_liquidity_state<P: StateProviderFactory>(
-    provider: &P,
+fn read_curve_stable_liquidity_state(
+    state: &dyn StateProvider,
     address: Address,
-) -> (Vec<u128>, u64, u64, u64, u64, u64, u64) {
-    let n_coins = read_storage_slot(provider, address, U256::from(1u64)).to::<usize>();
+) -> CurveStableSnapshot {
+    let n_coins = read_storage_slot(state, address, U256::from(1u64)).to::<usize>();
     let n_coins = n_coins.min(8);
 
     let mut effective_balances = Vec::with_capacity(n_coins);
     for i in 0..n_coins {
-        let stored = read_storage_slot(provider, address, U256::from((2 + i) as u64)).to::<u128>();
-        let admin = read_storage_slot(provider, address, U256::from((17 + i) as u64)).to::<u128>();
+        let stored = read_storage_slot(state, address, U256::from((2 + i) as u64)).to::<u128>();
+        let admin = read_storage_slot(state, address, U256::from((17 + i) as u64)).to::<u128>();
         effective_balances.push(stored.saturating_sub(admin));
     }
 
-    let fee = read_storage_slot(provider, address, U256::from(10u64)).to::<u64>();
-    let offpeg_fee_multiplier = read_storage_slot(provider, address, U256::from(11u64)).to::<u64>();
-    let initial_a = read_storage_slot(provider, address, U256::from(12u64)).to::<u64>();
-    let future_a = read_storage_slot(provider, address, U256::from(13u64)).to::<u64>();
-    let initial_a_time = read_storage_slot(provider, address, U256::from(14u64)).to::<u64>();
-    let future_a_time = read_storage_slot(provider, address, U256::from(15u64)).to::<u64>();
-
-    (
+    CurveStableSnapshot {
         effective_balances,
-        fee,
-        offpeg_fee_multiplier,
-        initial_a,
-        future_a,
-        initial_a_time,
-        future_a_time,
-    )
+        fee: read_storage_slot(state, address, U256::from(10u64)).to::<u64>(),
+        offpeg_fee_multiplier: read_storage_slot(state, address, U256::from(11u64)).to::<u64>(),
+        initial_a: read_storage_slot(state, address, U256::from(12u64)).to::<u64>(),
+        future_a: read_storage_slot(state, address, U256::from(13u64)).to::<u64>(),
+        initial_a_time: read_storage_slot(state, address, U256::from(14u64)).to::<u64>(),
+        future_a_time: read_storage_slot(state, address, U256::from(15u64)).to::<u64>(),
+    }
 }
 
 /// V3 storage slots.
@@ -1150,8 +1480,8 @@ fn v4_pool_base_slot(pool_id: &[u8; 32]) -> U256 {
     U256::from_be_bytes(*keccak256(&encoded))
 }
 
-fn read_v3_liquidity<P: StateProviderFactory>(provider: &P, address: Address) -> u128 {
-    let liquidity_raw = read_storage_slot(provider, address, V3_LIQUIDITY_VANILLA);
+fn read_v3_liquidity(state: &dyn StateProvider, address: Address) -> u128 {
+    let liquidity_raw = read_storage_slot(state, address, V3_LIQUIDITY_VANILLA);
 
     // Vanilla Uniswap V3-compatible pools store a plain uint128 at slot 4.
     if (liquidity_raw >> 128usize).is_zero() {
@@ -1161,27 +1491,24 @@ fn read_v3_liquidity<P: StateProviderFactory>(provider: &P, address: Address) ->
     // PancakeSwap V3 on Ethereum packs protocolFees into slot 4 and stores
     // liquidity at slot 5 instead. Minimal whitelist updates do not preserve
     // factory metadata, so reorg overrides need this runtime fallback.
-    let pancake_liquidity_raw = read_storage_slot(provider, address, V3_LIQUIDITY_PANCAKE);
+    let pancake_liquidity_raw = read_storage_slot(state, address, V3_LIQUIDITY_PANCAKE);
     pancake_liquidity_raw.to::<u128>()
 }
 
-/// Read slot0 override for a V3 pool from latest state.
-fn read_v3_slot0<P: StateProviderFactory>(
-    provider: &P,
-    address: Address,
-) -> Option<(U256, i32, u128)> {
-    let slot0_raw = read_storage_slot(provider, address, V3_SLOT0);
+/// Read slot0 override for a V3 pool from a held state snapshot.
+fn read_v3_slot0(state: &dyn StateProvider, address: Address) -> Option<(U256, i32, u128)> {
+    let slot0_raw = read_storage_slot(state, address, V3_SLOT0);
     if slot0_raw.is_zero() {
         return None;
     }
     let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
-    let liquidity = read_v3_liquidity(provider, address);
+    let liquidity = read_v3_liquidity(state, address);
     Some((sqrt_price_x96, tick, liquidity))
 }
 
-/// Read slot0 override for a V4 pool from latest state.
-fn read_v4_slot0<P: StateProviderFactory>(
-    provider: &P,
+/// Read slot0 override for a V4 pool from a held state snapshot.
+fn read_v4_slot0(
+    state: &dyn StateProvider,
     pool_manager: Address,
     pool_id: &[u8; 32],
 ) -> Option<(U256, i32, u128)> {
@@ -1190,25 +1517,25 @@ fn read_v4_slot0<P: StateProviderFactory>(
     let slot0_key = U256::from_be_bytes(base.to_be_bytes::<32>());
     let liquidity_key = slot0_key + U256::from(3);
 
-    let slot0_raw = read_storage_slot(provider, pool_manager, slot0_key);
+    let slot0_raw = read_storage_slot(state, pool_manager, slot0_key);
     if slot0_raw.is_zero() {
         return None;
     }
     let (sqrt_price_x96, tick) = decode_slot0_packed(slot0_raw);
-    let liquidity_raw = read_storage_slot(provider, pool_manager, liquidity_key);
+    let liquidity_raw = read_storage_slot(state, pool_manager, liquidity_key);
     let liquidity = liquidity_raw.to::<u128>();
     Some((sqrt_price_x96, tick, liquidity))
 }
 
-/// Read state for an Ekubo pool from latest state.
-fn read_ekubo_state<P: StateProviderFactory>(
-    provider: &P,
+/// Read state for an Ekubo pool from a held state snapshot.
+fn read_ekubo_state(
+    state: &dyn StateProvider,
     ekubo_core: Address,
     pool_id: &[u8; 32],
 ) -> Option<(U256, i32, u128)> {
     use alloy_primitives::B256;
     let state_slot = U256::from_be_bytes(*B256::from_slice(pool_id));
-    let state_raw = read_storage_slot(provider, ekubo_core, state_slot);
+    let state_raw = read_storage_slot(state, ekubo_core, state_slot);
     if state_raw.is_zero() {
         return None;
     }
@@ -1218,10 +1545,10 @@ fn read_ekubo_state<P: StateProviderFactory>(
 
 /// Send final slot0 epilogue messages for all affected pools after a reorg.
 ///
-/// Reads definitive post-reorg state from `latest()` storage and sends
+/// Reads definitive post-reorg state from one held final-tip snapshot and sends
 /// epilogue messages as the sole slot0 recovery mechanism.
-fn send_slot0_finals<P: StateProviderFactory>(
-    provider: &P,
+fn send_slot0_finals(
+    state: &dyn StateProvider,
     affected_pools: &HashSet<(PoolIdentifier, Protocol)>,
     exex: &LiquidityExEx,
     stream_seq: &mut u64,
@@ -1235,12 +1562,12 @@ fn send_slot0_finals<P: StateProviderFactory>(
 
     for (pool_id, protocol) in affected_pools {
         let slot0 = match (pool_id, protocol) {
-            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => read_v3_slot0(provider, *addr),
+            (PoolIdentifier::Address(addr), Protocol::UniswapV3) => read_v3_slot0(state, *addr),
             (PoolIdentifier::PoolId(id), Protocol::UniswapV4) => {
-                read_v4_slot0(provider, UNISWAP_V4_POOL_MANAGER, id)
+                read_v4_slot0(state, UNISWAP_V4_POOL_MANAGER, id)
             }
             (PoolIdentifier::PoolId(id), Protocol::Ekubo) => {
-                read_ekubo_state(provider, EKUBO_CORE, id)
+                read_ekubo_state(state, EKUBO_CORE, id)
             }
             _ => continue,
         };
@@ -1290,6 +1617,16 @@ fn record_affected_slot0_pool(
     if dominated_by_slot0 {
         affected.insert((event.pool_id.clone(), event.protocol));
     }
+}
+
+fn state_at_block<P: StateProviderFactory>(
+    provider: &P,
+    block_number: u64,
+    context: &str,
+) -> eyre::Result<reth_provider::StateProviderBox> {
+    provider
+        .history_by_block_number(block_number)
+        .map_err(|e| eyre::eyre!("{context}: failed to open state at block {block_number}: {e}"))
 }
 
 /// Main ExEx entry point
@@ -1398,26 +1735,53 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     continue;
                 }
 
-                // 3b-1: hydrate the shadow arena's V2 slots from this snapshot.
-                hydrate_shadow_from_snapshot(&ctx, &pools, exex.shadow.as_mut());
+                let fluid_addrs: Vec<Address> = pools
+                    .iter()
+                    .filter(|p| p.protocol == Protocol::Fluid)
+                    .filter_map(|p| p.pool_id.as_address())
+                    .collect();
+                let rpc_url = std::env::var("RPC_URL")
+                    .unwrap_or_else(|_| "http://localhost:8545".to_string());
+                let startup_fluid_configs = if exex.shadow.is_some() && !fluid_addrs.is_empty() {
+                    resolve_fluid_config_batch(fluid_addrs.clone(), &rpc_url).await
+                } else {
+                    Vec::new()
+                };
+                let fluid_config_map: HashMap<Address, FluidPoolConfig> = startup_fluid_configs
+                    .iter()
+                    .cloned()
+                    .map(|config| (config.pool_address, config))
+                    .collect();
+
+                // 3b: hydrate shadow arena slots from one frozen startup anchor.
+                hydrate_shadow_from_snapshot(&ctx, &pools, &fluid_config_map, exex.shadow.as_mut());
 
                 let update = crate::pool_tracker::WhitelistUpdate::Replace(pools);
-
-                // Extract Fluid pool addresses for config resolution
-                let fluid_addrs = extract_fluid_addresses(&update);
-                exex.pool_tracker.write().await.queue_update(update);
+                {
+                    let mut tracker = exex.pool_tracker.write().await;
+                    tracker.queue_update(update);
+                    for config in startup_fluid_configs.iter().cloned() {
+                        tracker.register_fluid_config(config);
+                    }
+                }
                 info!(
                     pools = pool_count,
                     "✅ Applied rich startup whitelist snapshot"
                 );
 
-                // Resolve configs for Fluid pools from startup snapshot
-                if !fluid_addrs.is_empty() {
-                    let rpc_url = std::env::var("RPC_URL")
-                        .unwrap_or_else(|_| "http://localhost:8545".to_string());
+                // Resolve any Fluid configs not already needed/resolved for shadow hydration.
+                let resolved_fluid: HashSet<Address> = startup_fluid_configs
+                    .iter()
+                    .map(|config| config.pool_address)
+                    .collect();
+                let unresolved_fluid: Vec<Address> = fluid_addrs
+                    .into_iter()
+                    .filter(|addr| !resolved_fluid.contains(addr))
+                    .collect();
+                if !unresolved_fluid.is_empty() {
                     let pt = exex.pool_tracker.clone();
                     tokio::spawn(async move {
-                        resolve_fluid_configs(fluid_addrs, &rpc_url, pt).await;
+                        resolve_fluid_configs(unresolved_fluid, &rpc_url, pt).await;
                     });
                 }
 
@@ -1515,6 +1879,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     );
 
                     let pool_tracker = exex.pool_tracker.read().await;
+                    let state = state_at_block(ctx.provider(), block_number, "ChainCommitted")?;
                     let mut events_in_block = 0;
                     let mut logs_checked = 0;
                     let mut logs_matched_address = 0;
@@ -1571,7 +1936,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 false,
-                                ctx.provider(),
+                                state.as_ref(),
                                 &pool_tracker,
                             ) {
                                 exex.send_pool_update(&mut stream_seq, update_msg);
@@ -1587,7 +1952,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     // slots from the state provider and decode reserves.
                     for pool_addr in &fluid_touched {
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
-                            match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
+                            match decode_fluid_pool(state.as_ref(), config, block_timestamp) {
                                 Some(reserves) => {
                                     exex.send_pool_update(
                                         &mut stream_seq,
@@ -1611,7 +1976,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         }
                     }
 
-                    // Release read lock before sending EndBlock
+                    // Release state/read lock before sending EndBlock and awaiting tracker writes.
+                    drop(state);
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
@@ -1703,6 +2069,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     );
 
                     let pool_tracker = exex.pool_tracker.read().await;
+                    // Reth exposes canonical post-reorg state here, not old-fork state.
+                    // Absolute full-state revert messages therefore use this final-tip
+                    // snapshot; reorg epilogues below remain the definitive recovery path.
+                    let state =
+                        state_at_block(ctx.provider(), final_tip_block, "ChainReorged revert")?;
                     let mut events_reverted = 0;
 
                     for (tx_index, receipt) in receipts.iter().enumerate() {
@@ -1747,7 +2118,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 true,
-                                ctx.provider(),
+                                state.as_ref(),
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
@@ -1758,6 +2129,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         }
                     }
 
+                    drop(state);
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
@@ -1798,6 +2170,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     );
 
                     let pool_tracker = exex.pool_tracker.read().await;
+                    let state = state_at_block(ctx.provider(), block_number, "ChainReorged apply")?;
                     let mut events_in_block = 0;
                     let mut fluid_touched = HashSet::<Address>::new();
 
@@ -1839,7 +2212,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 false,
-                                ctx.provider(),
+                                state.as_ref(),
                                 &pool_tracker,
                             ) {
                                 exex.send_pool_update(&mut stream_seq, update_msg);
@@ -1853,7 +2226,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     // ── Fluid batch decode (same as ChainCommitted) ──────────
                     for pool_addr in &fluid_touched {
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
-                            match decode_fluid_pool(ctx.provider(), config, block_timestamp) {
+                            match decode_fluid_pool(state.as_ref(), config, block_timestamp) {
                                 Some(reserves) => {
                                     exex.send_pool_update(
                                         &mut stream_seq,
@@ -1876,6 +2249,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         reorg_fluid_touched.remove(pool_addr);
                     }
 
+                    drop(state);
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
@@ -1896,6 +2270,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     exex.blocks_processed += 1;
                 }
 
+                let final_state =
+                    state_at_block(ctx.provider(), final_tip_block, "ChainReorged final")?;
+
                 // ── Fluid: decode pools touched in old blocks but not new ──
                 if !reorg_fluid_touched.is_empty() {
                     let pool_tracker = exex.pool_tracker.read().await;
@@ -1907,7 +2284,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         .unwrap_or_default();
                     for pool_addr in &reorg_fluid_touched {
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
-                            match decode_fluid_pool(ctx.provider(), config, tip_timestamp) {
+                            match decode_fluid_pool(final_state.as_ref(), config, tip_timestamp) {
                                 Some(reserves) => {
                                     exex.send_reorg_epilogue(
                                         &mut stream_seq,
@@ -1929,9 +2306,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
                 }
 
-                // Send definitive slot0 overrides from latest() state
+                // Send definitive slot0 overrides from the final-tip state snapshot.
                 send_slot0_finals(
-                    ctx.provider(),
+                    final_state.as_ref(),
                     &affected_slot0_pools,
                     &exex,
                     &mut stream_seq,
@@ -1971,6 +2348,11 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                 let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
                 let mut revert_fluid_touched = HashSet::<Address>::new();
+                // Reth exposes canonical post-revert state here, not the reverted-away
+                // old blocks' state. Absolute full-state revert messages and final
+                // epilogues both read this one final-tip snapshot.
+                let final_state =
+                    state_at_block(ctx.provider(), final_tip_block, "ChainReverted final")?;
 
                 for (block, receipts) in old.blocks_and_receipts() {
                     let block_number = block.number();
@@ -2030,7 +2412,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 tx_index as u64,
                                 log_index as u64,
                                 true,
-                                ctx.provider(),
+                                final_state.as_ref(),
                                 &pool_tracker,
                             ) {
                                 record_affected_slot0_pool(&update_msg, &mut affected_slot0_pools);
@@ -2071,7 +2453,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         .unwrap_or_default();
                     for pool_addr in &revert_fluid_touched {
                         if let Some(config) = pool_tracker.fluid_config(pool_addr) {
-                            match decode_fluid_pool(ctx.provider(), config, tip_timestamp) {
+                            match decode_fluid_pool(final_state.as_ref(), config, tip_timestamp) {
                                 Some(reserves) => {
                                     exex.send_reorg_epilogue(
                                         &mut stream_seq,
@@ -2093,9 +2475,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
                 }
 
-                // Send definitive slot0 overrides from latest() state
+                // Send definitive slot0 overrides from the final-tip state snapshot.
                 send_slot0_finals(
-                    ctx.provider(),
+                    final_state.as_ref(),
                     &affected_slot0_pools,
                     &exex,
                     &mut stream_seq,
@@ -2169,40 +2551,43 @@ fn extract_fluid_addresses(update: &pool_tracker::WhitelistUpdate) -> Vec<Addres
         .collect()
 }
 
-/// Resolve `FluidPoolConfig` for a batch of pool addresses via RPC and register them.
-async fn resolve_fluid_configs(
-    addrs: Vec<Address>,
-    rpc_url: &str,
-    pool_tracker: Arc<RwLock<PoolTracker>>,
-) {
+/// Resolve `FluidPoolConfig` for a batch of pool addresses via RPC.
+async fn resolve_fluid_config_batch(addrs: Vec<Address>, rpc_url: &str) -> Vec<FluidPoolConfig> {
     info!("Resolving Fluid configs for {} pools via RPC", addrs.len());
+    let mut configs = Vec::new();
     for addr in addrs {
         match FluidPoolConfig::resolve(addr, rpc_url).await {
             Ok(config) => {
                 info!(pool = %addr, liquidity = %config.liquidity_address, "✅ Fluid config resolved");
-                pool_tracker.write().await.register_fluid_config(config);
+                configs.push(config);
             }
             Err(e) => {
                 warn!(pool = %addr, error = %e, "❌ Failed to resolve Fluid config");
             }
         }
     }
+    configs
 }
 
-/// Read 8 storage slots from reth state provider and decode Fluid reserves.
-fn decode_fluid_pool<P: StateProviderFactory>(
-    provider: &P,
+/// Resolve `FluidPoolConfig` for a batch of pool addresses via RPC and register them.
+async fn resolve_fluid_configs(
+    addrs: Vec<Address>,
+    rpc_url: &str,
+    pool_tracker: Arc<RwLock<PoolTracker>>,
+) {
+    let configs = resolve_fluid_config_batch(addrs, rpc_url).await;
+    let mut tracker = pool_tracker.write().await;
+    for config in configs {
+        tracker.register_fluid_config(config);
+    }
+}
+
+/// Read 8 storage slots from a held state snapshot and decode Fluid reserves.
+fn decode_fluid_pool(
+    state: &dyn StateProvider,
     config: &FluidPoolConfig,
     block_timestamp: u64,
 ) -> Option<fluid_decoder::FluidReserves> {
-    let state = match provider.latest() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(pool = %config.pool_address, error = %e, "Failed to get state provider for Fluid decode");
-            return None;
-        }
-    };
-
     let reads = config.storage_reads();
     let mut values = [U256::ZERO; 8];
     for (i, (addr, slot)) in reads.iter().enumerate() {
@@ -2264,8 +2649,38 @@ fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::v2_swap_deltas;
+    use super::{twocrypto_storage_slots, v2_swap_deltas, TwoCryptoStorageSlots};
     use alloy_primitives::{I256, U256};
+
+    #[test]
+    fn twocrypto_storage_slots_follow_versioned_layouts() {
+        assert_eq!(
+            twocrypto_storage_slots(None),
+            TwoCryptoStorageSlots {
+                initial_a_gamma: 5,
+                initial_a_gamma_time: 6,
+                future_a_gamma: 7,
+                future_a_gamma_time: 8,
+                balance_0: 9,
+                balance_1: 10,
+                d: 11,
+                packed_fee_params: 16,
+            }
+        );
+        assert_eq!(
+            twocrypto_storage_slots(Some("v2.0.0")),
+            TwoCryptoStorageSlots {
+                initial_a_gamma: 8,
+                initial_a_gamma_time: 20,
+                future_a_gamma: 10,
+                future_a_gamma_time: 20,
+                balance_0: 12,
+                balance_1: 13,
+                d: 14,
+                packed_fee_params: 16,
+            }
+        );
+    }
 
     #[test]
     fn v2_swap_deltas_handle_standard_one_sided_swap() {

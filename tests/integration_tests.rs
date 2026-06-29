@@ -25,6 +25,8 @@ mod event_filtering {
             fee: None,
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         }
     }
 
@@ -39,6 +41,8 @@ mod event_filtering {
             fee: Some(3000),
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         }
     }
 
@@ -53,6 +57,8 @@ mod event_filtering {
             fee: Some(3000),
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         }
     }
 
@@ -333,6 +339,8 @@ mod event_decoding_and_filtering {
             fee: None,
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -378,6 +386,8 @@ mod event_decoding_and_filtering {
             fee: Some(3000),
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -413,6 +423,8 @@ mod event_decoding_and_filtering {
             fee: Some(3000),
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -460,6 +472,8 @@ mod event_decoding_and_filtering {
             fee: Some(3000),
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -505,6 +519,8 @@ mod event_decoding_and_filtering {
             fee: None,
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));

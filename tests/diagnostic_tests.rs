@@ -94,6 +94,8 @@ fn test_diagnostic_v2_event_processing() {
         fee: None,
         token0_decimals: None,
         token1_decimals: None,
+        extra_tokens: vec![],
+        twocrypto_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -176,6 +178,8 @@ fn test_diagnostic_v2_event_wrong_pool() {
         fee: None,
         token0_decimals: None,
         token1_decimals: None,
+        extra_tokens: vec![],
+        twocrypto_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -238,6 +242,8 @@ fn test_diagnostic_v3_event_processing() {
         fee: Some(3000),
         token0_decimals: None,
         token1_decimals: None,
+        extra_tokens: vec![],
+        twocrypto_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -296,6 +302,8 @@ fn test_diagnostic_v4_event_processing() {
         fee: Some(3000),
         token0_decimals: None,
         token1_decimals: None,
+        extra_tokens: vec![],
+        twocrypto_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -384,6 +392,8 @@ fn test_diagnostic_v4_wrong_pool_id() {
         fee: Some(3000),
         token0_decimals: None,
         token1_decimals: None,
+        extra_tokens: vec![],
+        twocrypto_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -517,6 +527,8 @@ fn test_diagnostic_whitelist_not_applied() {
         fee: None,
         token0_decimals: None,
         token1_decimals: None,
+        extra_tokens: vec![],
+        twocrypto_version: None,
     };
 
     // Begin block BEFORE queuing update

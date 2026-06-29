@@ -300,6 +300,13 @@ pub enum ReorgEpilogueUpdate {
     },
 }
 
+/// Token metadata from the rich whitelist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenMetadata {
+    pub address: Address,
+    pub decimals: u8,
+}
+
 /// Pool metadata from whitelist
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolMetadata {
@@ -318,6 +325,16 @@ pub struct PoolMetadata {
     /// hydration must skip pools whose decimals are unknown (data-integrity rule).
     pub token0_decimals: Option<u8>,
     pub token1_decimals: Option<u8>,
+
+    /// Additional token metadata for multi-token pools. `token0` and `token1`
+    /// remain the first two coins; this vector starts at coin index 2.
+    #[serde(default)]
+    pub extra_tokens: Vec<TokenMetadata>,
+
+    /// Curve TwoCrypto storage-layout version from whitelist `additional_data.version`.
+    /// `None` means the default v2.1.x layout; `Some("v2.0.0")` uses the legacy slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twocrypto_version: Option<String>,
 }
 
 /// Whitelist control message sent from dynamicWhitelist to ExEx

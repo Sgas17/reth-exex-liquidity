@@ -467,6 +467,8 @@ mod tests {
             fee: None,
             token0_decimals: None,
             token1_decimals: None,
+            extra_tokens: vec![],
+            twocrypto_version: None,
         }
     }
 

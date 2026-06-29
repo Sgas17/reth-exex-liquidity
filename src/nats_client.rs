@@ -4,7 +4,7 @@
 // (`whitelist.pools.{chain}.{full,add,remove}`), which carries token addresses,
 // decimals, and protocol metadata the ExEx arena writer needs.
 
-use crate::types::{PoolIdentifier, PoolMetadata, Protocol};
+use crate::types::{PoolIdentifier, PoolMetadata, Protocol, TokenMetadata};
 use alloy_primitives::Address;
 use async_nats::Client;
 use eyre::Result;
@@ -20,7 +20,9 @@ use tracing::{info, warn};
 // arena writer it also needs token addresses + decimals + protocol metadata,
 // which the orchestrator already publishes on `whitelist.pools.{chain}.full` as
 // the richer `WhitelistPool`. These deser structs mirror that wire format;
-// unknown fields (extra_tokens, ekubo/fluid config, additional_data) are ignored
+// `extra_tokens` is carried for multi-token Curve/Balancer hydration, and
+// `additional_data.version` is carried for CurveTwoCrypto storage-layout selection.
+// Other protocol fields not yet consumed (ekubo/fluid config) remain ignored
 // until the protocols that need them are hydrated.
 
 /// Token entry in the rich whitelist (`common::Token` on the wire).
@@ -28,6 +30,13 @@ use tracing::{info, warn};
 struct CanonicalToken {
     address: String,
     decimals: u8,
+}
+
+fn canonical_token_to_metadata(t: &CanonicalToken) -> Option<TokenMetadata> {
+    Some(TokenMetadata {
+        address: Address::from_str(&t.address).ok()?,
+        decimals: t.decimals,
+    })
 }
 
 /// Pool entry in the rich whitelist (orchestrator `WhitelistPool`).
@@ -45,6 +54,10 @@ struct CanonicalPool {
     pool_id: Option<String>,
     #[serde(default)]
     factory: Option<String>,
+    #[serde(default)]
+    extra_tokens: Vec<CanonicalToken>,
+    #[serde(default)]
+    additional_data: Option<serde_json::Value>,
 }
 
 /// Full rich-snapshot envelope (`whitelist.pools.{chain}.full`).
@@ -93,6 +106,17 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         .as_deref()
         .and_then(|f| Address::from_str(f).ok())
         .unwrap_or(Address::ZERO);
+    let extra_tokens = p
+        .extra_tokens
+        .iter()
+        .filter_map(canonical_token_to_metadata)
+        .collect();
+    let twocrypto_version = p
+        .additional_data
+        .as_ref()
+        .and_then(|data| data.get("version"))
+        .and_then(|version| version.as_str())
+        .map(str::to_owned);
     Some(PoolMetadata {
         pool_id,
         token0,
@@ -103,6 +127,8 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         fee: p.fee,
         token0_decimals: Some(p.token0.decimals),
         token1_decimals: Some(p.token1.decimals),
+        extra_tokens,
+        twocrypto_version,
     })
 }
 
@@ -263,6 +289,28 @@ mod tests {
         assert_eq!(p.token0_decimals, Some(6));
         assert_eq!(p.token1_decimals, Some(18));
         assert_eq!(p.fee, Some(3000));
+    }
+
+    #[test]
+    fn parse_full_snapshot_carries_twocrypto_version() {
+        let json = br#"{"snapshot_id":1,"chain":"ethereum","pools":[{"address":"0x0000000000000000000000000000000000000001","protocol":"curve_twocrypto","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18},"additional_data":{"version":"v2.0.0"}}]}"#;
+
+        let pools = super::parse_full_snapshot(json).expect("parse full snapshot");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].protocol, Protocol::CurveTwoCrypto);
+        assert_eq!(pools[0].twocrypto_version.as_deref(), Some("v2.0.0"));
+    }
+
+    #[test]
+    fn parse_full_snapshot_carries_extra_tokens() {
+        let json = br#"{"snapshot_id":1,"chain":"ethereum","pools":[{"address":"0x0000000000000000000000000000000000000001","protocol":"curve_tricrypto","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18},"extra_tokens":[{"address":"0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599","symbol":"WBTC","decimals":8}]}]}"#;
+
+        let pools = super::parse_full_snapshot(json).expect("parse full snapshot");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].protocol, Protocol::CurveTricrypto);
+        assert_eq!(pools[0].extra_tokens.len(), 1);
+        assert_eq!(pools[0].extra_tokens[0].decimals, 8);
+        assert_ne!(pools[0].extra_tokens[0].address, Address::ZERO);
     }
 
     const FULL_V2: &[u8] = br#"{"snapshot_id":1,"chain":"ethereum","pools":[{"address":"0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc","protocol":"v2","token0":{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","symbol":"USDC","decimals":6},"token1":{"address":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","symbol":"WETH","decimals":18}}]}"#;

@@ -12,12 +12,14 @@
 //! arena_service's arena before cutover. When the flag is unset, the shadow
 //! writer is disabled and the ExEx behaves exactly as before.
 //!
-//! Sub-step 3a (this commit): block-boundary plumbing only — open the arena and
-//! signal each block. Slot creation (topology) needs pool decimals from
-//! scraping and lands with startup hydration (3b); live per-block apply lands in
-//! 3c; reorg writes in 3d.
+//! Sub-step 3a added block-boundary plumbing; 3b hydrates startup topology from
+//! a rich whitelist plus anchor-pinned storage reads. Live per-block apply lands
+//! in 3c; reorg writes in 3d.
 
-use arena_layout::SIGNAL_REASON_LIVE_BLOCK_EMPTY;
+use arena_layout::{
+    CurveStablePoolData, CurveTricryptoPoolData, CurveTwoCryptoPoolData,
+    SIGNAL_REASON_LIVE_BLOCK_EMPTY,
+};
 use arena_writer::{ArenaMmap, SharedArenaWriter};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +38,54 @@ pub struct V2Hydration {
     pub reserve1: u128,
     pub token0_decimals: u8,
     pub token1_decimals: u8,
+}
+
+pub struct CurveStableHydration {
+    pub address: [u8; 20],
+    pub pool: CurveStablePoolData,
+}
+
+pub struct CurveTwoCryptoHydration {
+    pub address: [u8; 20],
+    pub pool: CurveTwoCryptoPoolData,
+}
+
+pub struct CurveTricryptoHydration {
+    pub address: [u8; 20],
+    pub pool: CurveTricryptoPoolData,
+}
+
+pub struct FluidHydration {
+    pub address: [u8; 20],
+    pub token0: [u8; 20],
+    pub token1: [u8; 20],
+    pub token0_decimals: u8,
+    pub token1_decimals: u8,
+    pub col_token0_real: u128,
+    pub col_token1_real: u128,
+    pub col_token0_imaginary: u128,
+    pub col_token1_imaginary: u128,
+    pub debt_token0_real: u128,
+    pub debt_token1_real: u128,
+    pub debt_token0_imaginary: u128,
+    pub debt_token1_imaginary: u128,
+    pub center_price: u128,
+    pub fee: u32,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartupHydrationCounts {
+    pub v2: usize,
+    pub curve_stable: usize,
+    pub curve_twocrypto: usize,
+    pub curve_tricrypto: usize,
+    pub fluid: usize,
+}
+
+impl StartupHydrationCounts {
+    pub fn total(self) -> usize {
+        self.v2 + self.curve_stable + self.curve_twocrypto + self.curve_tricrypto + self.fluid
+    }
 }
 
 /// In-process writer for the (shadow) pool arena.
@@ -65,7 +115,7 @@ impl ShadowArena {
         arena.init();
         tracing::info!(
             path = %path.display(),
-            "Shadow arena opened (ITE-16: block-signal plumbing + V2 hydration)"
+            "Shadow arena opened (ITE-16: block-signal plumbing + startup hydration)"
         );
         Ok(Self {
             arena,
@@ -73,14 +123,24 @@ impl ShadowArena {
         })
     }
 
-    /// Hydrate V2 pool slots from scraped reserves + whitelist metadata, frozen
-    /// at `anchor_block`. Creates a slot per pool and bumps `slot_version` once
-    /// so readers rebuild their lookup. Returns the number of slots created.
-    pub fn hydrate_v2(&mut self, anchor_block: u64, pools: &[V2Hydration]) -> usize {
+    /// Hydrate startup pool slots from scraped state + whitelist metadata,
+    /// frozen at `anchor_block`. Creates slots and bumps `slot_version` once so
+    /// readers rebuild their lookup from one coherent topology snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hydrate_startup(
+        &mut self,
+        anchor_block: u64,
+        v2: &[V2Hydration],
+        curve_stable: &[CurveStableHydration],
+        curve_twocrypto: &[CurveTwoCryptoHydration],
+        curve_tricrypto: &[CurveTricryptoHydration],
+        fluid: &[FluidHydration],
+    ) -> StartupHydrationCounts {
         self.scraped_at_block = anchor_block;
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-        let mut created = 0;
-        for p in pools {
+        let mut counts = StartupHydrationCounts::default();
+
+        for p in v2 {
             match writer.add_v2_pool(
                 p.address,
                 p.reserve0,
@@ -90,15 +150,88 @@ impl ShadowArena {
                 p.token0_decimals,
                 p.token1_decimals,
             ) {
-                Ok(()) => created += 1,
+                Ok(()) => counts.v2 += 1,
+                Err(e) => tracing::warn!(address = ?p.address, "shadow V2 hydration failed: {e}"),
+            }
+        }
+
+        for p in curve_stable {
+            match writer.add_curve_stable_pool(p.address, &p.pool) {
+                Ok(()) => counts.curve_stable += 1,
                 Err(e) => {
-                    tracing::warn!(address = ?p.address, "shadow V2 hydration failed: {e}");
+                    tracing::warn!(address = ?p.address, "shadow CurveStable hydration failed: {e}")
                 }
             }
         }
+
+        for p in curve_twocrypto {
+            match writer.add_curve_twocrypto_pool(p.address, &p.pool) {
+                Ok(()) => counts.curve_twocrypto += 1,
+                Err(e) => {
+                    tracing::warn!(address = ?p.address, "shadow CurveTwoCrypto hydration failed: {e}")
+                }
+            }
+        }
+
+        for p in curve_tricrypto {
+            match writer.add_curve_tricrypto_pool(p.address, &p.pool) {
+                Ok(()) => counts.curve_tricrypto += 1,
+                Err(e) => {
+                    tracing::warn!(address = ?p.address, "shadow CurveTricrypto hydration failed: {e}")
+                }
+            }
+        }
+
+        for p in fluid {
+            match writer.add_fluid_pool(
+                p.address,
+                p.token0,
+                p.token1,
+                p.fee,
+                p.token0_decimals,
+                p.token1_decimals,
+            ) {
+                Ok(()) => {
+                    if let Err(e) = writer.update_fluid_reserves(
+                        p.address,
+                        p.col_token0_real,
+                        p.col_token1_real,
+                        p.col_token0_imaginary,
+                        p.col_token1_imaginary,
+                        p.debt_token0_real,
+                        p.debt_token1_real,
+                        p.debt_token0_imaginary,
+                        p.debt_token1_imaginary,
+                        p.center_price,
+                        u128::from(p.fee),
+                    ) {
+                        tracing::warn!(address = ?p.address, "shadow Fluid reserve hydration failed: {e}");
+                    } else {
+                        counts.fluid += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(address = ?p.address, "shadow Fluid hydration failed: {e}")
+                }
+            }
+        }
+
         writer.signal_topology_change();
-        tracing::info!(created, anchor_block, "Shadow arena V2 hydration complete");
-        created
+        tracing::info!(
+            ?counts,
+            total = counts.total(),
+            anchor_block,
+            "Shadow arena startup hydration complete"
+        );
+        counts
+    }
+
+    /// Hydrate only V2 pool slots. Kept as a focused unit-test/convenience
+    /// wrapper around the multi-protocol startup path.
+    #[allow(dead_code)]
+    pub fn hydrate_v2(&mut self, anchor_block: u64, pools: &[V2Hydration]) -> usize {
+        self.hydrate_startup(anchor_block, pools, &[], &[], &[], &[])
+            .v2
     }
 
     /// Block boundary end. 3a: signal an empty block so a reader can confirm the
@@ -122,6 +255,10 @@ mod tests {
 
     fn temp_arena_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ite16_{tag}_{}.arena", std::process::id()))
+    }
+
+    fn addr(byte: u8) -> [u8; 20] {
+        [byte; 20]
     }
 
     /// Proves `arena_layout` compiles into the ExEx (reth) build and that this
@@ -209,6 +346,88 @@ mod tests {
         assert_eq!(got.reserve1, 2_000);
         assert_eq!(got.token0_decimals, 6);
         assert_eq!(got.token1_decimals, 18);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hydrate_startup_creates_curve_and_fluid_slots() {
+        let path = temp_arena_path("shadow_hydrate_multi");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let mut stable = CurveStablePoolData::default();
+        stable.n_coins = 2;
+        stable.balances[0] = 10;
+        stable.balances[1] = 20;
+        stable.fee = 4_000_000;
+        stable.coins[0] = addr(0x11);
+        stable.coins[1] = addr(0x22);
+        stable.rate_multipliers[0] = 1_000_000_000_000_000_000;
+        stable.rate_multipliers[1] = 1_000_000_000_000_000_000;
+
+        let mut twocrypto = CurveTwoCryptoPoolData::default();
+        twocrypto.balances = [30, 40];
+        twocrypto.price_scale = 1_000_000_000_000_000_000;
+        twocrypto.d = 70;
+        twocrypto.coins = [addr(0x33), addr(0x44)];
+
+        let fluid = FluidHydration {
+            address: addr(0xCC),
+            token0: addr(0x55),
+            token1: addr(0x66),
+            token0_decimals: 6,
+            token1_decimals: 18,
+            col_token0_real: 1,
+            col_token1_real: 2,
+            col_token0_imaginary: 3,
+            col_token1_imaginary: 4,
+            debt_token0_real: 5,
+            debt_token1_real: 6,
+            debt_token0_imaginary: 7,
+            debt_token1_imaginary: 8,
+            center_price: 9,
+            fee: 500,
+        };
+
+        let counts = shadow.hydrate_startup(
+            12_345,
+            &[],
+            &[CurveStableHydration {
+                address: addr(0xAA),
+                pool: stable,
+            }],
+            &[CurveTwoCryptoHydration {
+                address: addr(0xBB),
+                pool: twocrypto,
+            }],
+            &[],
+            &[fluid],
+        );
+        assert_eq!(counts.curve_stable, 1);
+        assert_eq!(counts.curve_twocrypto, 1);
+        assert_eq!(counts.fluid, 1);
+        assert_eq!(counts.total(), 3);
+        assert_eq!(shadow.scraped_at_block, 12_345);
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        assert_eq!(
+            writer
+                .get_curve_stable_pool(&addr(0xAA))
+                .expect("stable slot")
+                .balances[1],
+            20
+        );
+        assert_eq!(
+            writer
+                .get_curve_twocrypto_pool(&addr(0xBB))
+                .expect("twocrypto slot")
+                .d,
+            70
+        );
+        let fluid = writer.get_fluid_pool(&addr(0xCC)).expect("fluid slot");
+        assert_eq!(fluid.col_token0_real, 1);
+        assert_eq!(fluid.debt_token1_imaginary, 8);
+        assert_eq!(fluid.token0_decimals, 6);
 
         let _ = std::fs::remove_file(&path);
     }
