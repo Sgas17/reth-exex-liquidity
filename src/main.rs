@@ -35,10 +35,10 @@ use futures::{StreamExt, TryStreamExt};
 use nats_client::WhitelistNatsClient;
 use pool_tracker::PoolTracker;
 use reth::providers::StateProviderFactory;
-use shadow_arena::ShadowArena;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
+use shadow_arena::ShadowArena;
 use socket::PoolUpdateSocketServer;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1280,72 +1280,77 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
     let subscriber = loop {
         match nats_client.subscribe_whitelist(&chain).await {
             Ok(subscriber) => {
-                info!("✅ Subscribed to whitelist updates for {}", chain);
+                info!("✅ Subscribed to minimal whitelist deltas for {}", chain);
                 break subscriber;
             }
             Err(e) => {
-                warn!(error = %e, "Failed to subscribe to whitelist updates, retrying in 2s");
+                warn!(error = %e, "Failed to subscribe to minimal whitelist deltas, retrying in 2s");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     };
 
-    // ── Startup: request full whitelist snapshot ────────────────────────
+    let mut full_subscriber = loop {
+        match nats_client.subscribe_full_whitelist(&chain).await {
+            Ok(subscriber) => {
+                info!(
+                    "✅ Subscribed to rich full whitelist snapshots for {}",
+                    chain
+                );
+                break subscriber;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to rich full whitelist, retrying in 2s");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
+
+    // ── Startup: request canonical rich full whitelist snapshot ──────────
     loop {
+        if let Err(e) = nats_client.request_reseed().await {
+            warn!(error = %e, "Failed to request whitelist reseed, retrying in 2s");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
         match nats_client
-            .request_snapshot(&chain, Duration::from_secs(10))
+            .next_full_snapshot(&mut full_subscriber, Duration::from_secs(10))
             .await
         {
-            Ok(snapshot_msg) => {
-                if snapshot_msg.message_type != "full" {
-                    warn!(
-                        message_type = %snapshot_msg.message_type,
-                        "Ignoring non-full startup snapshot response"
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(pools) => {
+                let pool_count = pools.len();
+
+                if pool_count == 0 {
+                    warn!("Startup rich full snapshot contained zero pools, retrying in 2s");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
 
-                match nats_client.convert_to_pool_update(snapshot_msg) {
-                    Ok(update) => {
-                        let pool_count = match &update {
-                            crate::pool_tracker::WhitelistUpdate::Add(pools)
-                            | crate::pool_tracker::WhitelistUpdate::Replace(pools) => pools.len(),
-                            crate::pool_tracker::WhitelistUpdate::Remove(pool_ids) => {
-                                pool_ids.len()
-                            }
-                        };
+                let update = crate::pool_tracker::WhitelistUpdate::Replace(pools);
 
-                        if pool_count == 0 {
-                            warn!("Startup snapshot contained zero pools, retrying in 2s");
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue;
-                        }
+                // Extract Fluid pool addresses for config resolution
+                let fluid_addrs = extract_fluid_addresses(&update);
+                exex.pool_tracker.write().await.queue_update(update);
+                info!(
+                    pools = pool_count,
+                    "✅ Applied rich startup whitelist snapshot"
+                );
 
-                        // Extract Fluid pool addresses for config resolution
-                        let fluid_addrs = extract_fluid_addresses(&update);
-                        exex.pool_tracker.write().await.queue_update(update);
-                        info!(pools = pool_count, "✅ Applied startup whitelist snapshot");
-
-                        // Resolve configs for Fluid pools from startup snapshot
-                        if !fluid_addrs.is_empty() {
-                            let rpc_url = std::env::var("RPC_URL")
-                                .unwrap_or_else(|_| "http://localhost:8545".to_string());
-                            let pt = exex.pool_tracker.clone();
-                            tokio::spawn(async move {
-                                resolve_fluid_configs(fluid_addrs, &rpc_url, pt).await;
-                            });
-                        }
-
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to convert startup snapshot, retrying in 2s");
-                    }
+                // Resolve configs for Fluid pools from startup snapshot
+                if !fluid_addrs.is_empty() {
+                    let rpc_url = std::env::var("RPC_URL")
+                        .unwrap_or_else(|_| "http://localhost:8545".to_string());
+                    let pt = exex.pool_tracker.clone();
+                    tokio::spawn(async move {
+                        resolve_fluid_configs(fluid_addrs, &rpc_url, pt).await;
+                    });
                 }
+
+                break;
             }
             Err(e) => {
-                warn!(error = %e, "Failed to request startup snapshot, retrying in 2s");
+                warn!(error = %e, "Failed to receive rich startup whitelist snapshot, retrying in 2s");
             }
         }
 
@@ -1360,30 +1365,28 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
         let mut current_sub = subscriber;
         loop {
             while let Some(message) = current_sub.next().await {
-                match nats_client.parse_message(&message.payload) {
-                    Ok(whitelist_msg) => {
-                        match nats_client.convert_to_pool_update(whitelist_msg) {
-                            Ok(update) => {
-                                // Extract Fluid pool addresses before queueing
-                                let fluid_addrs = extract_fluid_addresses(&update);
-                                pool_tracker.write().await.queue_update(update);
+                // Canonical subjects are `whitelist.pools.{chain}.{full,add,remove}`;
+                // dispatch on the suffix. The legacy `.minimal` (also matched by the
+                // wildcard subscription) returns None and is ignored.
+                let suffix = message.subject.rsplit('.').next().unwrap_or("");
+                match nats_client.canonical_update(suffix, &message.payload) {
+                    Ok(Some(update)) => {
+                        // Extract Fluid pool addresses before queueing
+                        let fluid_addrs = extract_fluid_addresses(&update);
+                        pool_tracker.write().await.queue_update(update);
 
-                                // Resolve configs for new Fluid pools
-                                if !fluid_addrs.is_empty() {
-                                    let pt = pool_tracker.clone();
-                                    let rpc = rpc_url.clone();
-                                    tokio::spawn(async move {
-                                        resolve_fluid_configs(fluid_addrs, &rpc, pt).await;
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to convert whitelist message: {}", e);
-                            }
+                        // Resolve configs for new Fluid pools
+                        if !fluid_addrs.is_empty() {
+                            let pt = pool_tracker.clone();
+                            let rpc = rpc_url.clone();
+                            tokio::spawn(async move {
+                                resolve_fluid_configs(fluid_addrs, &rpc, pt).await;
+                            });
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => {
-                        warn!("Failed to parse whitelist message: {}", e);
+                        warn!("Failed to handle whitelist message: {}", e);
                     }
                 }
             }

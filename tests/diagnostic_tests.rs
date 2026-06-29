@@ -92,6 +92,8 @@ fn test_diagnostic_v2_event_processing() {
         factory: Address::ZERO,
         tick_spacing: None,
         fee: None,
+        token0_decimals: None,
+        token1_decimals: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -172,6 +174,8 @@ fn test_diagnostic_v2_event_wrong_pool() {
         factory: Address::ZERO,
         tick_spacing: None,
         fee: None,
+        token0_decimals: None,
+        token1_decimals: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -232,6 +236,8 @@ fn test_diagnostic_v3_event_processing() {
         factory: Address::ZERO,
         tick_spacing: Some(60),
         fee: Some(3000),
+        token0_decimals: None,
+        token1_decimals: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -288,6 +294,8 @@ fn test_diagnostic_v4_event_processing() {
         factory: UNISWAP_V4_POOL_MANAGER,
         tick_spacing: Some(60),
         fee: Some(3000),
+        token0_decimals: None,
+        token1_decimals: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -374,6 +382,8 @@ fn test_diagnostic_v4_wrong_pool_id() {
         factory: UNISWAP_V4_POOL_MANAGER,
         tick_spacing: Some(60),
         fee: Some(3000),
+        token0_decimals: None,
+        token1_decimals: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -505,6 +515,8 @@ fn test_diagnostic_whitelist_not_applied() {
         factory: Address::ZERO,
         tick_spacing: None,
         fee: None,
+        token0_decimals: None,
+        token1_decimals: None,
     };
 
     // Begin block BEFORE queuing update

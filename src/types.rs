@@ -312,6 +312,12 @@ pub struct PoolMetadata {
     /// V3/V4 specific fields
     pub tick_spacing: Option<i32>,
     pub fee: Option<u32>,
+
+    /// Token decimals, sourced from the rich (`.full`) whitelist (ITE-16).
+    /// `None` when parsed from the legacy minimal/address-only whitelist; arena
+    /// hydration must skip pools whose decimals are unknown (data-integrity rule).
+    pub token0_decimals: Option<u8>,
+    pub token1_decimals: Option<u8>,
 }
 
 /// Whitelist control message sent from dynamicWhitelist to ExEx

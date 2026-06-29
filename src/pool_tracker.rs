@@ -465,6 +465,8 @@ mod tests {
             factory: Address::ZERO,
             tick_spacing: None,
             fee: None,
+            token0_decimals: None,
+            token1_decimals: None,
         }
     }
 

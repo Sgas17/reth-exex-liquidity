@@ -23,6 +23,8 @@ mod event_filtering {
             factory: Address::ZERO,
             tick_spacing: None,
             fee: None,
+            token0_decimals: None,
+            token1_decimals: None,
         }
     }
 
@@ -35,6 +37,8 @@ mod event_filtering {
             factory: Address::ZERO,
             tick_spacing: Some(60),
             fee: Some(3000),
+            token0_decimals: None,
+            token1_decimals: None,
         }
     }
 
@@ -47,6 +51,8 @@ mod event_filtering {
             factory: UNISWAP_V4_POOL_MANAGER,
             tick_spacing: Some(60),
             fee: Some(3000),
+            token0_decimals: None,
+            token1_decimals: None,
         }
     }
 
@@ -325,6 +331,8 @@ mod event_decoding_and_filtering {
             factory: Address::ZERO,
             tick_spacing: None,
             fee: None,
+            token0_decimals: None,
+            token1_decimals: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -368,6 +376,8 @@ mod event_decoding_and_filtering {
             factory: Address::ZERO,
             tick_spacing: Some(60),
             fee: Some(3000),
+            token0_decimals: None,
+            token1_decimals: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -401,6 +411,8 @@ mod event_decoding_and_filtering {
             factory: UNISWAP_V4_POOL_MANAGER,
             tick_spacing: Some(60),
             fee: Some(3000),
+            token0_decimals: None,
+            token1_decimals: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -446,6 +458,8 @@ mod event_decoding_and_filtering {
             factory: UNISWAP_V4_POOL_MANAGER,
             tick_spacing: Some(60),
             fee: Some(3000),
+            token0_decimals: None,
+            token1_decimals: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -489,6 +503,8 @@ mod event_decoding_and_filtering {
             factory: Address::ZERO,
             tick_spacing: None,
             fee: None,
+            token0_decimals: None,
+            token1_decimals: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
