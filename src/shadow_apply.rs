@@ -198,7 +198,14 @@ fn unpack_tricrypto_price_scale(packed: U256) -> [u128; 2] {
 /// delta-folding protocols. Absolute-state writes propagate
 /// [`WriterError::PoolNotFound`] for the same condition; the caller downgrades
 /// it to a debug skip.
-pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessage) -> Result<bool> {
+/// `overflowed` is set to `true` when a tick-liquidity update could not fit the
+/// pool's tier (its tick array overflowed) — the caller queues such pools for a
+/// re-tier (promotion).
+pub fn apply_live_event(
+    writer: &mut SharedArenaWriter,
+    event: &PoolUpdateMessage,
+    overflowed: &mut bool,
+) -> Result<bool> {
     match &event.update {
         // ── Uniswap V2: fold reserve deltas into current state ──────────
         PoolUpdate::V2Swap { amount0, amount1 } | PoolUpdate::V2Liquidity { amount0, amount1 } => {
@@ -242,7 +249,7 @@ pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessag
                 let delta = maybe_negate_liquidity_delta(liq.liquidity_delta, event.is_revert)?;
                 match &event.pool_id {
                     PoolIdentifier::Address(addr) => {
-                        writer.update_v3_tick_liquidity(
+                        *overflowed |= writer.update_v3_tick_liquidity(
                             addr.into_array(),
                             liq.tick_lower,
                             liq.tick_upper,
@@ -250,7 +257,7 @@ pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessag
                         )?;
                     }
                     PoolIdentifier::PoolId(id) => {
-                        writer.update_v4_tick_liquidity(
+                        *overflowed |= writer.update_v4_tick_liquidity(
                             *id,
                             liq.tick_lower,
                             liq.tick_upper,
@@ -292,7 +299,8 @@ pub fn apply_live_event(writer: &mut SharedArenaWriter, event: &PoolUpdateMessag
             // same model as V3/V4/Ekubo swap reverts.
             if let PoolIdentifier::PoolId(id) = &event.pool_id {
                 let delta = maybe_negate_liquidity_delta(*liquidity_delta, event.is_revert)?;
-                writer.update_ekubo_tick_liquidity(*id, *tick_lower, *tick_upper, delta)?;
+                *overflowed |=
+                    writer.update_ekubo_tick_liquidity(*id, *tick_lower, *tick_upper, delta)?;
                 if !event.is_revert {
                     writer.update_ekubo_slot0(*id, *sqrt_ratio, *tick, *liquidity)?;
                 }

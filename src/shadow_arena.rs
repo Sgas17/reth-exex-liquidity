@@ -16,12 +16,13 @@
 //! a rich whitelist plus anchor-pinned storage reads. Live per-block apply lands
 //! in 3c; reorg writes in 3d.
 
-use crate::types::{PoolUpdateMessage, ReorgEpilogueUpdate};
+use crate::types::{PoolIdentifier, PoolUpdateMessage, Protocol, ReorgEpilogueUpdate};
 use arena_layout::{
     AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
     CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_APPLY, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
 };
 use arena_writer::{ArenaMmap, SharedArenaWriter};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Env var naming the shadow arena mmap path. When unset, the shadow writer is
@@ -124,6 +125,10 @@ pub struct ShadowArena {
     /// LIVE_BLOCK_APPLY (with the count) vs LIVE_BLOCK_EMPTY, matching
     /// arena_service so block signals stay diff-comparable.
     applied_this_block: u64,
+    /// Pools whose tick array overflowed their tier this block and must be
+    /// re-tiered (promoted). Drained at the block boundary by the ExEx, which
+    /// re-scrapes them and calls `retier_*`.
+    retier_pending: HashSet<(Protocol, PoolIdentifier)>,
 }
 
 impl ShadowArena {
@@ -151,6 +156,7 @@ impl ShadowArena {
             arena,
             scraped_at_block: 0,
             applied_this_block: 0,
+            retier_pending: HashSet::new(),
         })
     }
 
@@ -328,14 +334,82 @@ impl ShadowArena {
         &mut self,
         event: &PoolUpdateMessage,
     ) -> std::result::Result<bool, crate::shadow_apply::ApplyError> {
+        let mut overflowed = false;
         let applied = {
             let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-            crate::shadow_apply::apply_live_event(&mut writer, event)?
+            crate::shadow_apply::apply_live_event(&mut writer, event, &mut overflowed)?
         };
         if applied {
             self.applied_this_block += 1;
         }
+        if overflowed {
+            // Queue for promotion at the block boundary (re-scrape + re-tier).
+            self.retier_pending
+                .insert((event.protocol, event.pool_id.clone()));
+        }
         Ok(applied)
+    }
+
+    /// Drain the set of pools that overflowed their tier and need promotion. The
+    /// ExEx re-scrapes each at the current block and calls the matching `retier_*`.
+    pub fn take_retier_pending(&mut self) -> Vec<(Protocol, PoolIdentifier)> {
+        self.retier_pending.drain().collect()
+    }
+
+    /// Promote a V3 pool to a roomier tier (ITE-16 Phase 2). The fresh `pool` was
+    /// rebuilt from a full re-scrape, so `determine_tier` already placed it in the
+    /// right tier. Remove the old slot then add the new one and bump `slot_version`
+    /// — an in-place topology change (no double buffer; pool state is independent).
+    /// If the target tier has no free slot the add fails and the pool is left
+    /// absent until the next whitelist sync; the removal is still signalled.
+    pub fn retier_v3(
+        &mut self,
+        addr: [u8; 20],
+        pool: AnyUniswapV3Pool,
+    ) -> std::result::Result<(), crate::shadow_apply::ApplyError> {
+        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        writer
+            .remove_pool(addr)
+            .map_err(crate::shadow_apply::ApplyError::Writer)?;
+        let res = writer
+            .add_v3_pool(pool)
+            .map_err(crate::shadow_apply::ApplyError::Writer);
+        writer.signal_topology_change();
+        res
+    }
+
+    /// Promote a V4 pool to a roomier tier (see [`Self::retier_v3`]).
+    pub fn retier_v4(
+        &mut self,
+        pool_id: [u8; 32],
+        pool: AnyUniswapV4Pool,
+    ) -> std::result::Result<(), crate::shadow_apply::ApplyError> {
+        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        writer
+            .remove_pool_v4(pool_id)
+            .map_err(crate::shadow_apply::ApplyError::Writer)?;
+        let res = writer
+            .add_v4_pool(pool)
+            .map_err(crate::shadow_apply::ApplyError::Writer);
+        writer.signal_topology_change();
+        res
+    }
+
+    /// Promote an Ekubo pool to a roomier tier (see [`Self::retier_v3`]).
+    pub fn retier_ekubo(
+        &mut self,
+        pool_id: [u8; 32],
+        pool: AnyEkuboPool,
+    ) -> std::result::Result<(), crate::shadow_apply::ApplyError> {
+        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        writer
+            .remove_pool_v4(pool_id)
+            .map_err(crate::shadow_apply::ApplyError::Writer)?;
+        let res = writer
+            .add_ekubo_pool(pool)
+            .map_err(crate::shadow_apply::ApplyError::Writer);
+        writer.signal_topology_change();
+        res
     }
 
     /// Apply a reorg-epilogue update (ITE-16 step 3d): the definitive post-reorg
@@ -384,8 +458,8 @@ mod tests {
     use alloy_primitives::{Address, I256, U256};
     use arena_layout::ekubo::EkuboLowPoolData;
     use arena_layout::{
-        AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, SharedArenaRegion, UniswapV3LowPoolData,
-        UniswapV4LowPoolData, SHARED_ARENA_VERSION,
+        AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, SharedArenaRegion,
+        UniswapV3ActivePoolData, UniswapV3LowPoolData, UniswapV4LowPoolData, SHARED_ARENA_VERSION,
     };
     use arena_writer::SharedArenaWriter;
     use std::sync::atomic::Ordering;
@@ -1350,5 +1424,109 @@ mod tests {
             );
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// Phase 2: a V3 pool whose tick array overflows its tier is queued for
+    /// promotion (the writer reports overflow → `retier_pending`).
+    #[test]
+    fn overflow_queues_pool_for_retier() {
+        let path = temp_arena_path("overflow_queue");
+        let a = addr(0x66);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        // Low holds 50 ticks; 26 distinct mints (2 new ticks each) overflow it.
+        for i in 0..26i32 {
+            let ev = PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(Address::from(a)),
+                protocol: Protocol::UniswapV3,
+                update_type: UpdateType::Mint,
+                block_number: 101,
+                block_timestamp: 0,
+                tx_index: 0,
+                log_index: 0,
+                is_revert: false,
+                update: PoolUpdate::V3Liquidity {
+                    tick_lower: i * 100,
+                    tick_upper: i * 100 + 50,
+                    liquidity_delta: 1_000,
+                },
+            };
+            shadow.apply_live_event(&ev).expect("apply mint");
+        }
+
+        let pending = shadow.take_retier_pending();
+        assert_eq!(pending.len(), 1, "overflowed pool queued for promotion");
+        assert_eq!(pending[0].0, Protocol::UniswapV3);
+        // Draining clears it.
+        assert!(shadow.take_retier_pending().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 2: `retier_v3` promotes a pool to a bigger tier in place — the old
+    /// slot is freed and the pool reads back from the new tier.
+    #[test]
+    fn retier_promotes_v3_to_a_bigger_tier() {
+        let path = temp_arena_path("retier_v3");
+        let a = addr(0x55);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        {
+            let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            assert!(matches!(
+                writer.get_v3_pool(&a),
+                Some(AnyUniswapV3Pool::Low(_))
+            ));
+        }
+
+        // Re-scrape would yield a bigger-tier pool; here build an Active one.
+        let mut active = UniswapV3ActivePoolData::default();
+        active.common.pool_id = a;
+        active.common.is_active.store(true, Ordering::Release);
+        active.sqrt_price_x96 = U256::from(4_242u64);
+        active.tick = 7;
+        active.tick_spacing = 10;
+        active.token0_decimals = 6;
+        active.token1_decimals = 18;
+        shadow
+            .retier_v3(a, AnyUniswapV3Pool::Active(active))
+            .expect("retier");
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_v3_pool(&a).expect("pool present after retier");
+        assert!(
+            matches!(got, AnyUniswapV3Pool::Active(_)),
+            "pool promoted to the Active tier"
+        );
+        assert_eq!(got.sqrt_price_x96(), U256::from(4_242u64));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

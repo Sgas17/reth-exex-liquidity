@@ -149,6 +149,58 @@ fn apply_epilogue_to_shadow(shadow: &mut Option<ShadowArena>, update: &ReorgEpil
     }
 }
 
+/// Promote pools that overflowed their tier this block (ITE-16 Phase 2). Drains
+/// the shadow's pending set, re-scrapes each pool's full tick/bitmap state at the
+/// current block (so `determine_tier` re-places it in a roomier tier), and applies
+/// the in-place re-tier. Runs at the block boundary while `state` + `pool_tracker`
+/// are still held. Disjoint `shadow`-field borrow.
+fn promote_overflowed_pools(
+    shadow: &mut Option<ShadowArena>,
+    pool_tracker: &PoolTracker,
+    state: &dyn StateProvider,
+) {
+    let Some(shadow) = shadow.as_mut() else {
+        return;
+    };
+    for (protocol, ident) in shadow.take_retier_pending() {
+        match (protocol, &ident) {
+            (Protocol::UniswapV3, PoolIdentifier::Address(addr)) => {
+                let Some(meta) = pool_tracker.pool_metadata(addr) else {
+                    continue;
+                };
+                if let Some(h) = v3_hydration_from_snapshot(state, meta) {
+                    if let Err(e) = shadow.retier_v3(h.address, h.pool) {
+                        warn!(pool = %addr, "shadow V3 promote failed: {e}");
+                    } else {
+                        info!(pool = %addr, "shadow promoted overflowed V3 pool to a roomier tier");
+                    }
+                }
+            }
+            (Protocol::UniswapV4, PoolIdentifier::PoolId(id)) => {
+                let Some(meta) = pool_tracker.pool_metadata_by_id(id) else {
+                    continue;
+                };
+                if let Some(h) = v4_hydration_from_snapshot(state, meta) {
+                    if let Err(e) = shadow.retier_v4(h.pool_id, h.pool) {
+                        warn!(pool_id = ?id, "shadow V4 promote failed: {e}");
+                    }
+                }
+            }
+            (Protocol::Ekubo, PoolIdentifier::PoolId(id)) => {
+                let Some(meta) = pool_tracker.pool_metadata_by_id(id) else {
+                    continue;
+                };
+                if let Some(h) = ekubo_hydration_from_snapshot(state, meta) {
+                    if let Err(e) = shadow.retier_ekubo(h.pool_id, h.pool) {
+                        warn!(pool_id = ?id, "shadow Ekubo promote failed: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn v2_swap_deltas(
     amount0_in: U256,
     amount1_in: U256,
@@ -2722,6 +2774,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             debug!(pool = %pool_addr, "Fluid pool touched but no config cached — skipping");
                         }
                     }
+
+                    // Promote any pools that overflowed their tier this block
+                    // (re-scrape + in-place re-tier) while state + tracker are held.
+                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, state.as_ref());
 
                     // Release state/read lock before sending EndBlock and awaiting tracker writes.
                     drop(state);

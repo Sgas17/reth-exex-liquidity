@@ -349,6 +349,16 @@ impl PoolTracker {
         self.tracked_pool_ids.contains(pool_id)
     }
 
+    /// Full metadata for an address-keyed pool (V2/V3/Curve/Fluid), for re-scrape.
+    pub fn pool_metadata(&self, address: &Address) -> Option<&PoolMetadata> {
+        self.pools_by_address.get(address)
+    }
+
+    /// Full metadata for a pool-id-keyed pool (V4/Ekubo/Balancer/FluidV2).
+    pub fn pool_metadata_by_id(&self, pool_id: &[u8; 32]) -> Option<&PoolMetadata> {
+        self.pools_by_id.get(pool_id)
+    }
+
     /// Get the protocol of a pool tracked by address.
     pub fn get_protocol(&self, address: &Address) -> Option<Protocol> {
         self.pools_by_address.get(address).map(|m| m.protocol)
