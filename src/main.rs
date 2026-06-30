@@ -2092,19 +2092,32 @@ fn read_ekubo_full_state(
     })
 }
 
+/// Choose the tier a freshly hydrated pool is placed in, from its scraped tick /
+/// bitmap-word counts. This runs ONLY at (re-)hydration — there is no live
+/// re-tiering, so a pool keeps its tier until it is re-added.
+///
+/// The Low->Active and Active->Popular boundaries leave ~25% headroom (cap * 3/4:
+/// 37/50 ticks, 7/10 + 18/25 bitmap words) so a pool is not placed at the top of
+/// a tier and pushed into the crude overflow path by a few ticks of growth before
+/// the next hydration. Active/Popular have ample pool slots (600 / 450) to absorb
+/// the shift. The Popular->Major boundary is kept at the cap: Major has only 150
+/// pool slots, so we do not promote 376-500 tick pools into it. (Graceful handling
+/// of genuinely over-Major pools is a tracked follow-up; today's worst case,
+/// USDC/WETH 0.05% at ~1555 ticks / 52 words, still fits Major. See the tier
+/// sizing section in docs/improvements/exex_direct_pool_arena_writer_cutover.md.)
 fn determine_tier(tick_count: usize, bitmap_count: usize) -> PoolTier {
-    let tick_tier = if tick_count <= 50 {
+    let tick_tier = if tick_count <= 37 {
         PoolTier::Low
-    } else if tick_count <= 200 {
+    } else if tick_count <= 150 {
         PoolTier::Active
     } else if tick_count <= 500 {
         PoolTier::Popular
     } else {
         PoolTier::Major
     };
-    let bitmap_tier = if bitmap_count <= 10 {
+    let bitmap_tier = if bitmap_count <= 7 {
         PoolTier::Low
-    } else if bitmap_count <= 25 {
+    } else if bitmap_count <= 18 {
         PoolTier::Active
     } else if bitmap_count <= 50 {
         PoolTier::Popular
@@ -3541,11 +3554,21 @@ mod tests {
     }
 
     #[test]
-    fn determine_tier_uses_tick_and_bitmap_capacity() {
-        assert_eq!(determine_tier(50, 10), PoolTier::Low);
-        assert_eq!(determine_tier(51, 10), PoolTier::Active);
-        assert_eq!(determine_tier(200, 26), PoolTier::Popular);
-        assert_eq!(determine_tier(501, 51), PoolTier::Major);
+    fn determine_tier_leaves_headroom_on_roomy_boundaries() {
+        // Low only up to ~75% of its caps (37 ticks / 7 bitmap words).
+        assert_eq!(determine_tier(37, 7), PoolTier::Low);
+        assert_eq!(determine_tier(38, 7), PoolTier::Active); // tick headroom
+        assert_eq!(determine_tier(37, 8), PoolTier::Active); // bitmap headroom
+                                                             // Active up to ~75% (150 ticks / 18 words).
+        assert_eq!(determine_tier(150, 18), PoolTier::Active);
+        assert_eq!(determine_tier(151, 18), PoolTier::Popular);
+        assert_eq!(determine_tier(150, 19), PoolTier::Popular);
+        // Popular->Major kept at the cap (Major has only 150 pool slots): a 453-
+        // tick pool stays in Popular rather than being promoted into Major.
+        assert_eq!(determine_tier(453, 21), PoolTier::Popular);
+        assert_eq!(determine_tier(500, 50), PoolTier::Popular);
+        assert_eq!(determine_tier(501, 50), PoolTier::Major);
+        assert_eq!(determine_tier(500, 51), PoolTier::Major);
     }
 
     #[test]
