@@ -19,9 +19,10 @@
 use crate::types::{PoolIdentifier, PoolUpdateMessage, Protocol, ReorgEpilogueUpdate};
 use arena_layout::{
     AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
-    CurveTwoCryptoPoolData, SIGNAL_REASON_LIVE_BLOCK_APPLY, SIGNAL_REASON_LIVE_BLOCK_EMPTY,
+    CurveTwoCryptoPoolData, PoolTier, SIGNAL_REASON_LIVE_BLOCK_APPLY,
+    SIGNAL_REASON_LIVE_BLOCK_EMPTY,
 };
-use arena_writer::{ArenaMmap, SharedArenaWriter};
+use arena_writer::{ArenaMmap, SharedArenaWriter, WriterError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -358,58 +359,92 @@ impl ShadowArena {
 
     /// Promote a V3 pool to a roomier tier (ITE-16 Phase 2). The fresh `pool` was
     /// rebuilt from a full re-scrape, so `determine_tier` already placed it in the
-    /// right tier. Remove the old slot then add the new one and bump `slot_version`
-    /// — an in-place topology change (no double buffer; pool state is independent).
-    /// If the target tier has no free slot the add fails and the pool is left
-    /// absent until the next whitelist sync; the removal is still signalled.
+    /// right tier. This is failure-safe: the old slot is removed only after the
+    /// target tier is confirmed to have a free slot, so a full target tier leaves
+    /// the (overflowed) lower-tier pool in place rather than losing it — the next
+    /// overflow re-queues the promotion. On success it is an in-place topology
+    /// change (remove old + add new + bump `slot_version`; no double buffer).
     pub fn retier_v3(
         &mut self,
         addr: [u8; 20],
         pool: AnyUniswapV3Pool,
     ) -> std::result::Result<(), crate::shadow_apply::ApplyError> {
+        let tier = match &pool {
+            AnyUniswapV3Pool::Low(_) => PoolTier::Low,
+            AnyUniswapV3Pool::Active(_) => PoolTier::Active,
+            AnyUniswapV3Pool::Popular(_) => PoolTier::Popular,
+            AnyUniswapV3Pool::Major(_) => PoolTier::Major,
+        };
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        if !writer.v3_tier_has_free_slot(tier) {
+            return Err(crate::shadow_apply::ApplyError::Writer(
+                WriterError::NoFreeSlots(tier),
+            ));
+        }
         writer
             .remove_pool(addr)
             .map_err(crate::shadow_apply::ApplyError::Writer)?;
-        let res = writer
+        writer
             .add_v3_pool(pool)
-            .map_err(crate::shadow_apply::ApplyError::Writer);
+            .map_err(crate::shadow_apply::ApplyError::Writer)?;
         writer.signal_topology_change();
-        res
+        Ok(())
     }
 
-    /// Promote a V4 pool to a roomier tier (see [`Self::retier_v3`]).
+    /// Promote a V4 pool to a roomier tier — failure-safe (see [`Self::retier_v3`]).
     pub fn retier_v4(
         &mut self,
         pool_id: [u8; 32],
         pool: AnyUniswapV4Pool,
     ) -> std::result::Result<(), crate::shadow_apply::ApplyError> {
+        let tier = match &pool {
+            AnyUniswapV4Pool::Low(_) => PoolTier::Low,
+            AnyUniswapV4Pool::Active(_) => PoolTier::Active,
+            AnyUniswapV4Pool::Popular(_) => PoolTier::Popular,
+            AnyUniswapV4Pool::Major(_) => PoolTier::Major,
+        };
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        if !writer.v4_tier_has_free_slot(tier) {
+            return Err(crate::shadow_apply::ApplyError::Writer(
+                WriterError::NoFreeSlots(tier),
+            ));
+        }
         writer
             .remove_pool_v4(pool_id)
             .map_err(crate::shadow_apply::ApplyError::Writer)?;
-        let res = writer
+        writer
             .add_v4_pool(pool)
-            .map_err(crate::shadow_apply::ApplyError::Writer);
+            .map_err(crate::shadow_apply::ApplyError::Writer)?;
         writer.signal_topology_change();
-        res
+        Ok(())
     }
 
-    /// Promote an Ekubo pool to a roomier tier (see [`Self::retier_v3`]).
+    /// Promote an Ekubo pool to a roomier tier — failure-safe (see [`Self::retier_v3`]).
     pub fn retier_ekubo(
         &mut self,
         pool_id: [u8; 32],
         pool: AnyEkuboPool,
     ) -> std::result::Result<(), crate::shadow_apply::ApplyError> {
+        let tier = match &pool {
+            AnyEkuboPool::Low(_) => PoolTier::Low,
+            AnyEkuboPool::Active(_) => PoolTier::Active,
+            AnyEkuboPool::Popular(_) => PoolTier::Popular,
+            AnyEkuboPool::Major(_) => PoolTier::Major,
+        };
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+        if !writer.ekubo_tier_has_free_slot(tier) {
+            return Err(crate::shadow_apply::ApplyError::Writer(
+                WriterError::NoFreeSlots(tier),
+            ));
+        }
         writer
             .remove_pool_v4(pool_id)
             .map_err(crate::shadow_apply::ApplyError::Writer)?;
-        let res = writer
+        writer
             .add_ekubo_pool(pool)
-            .map_err(crate::shadow_apply::ApplyError::Writer);
+            .map_err(crate::shadow_apply::ApplyError::Writer)?;
         writer.signal_topology_change();
-        res
+        Ok(())
     }
 
     /// Apply a reorg-epilogue update (ITE-16 step 3d): the definitive post-reorg
@@ -459,7 +494,8 @@ mod tests {
     use arena_layout::ekubo::EkuboLowPoolData;
     use arena_layout::{
         AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, SharedArenaRegion,
-        UniswapV3ActivePoolData, UniswapV3LowPoolData, UniswapV4LowPoolData, SHARED_ARENA_VERSION,
+        UniswapV3ActivePoolData, UniswapV3LowPoolData, UniswapV3MajorPoolData,
+        UniswapV3PopularPoolData, UniswapV4LowPoolData, SHARED_ARENA_VERSION, V3_MAJOR_CAPACITY,
     };
     use arena_writer::SharedArenaWriter;
     use std::sync::atomic::Ordering;
@@ -1526,6 +1562,143 @@ mod tests {
             "pool promoted to the Active tier"
         );
         assert_eq!(got.sqrt_price_x96(), U256::from(4_242u64));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 2 failure-safety (round-16 Critical 2): when the target tier has no
+    /// free slot, `retier_v3` must fail WITHOUT removing the existing assignment.
+    /// Losing a hot pool is worse than keeping its overflowed lower-tier snapshot,
+    /// so the original pool stays readable and a later overflow re-queues it.
+    #[test]
+    fn retier_into_full_tier_keeps_existing_pool() {
+        let path = temp_arena_path("retier_full");
+        let a = [0xCC_u8; 20];
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        // Hydrate the pool we will try (and fail) to promote into the Major tier.
+        let mut popular = UniswapV3PopularPoolData::default();
+        popular.common.pool_id = a;
+        popular.common.is_active.store(true, Ordering::Release);
+        popular.sqrt_price_x96 = U256::from(9_001u64);
+        popular.tick_spacing = 10;
+        popular.token0_decimals = 6;
+        popular.token1_decimals = 18;
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Popular(popular),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        // Saturate every Major slot so a promotion into Major cannot fit.
+        {
+            let mut writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            for i in 0..V3_MAJOR_CAPACITY as u16 {
+                let mut id = [0u8; 20];
+                id[18] = (i >> 8) as u8;
+                id[19] = i as u8;
+                let mut major = UniswapV3MajorPoolData::default();
+                major.common.pool_id = id;
+                major.common.is_active.store(true, Ordering::Release);
+                major.tick_spacing = 10;
+                major.token0_decimals = 6;
+                major.token1_decimals = 18;
+                writer
+                    .add_v3_pool(AnyUniswapV3Pool::Major(major))
+                    .expect("fill major slot");
+            }
+            assert!(
+                !writer.v3_tier_has_free_slot(PoolTier::Major),
+                "Major tier saturated"
+            );
+        }
+
+        // A re-scrape that lands the pool in the (now full) Major tier must fail
+        // the promotion rather than evict the live Popular assignment.
+        let mut major = UniswapV3MajorPoolData::default();
+        major.common.pool_id = a;
+        major.common.is_active.store(true, Ordering::Release);
+        major.sqrt_price_x96 = U256::from(424_242u64);
+        major.tick_spacing = 10;
+        major.token0_decimals = 6;
+        major.token1_decimals = 18;
+        let res = shadow.retier_v3(a, AnyUniswapV3Pool::Major(major));
+        assert!(res.is_err(), "promotion into a full tier is rejected");
+
+        // The original Popular pool is untouched and still readable.
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer.get_v3_pool(&a).expect("pool kept on failed retier");
+        assert!(
+            matches!(got, AnyUniswapV3Pool::Popular(_)),
+            "failed promotion leaves the pool in its original tier"
+        );
+        assert_eq!(got.sqrt_price_x96(), U256::from(9_001u64));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 2 (round-16 Critical 1): overflow delivered via the REORG apply path
+    /// (`apply_reorg_event`, which bypasses the replay guard) must queue the pool
+    /// for promotion exactly like the committed-block path, so reorg blocks do not
+    /// leave the shadow arena silently truncated until an unrelated later block.
+    #[test]
+    fn reorg_overflow_queues_pool_for_retier() {
+        let path = temp_arena_path("reorg_overflow_queue");
+        let a = addr(0x77);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        // 26 distinct mints (2 new ticks each) overflow the 50-tick Low tier. They
+        // arrive at block 50 — below the hydration anchor — to prove the reorg path
+        // bypasses the replay guard yet still records the overflow for promotion.
+        for i in 0..26i32 {
+            let ev = PoolUpdateMessage {
+                pool_id: PoolIdentifier::Address(Address::from(a)),
+                protocol: Protocol::UniswapV3,
+                update_type: UpdateType::Mint,
+                block_number: 50,
+                block_timestamp: 0,
+                tx_index: 0,
+                log_index: 0,
+                is_revert: false,
+                update: PoolUpdate::V3Liquidity {
+                    tick_lower: i * 100,
+                    tick_upper: i * 100 + 50,
+                    liquidity_delta: 1_000,
+                },
+            };
+            shadow.apply_reorg_event(&ev).expect("apply reorg mint");
+        }
+
+        let pending = shadow.take_retier_pending();
+        assert_eq!(
+            pending.len(),
+            1,
+            "reorg-delivered overflow queued for promotion"
+        );
+        assert_eq!(pending[0].0, Protocol::UniswapV3);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -2145,18 +2145,25 @@ fn read_ekubo_full_state(
 }
 
 /// Choose the tier a freshly hydrated pool is placed in, from its scraped tick /
-/// bitmap-word counts. This runs ONLY at (re-)hydration — there is no live
-/// re-tiering, so a pool keeps its tier until it is re-added.
+/// bitmap-word counts. This runs at (re-)hydration AND on every live promotion:
+/// when a pool overflows its tier during committed-block or reorg apply, the ExEx
+/// re-scrapes it at the current tip and rebuilds it through this function, so the
+/// overflow is repaired in place (remove old slot + add at the new tier) rather
+/// than left truncated. See `ShadowArena::take_retier_pending` /
+/// `promote_overflowed_pools` for the live-promotion drain.
 ///
 /// The Low->Active and Active->Popular boundaries leave ~25% headroom (cap * 3/4:
 /// 37/50 ticks, 7/10 + 18/25 bitmap words) so a pool is not placed at the top of
-/// a tier and pushed into the crude overflow path by a few ticks of growth before
-/// the next hydration. Active/Popular have ample pool slots (600 / 450) to absorb
-/// the shift. The Popular->Major boundary is kept at the cap: Major has only 150
-/// pool slots, so we do not promote 376-500 tick pools into it. (Graceful handling
-/// of genuinely over-Major pools is a tracked follow-up; today's worst case,
-/// USDC/WETH 0.05% at ~1555 ticks / 52 words, still fits Major. See the tier
-/// sizing section in docs/improvements/exex_direct_pool_arena_writer_cutover.md.)
+/// a tier and pushed into the overflow/promotion path by a few ticks of growth.
+/// Active/Popular have ample pool slots (600 / 450) to absorb the shift. The
+/// Popular->Major boundary is kept at the cap: Major has only 150 pool slots, so
+/// we do not promote 376-500 tick pools into it. A pool that overflows Major (or
+/// whose target tier is already saturated) keeps its overflowed lower-tier
+/// snapshot — promotion is failure-safe and re-queues on the next overflow.
+/// (Graceful handling of genuinely over-Major pools is a tracked follow-up;
+/// today's worst case, USDC/WETH 0.05% at ~1555 ticks / 52 words, still fits
+/// Major. See the tier sizing section in
+/// docs/improvements/exex_direct_pool_arena_writer_cutover.md.)
 fn determine_tier(tick_count: usize, bitmap_count: usize) -> PoolTier {
     let tick_tier = if tick_count <= 37 {
         PoolTier::Low
@@ -2942,6 +2949,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         }
                     }
 
+                    // Promote pools an overflow-on-revert may have grown (e.g. a
+                    // reverted burn re-inserting ticks) before the block signal.
+                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, state.as_ref());
+
                     drop(state);
                     drop(pool_tracker);
 
@@ -3062,6 +3073,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         // Pool handled in new chain — don't re-decode after Step 2
                         reorg_fluid_touched.remove(pool_addr);
                     }
+
+                    // Promote pools that overflowed on the reorg new-block apply
+                    // before the block signal.
+                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, state.as_ref());
 
                     drop(state);
                     drop(pool_tracker);
@@ -3249,6 +3264,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
                         }
                     }
+
+                    // Promote pools that overflowed on the revert apply before the
+                    // block signal (final_state is the canonical post-revert tip).
+                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, final_state.as_ref());
 
                     drop(pool_tracker);
 
