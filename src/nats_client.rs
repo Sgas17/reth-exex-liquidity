@@ -121,6 +121,11 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         .and_then(|data| data.get("version"))
         .and_then(|version| version.as_str())
         .map(str::to_owned);
+    let balancer_weights = if protocol == Protocol::BalancerV2Weighted {
+        parse_balancer_weights(p.additional_data.as_ref())
+    } else {
+        None
+    };
     Some(PoolMetadata {
         pool_id,
         token0,
@@ -135,7 +140,30 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         twocrypto_version,
         ekubo_fee: p.ekubo_fee,
         ekubo_type_config: p.ekubo_type_config,
+        balancer_weights,
     })
+}
+
+/// Parse Balancer V2 normalized weights from whitelist `additional_data.weights`
+/// (a JSON array, 1e18 scale). Each entry may be a number or a decimal/hex string.
+/// Returns `None` if absent or any element is unparseable — hydration then skips
+/// the pool (data-integrity rule: never default on-chain/weight metadata).
+fn parse_balancer_weights(additional_data: Option<&serde_json::Value>) -> Option<Vec<u64>> {
+    let weights = additional_data?.get("weights")?.as_array()?;
+    let mut out = Vec::with_capacity(weights.len());
+    for value in weights {
+        let w = if let Some(n) = value.as_u64() {
+            n
+        } else {
+            let s = value.as_str()?.trim();
+            match s.strip_prefix("0x") {
+                Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+                None => s.parse::<u64>().ok()?,
+            }
+        };
+        out.push(w);
+    }
+    Some(out)
 }
 
 /// Parse the rich `.full` whitelist snapshot into enriched `PoolMetadata`,
@@ -295,6 +323,37 @@ mod tests {
         assert_eq!(p.token0_decimals, Some(6));
         assert_eq!(p.token1_decimals, Some(18));
         assert_eq!(p.fee, Some(3000));
+    }
+
+    #[test]
+    fn parse_full_snapshot_carries_balancer_weights() {
+        // Balancer V2 weighted pool with poolId + additional_data.weights.
+        let json = r#"{
+            "snapshot_id": 1,
+            "chain": "ethereum",
+            "pools": [
+                {
+                    "address": "0x5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56",
+                    "pool_id": "0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014",
+                    "protocol": "balancer_v2_weighted",
+                    "token0": {"address": "0xba100000625a3754423978a60c9317c58a424e3D", "symbol": "BAL", "decimals": 18},
+                    "token1": {"address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "decimals": 18},
+                    "extra_tokens": [],
+                    "additional_data": {"weights": ["800000000000000000", "200000000000000000"]}
+                }
+            ]
+        }"#;
+
+        let pools = super::parse_full_snapshot(json.as_bytes()).expect("parse full snapshot");
+        assert_eq!(pools.len(), 1);
+        let p = &pools[0];
+        assert_eq!(p.protocol, Protocol::BalancerV2Weighted);
+        assert!(matches!(p.pool_id, PoolIdentifier::PoolId(_)));
+        assert_eq!(
+            p.balancer_weights.as_deref(),
+            Some(&[800_000_000_000_000_000u64, 200_000_000_000_000_000][..]),
+            "80/20 weights parsed from additional_data.weights"
+        );
     }
 
     #[test]

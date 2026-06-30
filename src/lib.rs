@@ -3,6 +3,7 @@
 // Exposes modules for reuse and testing
 
 pub mod balance_monitor;
+pub mod balancer_storage;
 pub mod events;
 pub mod fluid_decoder;
 pub mod nats_client;

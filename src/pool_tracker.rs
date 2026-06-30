@@ -58,6 +58,11 @@ pub struct PoolTracker {
     /// Pending whitelist updates (applied between blocks)
     pending_updates: VecDeque<WhitelistUpdate>,
 
+    /// Pools added since the last `take_newly_added` drain. The ExEx drains this
+    /// at each committed block boundary and hydrates them into the shadow arena
+    /// from current state, so live `.add` pools are written without a restart.
+    newly_added: Vec<PoolMetadata>,
+
     /// Whether we're currently processing a block
     in_block: bool,
 
@@ -82,6 +87,7 @@ impl PoolTracker {
             tracked_pool_ids: HashSet::new(),
             fluid_configs: HashMap::new(),
             pending_updates: VecDeque::new(),
+            newly_added: Vec::new(),
             in_block: false,
             v2_count: 0,
             v3_count: 0,
@@ -143,7 +149,7 @@ impl PoolTracker {
 
         while let Some(update) = self.pending_updates.pop_front() {
             match update {
-                WhitelistUpdate::Add(pools) => self.add_pools(pools),
+                WhitelistUpdate::Add(pools) => self.add_pools(pools, true),
                 WhitelistUpdate::Remove(pool_ids) => self.remove_pools(pool_ids),
                 WhitelistUpdate::Replace(pools) => self.replace_all(pools),
             }
@@ -164,8 +170,14 @@ impl PoolTracker {
         );
     }
 
-    /// Add pools to the whitelist
-    fn add_pools(&mut self, pools: Vec<PoolMetadata>) {
+    /// Add pools to the whitelist.
+    ///
+    /// `surface_newly_added` is true for live `.add` deltas so the ExEx can hydrate
+    /// those pools into the shadow arena. It is false for `.full`/startup replace:
+    /// startup hydration is already done from the frozen anchor, and treating the
+    /// full snapshot as live additions would retry-hydrate the whole universe on the
+    /// first committed block.
+    fn add_pools(&mut self, pools: Vec<PoolMetadata>, surface_newly_added: bool) {
         let mut added = 0;
 
         for pool in pools {
@@ -237,6 +249,12 @@ impl PoolTracker {
                 Protocol::Fluid => self.fluid_count += 1,
             }
 
+            // Queue live `.add` pools for shadow-arena hydration (drained by the
+            // ExEx at the next committed block boundary). Startup/full replace is
+            // hydrated separately from the frozen anchor and must not surface here.
+            if surface_newly_added {
+                self.newly_added.push(pool);
+            }
             added += 1;
         }
 
@@ -319,6 +337,7 @@ impl PoolTracker {
         self.tracked_addresses.clear();
         self.tracked_pool_ids.clear();
         self.fluid_configs.clear();
+        self.newly_added.clear();
         self.v2_count = 0;
         self.v3_count = 0;
         self.v4_count = 0;
@@ -329,8 +348,10 @@ impl PoolTracker {
         self.balancer_v2_count = 0;
         self.fluid_count = 0;
 
-        // Add new pools
-        self.add_pools(pools);
+        // Add new pools. A full snapshot is not a live `.add` delta: startup
+        // shadow hydration is driven explicitly from the same snapshot before the
+        // tracker is replaced, so do not put every pool into `newly_added`.
+        self.add_pools(pools, false);
     }
 
     /// Legacy method for backward compatibility - converts to Replace update
@@ -418,6 +439,19 @@ impl PoolTracker {
         self.fluid_configs.get(pool)
     }
 
+    /// The full resolved Fluid config map — used by live-add shadow hydration to
+    /// build Fluid hydrations from the same source as startup.
+    pub fn fluid_configs_map(&self) -> &HashMap<Address, FluidPoolConfig> {
+        &self.fluid_configs
+    }
+
+    /// Re-queue pools that could not be hydrated this round (e.g. a Fluid pool
+    /// whose config has not finished resolving) so the next committed block
+    /// retries them, rather than dropping them from the shadow topology.
+    pub fn requeue_newly_added(&mut self, pools: Vec<PoolMetadata>) {
+        self.newly_added.extend(pools);
+    }
+
     /// Get statistics
     pub fn stats(&self) -> PoolTrackerStats {
         PoolTrackerStats {
@@ -438,6 +472,13 @@ impl PoolTracker {
     #[allow(dead_code)]
     pub fn has_pending_updates(&self) -> bool {
         !self.pending_updates.is_empty()
+    }
+
+    /// Drain the pools added since the last call. The ExEx hydrates these into
+    /// the shadow arena from current state at the committed block boundary so a
+    /// live `.add` pool is written without waiting for a restart.
+    pub fn take_newly_added(&mut self) -> Vec<PoolMetadata> {
+        std::mem::take(&mut self.newly_added)
     }
 }
 
@@ -481,6 +522,7 @@ mod tests {
             twocrypto_version: None,
             ekubo_fee: None,
             ekubo_type_config: None,
+            balancer_weights: None,
         }
     }
 
@@ -496,6 +538,59 @@ mod tests {
         assert_eq!(tracker.stats().total_pools, 2);
         assert_eq!(tracker.stats().v2_pools, 1);
         assert_eq!(tracker.stats().v3_pools, 1);
+    }
+
+    /// ITE-16 round-18: added pools surface via `take_newly_added` (for live-add
+    /// shadow hydration); full replace/startup does not surface the whole snapshot,
+    /// the drain empties it, dedup of duplicate adds holds, and `requeue_newly_added`
+    /// puts unhydratable pools back for a later retry.
+    #[test]
+    fn newly_added_drains_and_requeues() {
+        let mut tracker = PoolTracker::new();
+        let a = Address::from([1u8; 20]);
+        let b = Address::from([2u8; 20]);
+        tracker.queue_update(WhitelistUpdate::Add(vec![
+            create_test_pool(a, Protocol::UniswapV2),
+            create_test_pool(b, Protocol::UniswapV3),
+        ]));
+
+        let drained = tracker.take_newly_added();
+        assert_eq!(drained.len(), 2, "both added pools surfaced for hydration");
+        assert!(
+            tracker.take_newly_added().is_empty(),
+            "drain empties the set"
+        );
+
+        // A duplicate add is skipped (already tracked) — nothing new to hydrate.
+        tracker.queue_update(WhitelistUpdate::Add(vec![create_test_pool(
+            a,
+            Protocol::UniswapV2,
+        )]));
+        assert!(
+            tracker.take_newly_added().is_empty(),
+            "duplicate add does not re-queue hydration"
+        );
+
+        // Re-queued (unhydratable) pools come back on the next drain.
+        tracker.requeue_newly_added(drained);
+        assert_eq!(
+            tracker.take_newly_added().len(),
+            2,
+            "requeued pools retried"
+        );
+    }
+
+    #[test]
+    fn replace_does_not_surface_startup_snapshot_as_newly_added() {
+        let mut tracker = PoolTracker::new();
+        tracker.queue_update(WhitelistUpdate::Replace(vec![create_test_pool(
+            Address::from([3u8; 20]),
+            Protocol::UniswapV2,
+        )]));
+        assert!(
+            tracker.take_newly_added().is_empty(),
+            "full replace/startup snapshot is hydrated separately, not as live-add"
+        );
     }
 
     #[test]

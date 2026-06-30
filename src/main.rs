@@ -15,6 +15,7 @@
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
 mod balance_monitor;
+mod balancer_storage;
 mod events;
 mod fluid_decoder;
 mod nats_client;
@@ -81,9 +82,9 @@ struct LiquidityExEx {
 /// Apply a committed-block pool update into the shadow arena (ITE-16 step 3c),
 /// if enabled. Mirrors arena_service's apply so the two writers stay in lockstep
 /// for the pre-cutover diff. `PoolNotFound` means the pool is not in the shadow
-/// topology yet (live-added pools are not hydrated into the shadow — tracked as a
-/// follow-up) and is downgraded to a debug skip; the shadow is a validation
-/// harness and must never crash the ExEx.
+/// topology (for example, metadata/config was insufficient to hydrate it yet, or
+/// the protocol is intentionally not shadow-hydrated) and is downgraded to a debug
+/// skip; the shadow is a validation harness and must never crash the ExEx.
 ///
 /// Takes the `shadow` field directly (not `&mut self`) so callers can apply while
 /// holding the `pool_tracker` read guard — a disjoint field borrow.
@@ -1245,6 +1246,142 @@ fn ekubo_hydration_from_snapshot(
     })
 }
 
+/// 3b/3c Balancer V2 hydration: build a weighted-pool slot from chain state at
+/// the anchor. Balances + swap fee are read from Vault/pool storage (mirroring
+/// `scrape_reth::balancer_storage`); token order, weights and decimals are
+/// immutable pool metadata sourced from the whitelist. Scaling factors are
+/// `10^(18 - decimals)`. Any missing/zero weight, missing decimals, or decimals
+/// > 18 skips the pool (data-integrity rule — never default weight/scale metadata).
+fn balancer_v2_hydration_from_snapshot(
+    state: &dyn StateProvider,
+    pool: &PoolMetadata,
+) -> Option<shadow_arena::BalancerV2Hydration> {
+    let pool_id = pool_id_32(pool)?;
+
+    // Token order token0, token1, then extra_tokens — must match the whitelist
+    // weights (and the live BalancerSwap apply ordering).
+    let mut tokens: Vec<Address> = Vec::with_capacity(2 + pool.extra_tokens.len());
+    tokens.push(pool.token0);
+    tokens.push(pool.token1);
+    tokens.extend(pool.extra_tokens.iter().map(|t| t.address));
+    let n = tokens.len();
+    if !(2..=arena_layout::balancer_v2::MAX_TOKENS).contains(&n) {
+        warn!(pool_id = ?pool_id, n, "Skipping BalancerV2 hydration: token count out of [2,8]");
+        return None;
+    }
+
+    let weights = pool.balancer_weights.clone()?;
+    if weights.len() != n || weights.iter().any(|w| *w == 0) {
+        warn!(pool_id = ?pool_id, "Skipping BalancerV2 hydration: weights missing/zero or length mismatch");
+        return None;
+    }
+
+    // Decimals → scaling factors. Reject missing decimals or >18 (would underflow
+    // / imply a fractional scaling factor Balancer FixedPoint does not support).
+    let mut decimals: Vec<u8> = Vec::with_capacity(n);
+    decimals.push(pool.token0_decimals?);
+    decimals.push(pool.token1_decimals?);
+    for t in &pool.extra_tokens {
+        decimals.push(t.decimals);
+    }
+    let mut scaling_factors: Vec<u64> = Vec::with_capacity(n);
+    for d in &decimals {
+        if *d > 18 {
+            warn!(pool_id = ?pool_id, decimals = d, "Skipping BalancerV2 hydration: token decimals > 18");
+            return None;
+        }
+        scaling_factors.push(10u64.pow(18 - u32::from(*d)));
+    }
+
+    // Swap fee from the pool contract (slot 7, 1e18 scale).
+    let pool_addr = balancer_storage::pool_address(&pool_id);
+    let fee_raw = read_storage_slot(state, pool_addr, balancer_storage::pool_fee_slot());
+    let swap_fee = u64::try_from(fee_raw).ok()?;
+
+    // Effective per-token balances (cash + managed) from the Vault.
+    let balances = read_balancer_v2_balances(state, &pool_id, &tokens)?;
+
+    Some(shadow_arena::BalancerV2Hydration {
+        pool_id,
+        n_tokens: n as u8,
+        tokens: tokens.iter().map(|t| t.into_array()).collect(),
+        weights,
+        scaling_factors,
+        swap_fee,
+        balances,
+    })
+}
+
+/// Read Balancer V2 effective balances from the Vault per pool specialization,
+/// returning them in `expected_tokens` order. Mirrors
+/// `scrape_reth::readers::read_balancer_v2_pool` against a `StateProvider`.
+fn read_balancer_v2_balances(
+    state: &dyn StateProvider,
+    pool_id: &[u8; 32],
+    expected_tokens: &[Address],
+) -> Option<Vec<u128>> {
+    use balancer_storage::PoolSpecialization;
+    let vault = events::BALANCER_V2_VAULT;
+    let n = expected_tokens.len();
+    match PoolSpecialization::from_pool_id(pool_id) {
+        // Both balances packed in one sharedCash word; read the Vault's canonical
+        // tokenA/tokenB ordering and reorder to match the whitelist token order.
+        PoolSpecialization::TwoToken => {
+            if n != 2 {
+                warn!(pool_id = ?pool_id, "BalancerV2 TwoToken pool must have exactly 2 tokens");
+                return None;
+            }
+            let raw_a = read_storage_slot(
+                state,
+                vault,
+                balancer_storage::two_token_token_a_slot(pool_id),
+            );
+            let raw_b = read_storage_slot(
+                state,
+                vault,
+                balancer_storage::two_token_token_b_slot(pool_id),
+            );
+            let token_a = Address::from_slice(&raw_a.to_be_bytes::<32>()[12..]);
+            let token_b = Address::from_slice(&raw_b.to_be_bytes::<32>()[12..]);
+
+            let pair_hash = balancer_storage::two_token_pair_hash(&token_a, &token_b);
+            let cash_slot = balancer_storage::two_token_shared_cash_slot(pool_id, pair_hash);
+            let managed_slot = cash_slot + U256::from(1u64);
+            let shared_cash = read_storage_slot(state, vault, cash_slot);
+            let shared_managed = read_storage_slot(state, vault, managed_slot);
+            let (cash_a, cash_b, _) = balancer_storage::decode_two_token_shared(shared_cash);
+            let (managed_a, managed_b, _) =
+                balancer_storage::decode_two_token_shared(shared_managed);
+            let bal_a = cash_a.checked_add(managed_a).unwrap_or(cash_a);
+            let bal_b = cash_b.checked_add(managed_b).unwrap_or(cash_b);
+
+            if expected_tokens[0] == token_a && expected_tokens[1] == token_b {
+                Some(vec![bal_a, bal_b])
+            } else if expected_tokens[0] == token_b && expected_tokens[1] == token_a {
+                Some(vec![bal_b, bal_a])
+            } else {
+                warn!(pool_id = ?pool_id, "Skipping BalancerV2 TwoToken: whitelist tokens do not match Vault storage");
+                None
+            }
+        }
+        // One packed balance word per token, keyed by poolId+token.
+        PoolSpecialization::MinimalSwapInfo => {
+            let mut bal = Vec::with_capacity(n);
+            for token in expected_tokens {
+                let slot = balancer_storage::vault_balance_slot(pool_id, token);
+                let packed = read_storage_slot(state, vault, slot);
+                let (cash, managed, _) = balancer_storage::decode_packed_balance(packed);
+                bal.push(cash.checked_add(managed).unwrap_or(cash));
+            }
+            Some(bal)
+        }
+        PoolSpecialization::General => {
+            warn!(pool_id = ?pool_id, "Skipping BalancerV2 General pool: unsupported in shadow hydration");
+            None
+        }
+    }
+}
+
 fn curve_stable_hydration_from_snapshot(
     state: &dyn StateProvider,
     pool: &PoolMetadata,
@@ -1490,8 +1627,13 @@ fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
             fluid_hydration_from_snapshot(state.as_ref(), p, fluid_configs, anchor_timestamp)
         })
         .collect();
+    let balancer_v2: Vec<shadow_arena::BalancerV2Hydration> = pools
+        .iter()
+        .filter(|p| p.protocol == Protocol::BalancerV2Weighted)
+        .filter_map(|p| balancer_v2_hydration_from_snapshot(state.as_ref(), p))
+        .collect();
 
-    let counts = shadow.hydrate_startup(
+    let mut counts = shadow.hydrate_startup(
         anchor,
         &v2,
         &v3,
@@ -1502,7 +1644,65 @@ fn hydrate_shadow_from_snapshot<Node: FullNodeComponents>(
         &curve_tricrypto,
         &fluid,
     );
+    // Balancer V2 carries weight/scaling metadata, so it rides the batch path.
+    counts.balancer_v2 = shadow
+        .hydrate_added(&shadow_arena::HydrationBatch {
+            balancer_v2,
+            ..Default::default()
+        })
+        .balancer_v2;
     info!(?counts, anchor, "shadow arena: hydrated startup slots");
+}
+
+/// Build a `HydrationBatch` for the given pools from a state snapshot, returning
+/// the batch plus the pools that could NOT be hydrated (missing metadata, or a
+/// Fluid pool whose config has not resolved yet). Used by live `.add` hydration;
+/// callers re-queue the unhydrated set to retry on a later block.
+fn build_hydration_batch(
+    state: &dyn StateProvider,
+    pools: &[PoolMetadata],
+    fluid_configs: &HashMap<Address, FluidPoolConfig>,
+    block_timestamp: u64,
+) -> (shadow_arena::HydrationBatch, Vec<PoolMetadata>) {
+    let mut batch = shadow_arena::HydrationBatch::default();
+    let mut unhydrated = Vec::new();
+    for p in pools {
+        let hydrated = match p.protocol {
+            Protocol::UniswapV2 => v2_hydration_from_snapshot(state, p)
+                .map(|h| batch.v2.push(h))
+                .is_some(),
+            Protocol::UniswapV3 => v3_hydration_from_snapshot(state, p)
+                .map(|h| batch.v3.push(h))
+                .is_some(),
+            Protocol::UniswapV4 => v4_hydration_from_snapshot(state, p)
+                .map(|h| batch.v4.push(h))
+                .is_some(),
+            Protocol::Ekubo => ekubo_hydration_from_snapshot(state, p)
+                .map(|h| batch.ekubo.push(h))
+                .is_some(),
+            Protocol::CurveStable => curve_stable_hydration_from_snapshot(state, p)
+                .map(|h| batch.curve_stable.push(h))
+                .is_some(),
+            Protocol::CurveTwoCrypto => curve_twocrypto_hydration_from_snapshot(state, p)
+                .map(|h| batch.curve_twocrypto.push(h))
+                .is_some(),
+            Protocol::CurveTricrypto => curve_tricrypto_hydration_from_snapshot(state, p)
+                .map(|h| batch.curve_tricrypto.push(h))
+                .is_some(),
+            Protocol::Fluid => {
+                fluid_hydration_from_snapshot(state, p, fluid_configs, block_timestamp)
+                    .map(|h| batch.fluid.push(h))
+                    .is_some()
+            }
+            Protocol::BalancerV2Weighted => balancer_v2_hydration_from_snapshot(state, p)
+                .map(|h| batch.balancer_v2.push(h))
+                .is_some(),
+        };
+        if !hydrated {
+            unhydrated.push(p.clone());
+        }
+    }
+    (batch, unhydrated)
 }
 
 #[derive(Debug, Clone)]
@@ -2797,6 +2997,58 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     {
                         let mut pool_tracker = exex.pool_tracker.write().await;
                         pool_tracker.end_block();
+                    }
+
+                    // Hydrate pools added by this block's whitelist `.add` into the
+                    // shadow arena from current state, so their subsequent committed
+                    // events update a real slot instead of being skipped until a
+                    // restart. Pools that cannot hydrate yet (e.g. a Fluid config
+                    // still resolving) are re-queued for the next block.
+                    if exex.shadow.is_some() {
+                        let added = exex.pool_tracker.write().await.take_newly_added();
+                        if !added.is_empty() {
+                            match state_at_block(
+                                ctx.provider(),
+                                block_number,
+                                "ChainCommitted live-add hydrate",
+                            ) {
+                                Ok(add_state) => {
+                                    let (batch, unhydrated) = {
+                                        let pool_tracker = exex.pool_tracker.read().await;
+                                        build_hydration_batch(
+                                            add_state.as_ref(),
+                                            &added,
+                                            pool_tracker.fluid_configs_map(),
+                                            block_timestamp,
+                                        )
+                                    };
+                                    if !unhydrated.is_empty() {
+                                        exex.pool_tracker
+                                            .write()
+                                            .await
+                                            .requeue_newly_added(unhydrated);
+                                    }
+                                    if let Some(shadow) = exex.shadow.as_mut() {
+                                        if !batch.is_empty() {
+                                            let added_counts = shadow.hydrate_added(&batch);
+                                            info!(
+                                                ?added_counts,
+                                                block_number,
+                                                "shadow arena: hydrated live-added pools"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        block_number,
+                                        "live-add shadow hydration: no state; re-queueing"
+                                    );
+                                    exex.pool_tracker.write().await.requeue_newly_added(added);
+                                }
+                            }
+                        }
                     }
 
                     if events_in_block > 0 {

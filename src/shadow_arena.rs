@@ -91,6 +91,50 @@ pub struct FluidHydration {
     pub fee: u32,
 }
 
+pub struct BalancerV2Hydration {
+    pub pool_id: [u8; 32],
+    pub n_tokens: u8,
+    /// Token addresses ordered to match `weights`/`scaling_factors`/`balances`.
+    pub tokens: Vec<[u8; 20]>,
+    /// Normalized weights (1e18 scale) from whitelist metadata.
+    pub weights: Vec<u64>,
+    /// Per-token scaling factors (10^(18 - decimals)).
+    pub scaling_factors: Vec<u64>,
+    /// Swap fee (1e18 scale) read from pool storage.
+    pub swap_fee: u64,
+    /// Per-token effective balances (cash + managed) read from Vault storage.
+    pub balances: Vec<u128>,
+}
+
+/// A batch of per-protocol hydrations. Used for live `.add` topology hydration
+/// (and as the grouping the per-protocol add loop consumes).
+#[derive(Default)]
+pub struct HydrationBatch {
+    pub v2: Vec<V2Hydration>,
+    pub v3: Vec<UniswapV3Hydration>,
+    pub v4: Vec<UniswapV4Hydration>,
+    pub ekubo: Vec<EkuboHydration>,
+    pub curve_stable: Vec<CurveStableHydration>,
+    pub curve_twocrypto: Vec<CurveTwoCryptoHydration>,
+    pub curve_tricrypto: Vec<CurveTricryptoHydration>,
+    pub fluid: Vec<FluidHydration>,
+    pub balancer_v2: Vec<BalancerV2Hydration>,
+}
+
+impl HydrationBatch {
+    pub fn is_empty(&self) -> bool {
+        self.v2.is_empty()
+            && self.v3.is_empty()
+            && self.v4.is_empty()
+            && self.ekubo.is_empty()
+            && self.curve_stable.is_empty()
+            && self.curve_twocrypto.is_empty()
+            && self.curve_tricrypto.is_empty()
+            && self.fluid.is_empty()
+            && self.balancer_v2.is_empty()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StartupHydrationCounts {
     pub v2: usize,
@@ -101,6 +145,7 @@ pub struct StartupHydrationCounts {
     pub curve_twocrypto: usize,
     pub curve_tricrypto: usize,
     pub fluid: usize,
+    pub balancer_v2: usize,
 }
 
 impl StartupHydrationCounts {
@@ -113,7 +158,142 @@ impl StartupHydrationCounts {
             + self.curve_twocrypto
             + self.curve_tricrypto
             + self.fluid
+            + self.balancer_v2
     }
+}
+
+/// Add a batch of per-protocol hydrations to the arena via the shared writer,
+/// returning per-protocol success counts. Shared by `hydrate_startup` and
+/// `hydrate_added` so the per-protocol add loops live in exactly one place.
+/// Does NOT signal topology or set the replay anchor — callers do that.
+#[allow(clippy::too_many_arguments)]
+fn add_pools(
+    writer: &mut SharedArenaWriter,
+    v2: &[V2Hydration],
+    v3: &[UniswapV3Hydration],
+    v4: &[UniswapV4Hydration],
+    ekubo: &[EkuboHydration],
+    curve_stable: &[CurveStableHydration],
+    curve_twocrypto: &[CurveTwoCryptoHydration],
+    curve_tricrypto: &[CurveTricryptoHydration],
+    fluid: &[FluidHydration],
+    balancer_v2: &[BalancerV2Hydration],
+) -> StartupHydrationCounts {
+    let mut counts = StartupHydrationCounts::default();
+
+    for p in v2 {
+        match writer.add_v2_pool(
+            p.address,
+            p.reserve0,
+            p.reserve1,
+            p.token0,
+            p.token1,
+            p.token0_decimals,
+            p.token1_decimals,
+        ) {
+            Ok(()) => counts.v2 += 1,
+            Err(e) => tracing::warn!(address = ?p.address, "shadow V2 hydration failed: {e}"),
+        }
+    }
+
+    for p in v3 {
+        match writer.add_v3_pool(p.pool.clone()) {
+            Ok(()) => counts.v3 += 1,
+            Err(e) => tracing::warn!(address = ?p.address, "shadow V3 hydration failed: {e}"),
+        }
+    }
+
+    for p in v4 {
+        match writer.add_v4_pool(p.pool.clone()) {
+            Ok(()) => counts.v4 += 1,
+            Err(e) => tracing::warn!(pool_id = ?p.pool_id, "shadow V4 hydration failed: {e}"),
+        }
+    }
+
+    for p in ekubo {
+        match writer.add_ekubo_pool(p.pool.clone()) {
+            Ok(()) => counts.ekubo += 1,
+            Err(e) => tracing::warn!(pool_id = ?p.pool_id, "shadow Ekubo hydration failed: {e}"),
+        }
+    }
+
+    for p in curve_stable {
+        match writer.add_curve_stable_pool(p.address, &p.pool) {
+            Ok(()) => counts.curve_stable += 1,
+            Err(e) => {
+                tracing::warn!(address = ?p.address, "shadow CurveStable hydration failed: {e}")
+            }
+        }
+    }
+
+    for p in curve_twocrypto {
+        match writer.add_curve_twocrypto_pool(p.address, &p.pool) {
+            Ok(()) => counts.curve_twocrypto += 1,
+            Err(e) => {
+                tracing::warn!(address = ?p.address, "shadow CurveTwoCrypto hydration failed: {e}")
+            }
+        }
+    }
+
+    for p in curve_tricrypto {
+        match writer.add_curve_tricrypto_pool(p.address, &p.pool) {
+            Ok(()) => counts.curve_tricrypto += 1,
+            Err(e) => {
+                tracing::warn!(address = ?p.address, "shadow CurveTricrypto hydration failed: {e}")
+            }
+        }
+    }
+
+    for p in fluid {
+        match writer.add_fluid_pool(
+            p.address,
+            p.token0,
+            p.token1,
+            p.fee,
+            p.token0_decimals,
+            p.token1_decimals,
+        ) {
+            Ok(()) => {
+                if let Err(e) = writer.update_fluid_reserves(
+                    p.address,
+                    p.col_token0_real,
+                    p.col_token1_real,
+                    p.col_token0_imaginary,
+                    p.col_token1_imaginary,
+                    p.debt_token0_real,
+                    p.debt_token1_real,
+                    p.debt_token0_imaginary,
+                    p.debt_token1_imaginary,
+                    p.center_price,
+                    u128::from(p.fee),
+                ) {
+                    tracing::warn!(address = ?p.address, "shadow Fluid reserve hydration failed: {e}");
+                } else {
+                    counts.fluid += 1;
+                }
+            }
+            Err(e) => tracing::warn!(address = ?p.address, "shadow Fluid hydration failed: {e}"),
+        }
+    }
+
+    for p in balancer_v2 {
+        match writer.add_balancer_v2_pool(
+            p.pool_id,
+            p.n_tokens,
+            &p.tokens,
+            &p.weights,
+            &p.scaling_factors,
+            p.swap_fee,
+            &p.balances,
+        ) {
+            Ok(()) => counts.balancer_v2 += 1,
+            Err(e) => {
+                tracing::warn!(pool_id = ?p.pool_id, "shadow BalancerV2 hydration failed: {e}")
+            }
+        }
+    }
+
+    counts
 }
 
 /// In-process writer for the (shadow) pool arena.
@@ -178,114 +358,65 @@ impl ShadowArena {
         fluid: &[FluidHydration],
     ) -> StartupHydrationCounts {
         self.scraped_at_block = anchor_block;
-        let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-        let mut counts = StartupHydrationCounts::default();
-
-        for p in v2 {
-            match writer.add_v2_pool(
-                p.address,
-                p.reserve0,
-                p.reserve1,
-                p.token0,
-                p.token1,
-                p.token0_decimals,
-                p.token1_decimals,
-            ) {
-                Ok(()) => counts.v2 += 1,
-                Err(e) => tracing::warn!(address = ?p.address, "shadow V2 hydration failed: {e}"),
-            }
-        }
-
-        for p in v3 {
-            match writer.add_v3_pool(p.pool.clone()) {
-                Ok(()) => counts.v3 += 1,
-                Err(e) => tracing::warn!(address = ?p.address, "shadow V3 hydration failed: {e}"),
-            }
-        }
-
-        for p in v4 {
-            match writer.add_v4_pool(p.pool.clone()) {
-                Ok(()) => counts.v4 += 1,
-                Err(e) => tracing::warn!(pool_id = ?p.pool_id, "shadow V4 hydration failed: {e}"),
-            }
-        }
-
-        for p in ekubo {
-            match writer.add_ekubo_pool(p.pool.clone()) {
-                Ok(()) => counts.ekubo += 1,
-                Err(e) => {
-                    tracing::warn!(pool_id = ?p.pool_id, "shadow Ekubo hydration failed: {e}")
-                }
-            }
-        }
-
-        for p in curve_stable {
-            match writer.add_curve_stable_pool(p.address, &p.pool) {
-                Ok(()) => counts.curve_stable += 1,
-                Err(e) => {
-                    tracing::warn!(address = ?p.address, "shadow CurveStable hydration failed: {e}")
-                }
-            }
-        }
-
-        for p in curve_twocrypto {
-            match writer.add_curve_twocrypto_pool(p.address, &p.pool) {
-                Ok(()) => counts.curve_twocrypto += 1,
-                Err(e) => {
-                    tracing::warn!(address = ?p.address, "shadow CurveTwoCrypto hydration failed: {e}")
-                }
-            }
-        }
-
-        for p in curve_tricrypto {
-            match writer.add_curve_tricrypto_pool(p.address, &p.pool) {
-                Ok(()) => counts.curve_tricrypto += 1,
-                Err(e) => {
-                    tracing::warn!(address = ?p.address, "shadow CurveTricrypto hydration failed: {e}")
-                }
-            }
-        }
-
-        for p in fluid {
-            match writer.add_fluid_pool(
-                p.address,
-                p.token0,
-                p.token1,
-                p.fee,
-                p.token0_decimals,
-                p.token1_decimals,
-            ) {
-                Ok(()) => {
-                    if let Err(e) = writer.update_fluid_reserves(
-                        p.address,
-                        p.col_token0_real,
-                        p.col_token1_real,
-                        p.col_token0_imaginary,
-                        p.col_token1_imaginary,
-                        p.debt_token0_real,
-                        p.debt_token1_real,
-                        p.debt_token0_imaginary,
-                        p.debt_token1_imaginary,
-                        p.center_price,
-                        u128::from(p.fee),
-                    ) {
-                        tracing::warn!(address = ?p.address, "shadow Fluid reserve hydration failed: {e}");
-                    } else {
-                        counts.fluid += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(address = ?p.address, "shadow Fluid hydration failed: {e}")
-                }
-            }
-        }
-
-        writer.signal_topology_change();
+        let counts = {
+            let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+            // Balancer V2 is hydrated via `hydrate_added` (it needs the weights/
+            // scaling metadata threaded through a batch), so pass none here.
+            let counts = add_pools(
+                &mut writer,
+                v2,
+                v3,
+                v4,
+                ekubo,
+                curve_stable,
+                curve_twocrypto,
+                curve_tricrypto,
+                fluid,
+                &[],
+            );
+            writer.signal_topology_change();
+            counts
+        };
         tracing::info!(
             ?counts,
             total = counts.total(),
             anchor_block,
             "Shadow arena startup hydration complete"
+        );
+        counts
+    }
+
+    /// Hydrate live-added (`.add`) whitelist pools into the shadow topology from a
+    /// post-block state snapshot, WITHOUT re-anchoring the replay guard: existing
+    /// pools keep their startup anchor, and the new pool's future committed events
+    /// (block > the current tip it was scraped at) apply forward. Bumps
+    /// `slot_version` so readers re-index. Also used at startup for the Balancer V2
+    /// batch. Returns the per-protocol counts of slots added.
+    pub fn hydrate_added(&mut self, batch: &HydrationBatch) -> StartupHydrationCounts {
+        if batch.is_empty() {
+            return StartupHydrationCounts::default();
+        }
+        let counts = {
+            let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+            let counts = add_pools(
+                &mut writer,
+                &batch.v2,
+                &batch.v3,
+                &batch.v4,
+                &batch.ekubo,
+                &batch.curve_stable,
+                &batch.curve_twocrypto,
+                &batch.curve_tricrypto,
+                &batch.fluid,
+                &batch.balancer_v2,
+            );
+            writer.signal_topology_change();
+            counts
+        };
+        tracing::info!(
+            ?counts,
+            total = counts.total(),
+            "Shadow arena: hydrated live-added pools"
         );
         counts
     }
@@ -1934,6 +2065,57 @@ mod tests {
         assert!(ids.contains(&PoolIdentifier::Address(Address::from(a))));
         assert!(ids.contains(&PoolIdentifier::Address(Address::from(b))));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ITE-16 round-18: Balancer V2 startup/live hydration writes a weighted-pool
+    /// slot (tokens/weights/scaling/fee/balances) readable from the arena.
+    #[test]
+    fn hydrate_added_writes_balancer_v2_pool() {
+        let path = temp_arena_path("balancer_add");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        let pool_id = [0xB2_u8; 32];
+
+        let batch = HydrationBatch {
+            balancer_v2: vec![BalancerV2Hydration {
+                pool_id,
+                n_tokens: 2,
+                tokens: vec![[0x11; 20], [0x22; 20]],
+                // 80/20 weighted pool (1e18 scale).
+                weights: vec![800_000_000_000_000_000, 200_000_000_000_000_000],
+                // token0 18 dec -> 1; token1 8 dec (WBTC-like) -> 1e10.
+                scaling_factors: vec![1, 10_000_000_000],
+                swap_fee: 1_000_000_000_000_000,
+                balances: vec![1_000, 2_000],
+            }],
+            ..Default::default()
+        };
+        let counts = shadow.hydrate_added(&batch);
+        assert_eq!(counts.balancer_v2, 1);
+        assert_eq!(counts.total(), 1);
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let pool = writer
+            .get_balancer_v2_pool(&pool_id)
+            .expect("balancer pool present after hydrate_added");
+        assert_eq!(pool.n_tokens, 2);
+        assert_eq!(pool.swap_fee, 1_000_000_000_000_000);
+        assert_eq!(pool.balances[0], 1_000);
+        assert_eq!(pool.balances[1], 2_000);
+        assert_eq!(pool.weights[1], 200_000_000_000_000_000);
+        assert_eq!(pool.scaling_factors[1], 10_000_000_000);
+        assert_eq!(pool.tokens[0], [0x11; 20]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An empty live-add batch is a no-op (no slots added, no panic).
+    #[test]
+    fn hydrate_added_empty_batch_is_noop() {
+        let path = temp_arena_path("empty_add");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        let counts = shadow.hydrate_added(&HydrationBatch::default());
+        assert_eq!(counts.total(), 0);
         let _ = std::fs::remove_file(&path);
     }
 }

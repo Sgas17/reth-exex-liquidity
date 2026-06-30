@@ -343,6 +343,12 @@ pub struct PoolMetadata {
     /// Ekubo PoolConfig type_config (packed u32). Required for Ekubo arena hydration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ekubo_type_config: Option<u32>,
+
+    /// Balancer V2 normalized weights (1e18 scale), ordered token0, token1, then
+    /// `extra_tokens`. Immutable pool bytecode (not in storage), so sourced from
+    /// whitelist `additional_data.weights`. Required for Balancer arena hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_weights: Option<Vec<u64>>,
 }
 
 /// Whitelist control message sent from dynamicWhitelist to ExEx
