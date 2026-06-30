@@ -360,10 +360,14 @@ impl ShadowArena {
     /// Promote a V3 pool to a roomier tier (ITE-16 Phase 2). The fresh `pool` was
     /// rebuilt from a full re-scrape, so `determine_tier` already placed it in the
     /// right tier. This is failure-safe: the old slot is removed only after the
-    /// target tier is confirmed to have a free slot, so a full target tier leaves
+    /// target tier is confirmed to accept the pool, so a full target tier leaves
     /// the (overflowed) lower-tier pool in place rather than losing it — the next
-    /// overflow re-queues the promotion. On success it is an in-place topology
-    /// change (remove old + add new + bump `slot_version`; no double buffer).
+    /// overflow re-queues the promotion. The preflight is same-tier-aware: when the
+    /// pool already occupies a slot in the (saturated) target tier — a transient
+    /// overflow that re-scrapes back to the same tier — the rewrite is allowed
+    /// because removing the old assignment frees the exact slot the re-add reuses.
+    /// On success it is an in-place topology change (remove old + add new + bump
+    /// `slot_version`; no double buffer).
     pub fn retier_v3(
         &mut self,
         addr: [u8; 20],
@@ -376,7 +380,19 @@ impl ShadowArena {
             AnyUniswapV3Pool::Major(_) => PoolTier::Major,
         };
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-        if !writer.v3_tier_has_free_slot(tier) {
+        // Same-tier-aware preflight: a saturated target tier is acceptable when
+        // the pool ALREADY occupies a slot in it (a transient overflow that
+        // re-scrapes back to the same tier). Removing the old assignment frees
+        // exactly the slot the re-add reuses, so requiring a *separate* free slot
+        // would wrongly reject a valid in-place rewrite and strand the pool with
+        // its overflowed snapshot.
+        let current_tier = writer.get_v3_pool(&addr).map(|p| match p {
+            AnyUniswapV3Pool::Low(_) => PoolTier::Low,
+            AnyUniswapV3Pool::Active(_) => PoolTier::Active,
+            AnyUniswapV3Pool::Popular(_) => PoolTier::Popular,
+            AnyUniswapV3Pool::Major(_) => PoolTier::Major,
+        });
+        if !writer.v3_tier_has_free_slot(tier) && current_tier != Some(tier) {
             return Err(crate::shadow_apply::ApplyError::Writer(
                 WriterError::NoFreeSlots(tier),
             ));
@@ -404,7 +420,14 @@ impl ShadowArena {
             AnyUniswapV4Pool::Major(_) => PoolTier::Major,
         };
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-        if !writer.v4_tier_has_free_slot(tier) {
+        // Same-tier-aware preflight (see [`Self::retier_v3`]).
+        let current_tier = writer.get_v4_pool(&pool_id).map(|p| match p {
+            AnyUniswapV4Pool::Low(_) => PoolTier::Low,
+            AnyUniswapV4Pool::Active(_) => PoolTier::Active,
+            AnyUniswapV4Pool::Popular(_) => PoolTier::Popular,
+            AnyUniswapV4Pool::Major(_) => PoolTier::Major,
+        });
+        if !writer.v4_tier_has_free_slot(tier) && current_tier != Some(tier) {
             return Err(crate::shadow_apply::ApplyError::Writer(
                 WriterError::NoFreeSlots(tier),
             ));
@@ -432,7 +455,14 @@ impl ShadowArena {
             AnyEkuboPool::Major(_) => PoolTier::Major,
         };
         let mut writer = SharedArenaWriter::new(self.arena.region_mut());
-        if !writer.ekubo_tier_has_free_slot(tier) {
+        // Same-tier-aware preflight (see [`Self::retier_v3`]).
+        let current_tier = writer.get_ekubo_pool(&pool_id).map(|p| match p {
+            AnyEkuboPool::Low(_) => PoolTier::Low,
+            AnyEkuboPool::Active(_) => PoolTier::Active,
+            AnyEkuboPool::Popular(_) => PoolTier::Popular,
+            AnyEkuboPool::Major(_) => PoolTier::Major,
+        });
+        if !writer.ekubo_tier_has_free_slot(tier) && current_tier != Some(tier) {
             return Err(crate::shadow_apply::ApplyError::Writer(
                 WriterError::NoFreeSlots(tier),
             ));
@@ -495,7 +525,8 @@ mod tests {
     use arena_layout::{
         AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, SharedArenaRegion,
         UniswapV3ActivePoolData, UniswapV3LowPoolData, UniswapV3MajorPoolData,
-        UniswapV3PopularPoolData, UniswapV4LowPoolData, SHARED_ARENA_VERSION, V3_MAJOR_CAPACITY,
+        UniswapV3PopularPoolData, UniswapV4LowPoolData, UniswapV4MajorPoolData,
+        SHARED_ARENA_VERSION, V3_MAJOR_CAPACITY, V4_MAJOR_CAPACITY,
     };
     use arena_writer::SharedArenaWriter;
     use std::sync::atomic::Ordering;
@@ -1699,6 +1730,209 @@ mod tests {
             "reorg-delivered overflow queued for promotion"
         );
         assert_eq!(pending[0].0, Protocol::UniswapV3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 2 same-tier failure-safety (round-17 Critical 2): when the target tier
+    /// is saturated ONLY because the pool's own slot occupies it (a transient
+    /// overflow that re-scrapes back to the same tier), the rewrite must succeed —
+    /// removing the old assignment frees the exact slot the re-add reuses. Without
+    /// the same-tier-aware preflight this would be rejected, stranding the pool with
+    /// its overflowed snapshot.
+    #[test]
+    fn retier_same_tier_rewrites_when_tier_saturated_v3() {
+        let path = temp_arena_path("retier_same_tier_v3");
+        let a = [0xD1_u8; 20];
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        // Fill every Major slot; the last one is our pool `a`.
+        {
+            let mut writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            for i in 0..V3_MAJOR_CAPACITY as u16 {
+                let id = if i + 1 == V3_MAJOR_CAPACITY as u16 {
+                    a
+                } else {
+                    let mut x = [0u8; 20];
+                    x[18] = (i >> 8) as u8;
+                    x[19] = i as u8;
+                    x
+                };
+                let mut major = UniswapV3MajorPoolData::default();
+                major.common.pool_id = id;
+                major.common.is_active.store(true, Ordering::Release);
+                major.sqrt_price_x96 = U256::from(1u64);
+                major.tick_spacing = 10;
+                major.token0_decimals = 6;
+                major.token1_decimals = 18;
+                writer
+                    .add_v3_pool(AnyUniswapV3Pool::Major(major))
+                    .expect("fill major slot");
+            }
+            assert!(
+                !writer.v3_tier_has_free_slot(PoolTier::Major),
+                "Major tier saturated"
+            );
+        }
+
+        // Re-scrape lands `a` back in Major (a valid Major-sized snapshot). The tier
+        // is full, but `a` already owns a Major slot, so the rewrite succeeds.
+        let mut major = UniswapV3MajorPoolData::default();
+        major.common.pool_id = a;
+        major.common.is_active.store(true, Ordering::Release);
+        major.sqrt_price_x96 = U256::from(123_456u64);
+        major.tick_spacing = 10;
+        major.token0_decimals = 6;
+        major.token1_decimals = 18;
+        shadow
+            .retier_v3(a, AnyUniswapV3Pool::Major(major))
+            .expect("same-tier rewrite into a saturated tier");
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let got = writer
+            .get_v3_pool(&a)
+            .expect("pool present after same-tier retier");
+        assert!(matches!(got, AnyUniswapV3Pool::Major(_)));
+        assert_eq!(
+            got.sqrt_price_x96(),
+            U256::from(123_456u64),
+            "rewritten with the fresh snapshot"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same-tier saturated rewrite for a pool-id-keyed protocol (V4) — round-17
+    /// Critical 2 coverage across the V4 path.
+    #[test]
+    fn retier_same_tier_rewrites_when_tier_saturated_v4() {
+        let path = temp_arena_path("retier_same_tier_v4");
+        let pid = [0xD2_u8; 32];
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        {
+            let mut writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            for i in 0..V4_MAJOR_CAPACITY as u16 {
+                let id = if i + 1 == V4_MAJOR_CAPACITY as u16 {
+                    pid
+                } else {
+                    let mut x = [0u8; 32];
+                    x[30] = (i >> 8) as u8;
+                    x[31] = i as u8;
+                    x
+                };
+                let mut major = UniswapV4MajorPoolData::default();
+                major.pool_id = id;
+                major.common.is_active.store(true, Ordering::Release);
+                major.sqrt_price_x96 = U256::from(1u64);
+                major.tick_spacing = 10;
+                major.token0_decimals = 6;
+                major.token1_decimals = 18;
+                writer
+                    .add_v4_pool(AnyUniswapV4Pool::Major(major))
+                    .expect("fill v4 major slot");
+            }
+            assert!(
+                !writer.v4_tier_has_free_slot(PoolTier::Major),
+                "V4 Major tier saturated"
+            );
+        }
+
+        let mut major = UniswapV4MajorPoolData::default();
+        major.pool_id = pid;
+        major.common.is_active.store(true, Ordering::Release);
+        major.sqrt_price_x96 = U256::from(987_654u64);
+        major.tick_spacing = 10;
+        major.token0_decimals = 6;
+        major.token1_decimals = 18;
+        shadow
+            .retier_v4(pid, AnyUniswapV4Pool::Major(major))
+            .expect("same-tier v4 rewrite into a saturated tier");
+
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        match writer
+            .get_v4_pool(&pid)
+            .expect("v4 pool present after retier")
+        {
+            AnyUniswapV4Pool::Major(p) => {
+                assert_eq!(p.sqrt_price_x96, U256::from(987_654u64));
+            }
+            _ => panic!("expected Major-tier V4 pool"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 2 (round-17 Critical 1): overflow promotions are accumulated across the
+    /// WHOLE reorg sequence and drained once at the end, so a pool overflowing on an
+    /// early block and a different pool overflowing on a later block both survive to
+    /// the single end-of-reorg drain — and a pool touched on multiple blocks is
+    /// queued only once. The per-block drain removed this round re-scraped from a
+    /// mid-sequence snapshot that later deltas then double-applied.
+    #[test]
+    fn reorg_overflow_pending_accumulates_across_blocks() {
+        let path = temp_arena_path("reorg_accum");
+        let a = addr(0x71);
+        let b = addr(0x72);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[
+                UniswapV3Hydration {
+                    address: a,
+                    pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+                },
+                UniswapV3Hydration {
+                    address: b,
+                    pool: AnyUniswapV3Pool::Low(v3_low_pool(b)),
+                },
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let mk = |pool: [u8; 20], block: u64, i: i32| PoolUpdateMessage {
+            pool_id: PoolIdentifier::Address(Address::from(pool)),
+            protocol: Protocol::UniswapV3,
+            update_type: UpdateType::Mint,
+            block_number: block,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: false,
+            update: PoolUpdate::V3Liquidity {
+                tick_lower: i * 100,
+                tick_upper: i * 100 + 50,
+                liquidity_delta: 1_000,
+            },
+        };
+
+        // Block 50: pool A overflows. Block 51: pool B overflows. Block 52: pool A
+        // is touched again. No per-block drain runs — the queue must survive.
+        for i in 0..26i32 {
+            shadow.apply_reorg_event(&mk(a, 50, i)).expect("a@50");
+        }
+        for i in 0..26i32 {
+            shadow.apply_reorg_event(&mk(b, 51, i)).expect("b@51");
+        }
+        for i in 26..52i32 {
+            shadow.apply_reorg_event(&mk(a, 52, i)).expect("a@52");
+        }
+
+        let pending = shadow.take_retier_pending();
+        assert_eq!(
+            pending.len(),
+            2,
+            "two distinct pools queued; A deduped across its two blocks"
+        );
+        let ids: Vec<PoolIdentifier> = pending.into_iter().map(|(_, id)| id).collect();
+        assert!(ids.contains(&PoolIdentifier::Address(Address::from(a))));
+        assert!(ids.contains(&PoolIdentifier::Address(Address::from(b))));
 
         let _ = std::fs::remove_file(&path);
     }

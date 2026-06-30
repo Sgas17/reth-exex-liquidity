@@ -2949,9 +2949,12 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         }
                     }
 
-                    // Promote pools an overflow-on-revert may have grown (e.g. a
-                    // reverted burn re-inserting ticks) before the block signal.
-                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, state.as_ref());
+                    // Overflow promotion is NOT drained here: this loop re-scrapes
+                    // from the FINAL canonical tip, and Step 2 still applies the
+                    // new-chain deltas afterward. Re-scraping a pool now and then
+                    // applying more deltas would double-apply. The pending set is
+                    // accumulated across the whole reorg and drained once, from
+                    // final_state, after every delta has landed (see below).
 
                     drop(state);
                     drop(pool_tracker);
@@ -3074,9 +3077,9 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         reorg_fluid_touched.remove(pool_addr);
                     }
 
-                    // Promote pools that overflowed on the reorg new-block apply
-                    // before the block signal.
-                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, state.as_ref());
+                    // Overflow promotion is drained once at the end of the reorg
+                    // from final_state, not per new block — see Step 1's note and
+                    // the post-Step-2 drain below.
 
                     drop(state);
                     drop(pool_tracker);
@@ -3151,8 +3154,18 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         .map(|b| b.timestamp())
                         .unwrap_or(0),
                 );
-                // Flush the reorg epilogue writes (slot0/fluid finals) into a
-                // shadow block signal at the settled tip.
+                // Drain overflow promotions ONCE, now that every revert + new-chain
+                // delta has landed. Re-scraping each overflowed pool from the settled
+                // final-tip state and replacing its slot is authoritative because no
+                // further deltas are applied after this point (only the epilogue
+                // signal). Doing it per block above would re-scrape from a snapshot
+                // that later deltas then double-apply on top of.
+                {
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, final_state.as_ref());
+                }
+                // Flush the reorg epilogue writes (slot0/fluid finals + promotions)
+                // into a shadow block signal at the settled tip.
                 exex.shadow_end_block(final_tip_block);
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
@@ -3265,9 +3278,10 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                         }
                     }
 
-                    // Promote pools that overflowed on the revert apply before the
-                    // block signal (final_state is the canonical post-revert tip).
-                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, final_state.as_ref());
+                    // Overflow promotion is drained once after the whole revert loop
+                    // (see below): re-scraping from final_state mid-loop, before older
+                    // reverted blocks are unapplied, would install the settled tick set
+                    // and then double-apply the remaining inverse deltas on top.
 
                     drop(pool_tracker);
 
@@ -3333,8 +3347,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     final_tip_block,
                     0, // No new blocks in ChainReverted
                 );
-                // Flush the reorg epilogue writes (slot0/fluid finals) into a
-                // shadow block signal at the settled tip.
+                // Drain overflow promotions ONCE, after every reverted block has been
+                // unapplied — re-scrape each overflowed pool from the settled
+                // post-revert tip. Doing it per block above would re-scrape from
+                // final_state before older reverts landed and double-apply on top.
+                {
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    promote_overflowed_pools(&mut exex.shadow, &pool_tracker, final_state.as_ref());
+                }
+                // Flush the reorg epilogue writes (slot0/fluid finals + promotions)
+                // into a shadow block signal at the settled tip.
                 exex.shadow_end_block(final_tip_block);
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
