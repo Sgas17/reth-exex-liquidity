@@ -2118,4 +2118,108 @@ mod tests {
         assert_eq!(counts.total(), 0);
         let _ = std::fs::remove_file(&path);
     }
+
+    fn hydrate_balancer_two_token(shadow: &mut ShadowArena, pool_id: [u8; 32]) {
+        shadow.hydrate_added(&HydrationBatch {
+            balancer_v2: vec![BalancerV2Hydration {
+                pool_id,
+                n_tokens: 2,
+                tokens: vec![[0x11; 20], [0x22; 20]],
+                weights: vec![500_000_000_000_000_000, 500_000_000_000_000_000],
+                scaling_factors: vec![1, 1],
+                swap_fee: 1_000_000_000_000_000,
+                balances: vec![1_000, 2_000],
+            }],
+            ..Default::default()
+        });
+    }
+
+    fn balancer_v2_pool_balances(
+        shadow: &mut ShadowArena,
+        pool_id: &[u8; 32],
+    ) -> (u128, u128, u64) {
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        let p = writer.get_balancer_v2_pool(pool_id).expect("balancer pool");
+        (p.balances[0], p.balances[1], p.swap_fee)
+    }
+
+    /// Round-19 Critical: a Balancer fee update is an ABSOLUTE write — it sets the
+    /// fee to the message value regardless of `is_revert` (the value is read from
+    /// canonical state, so reverts carry the settled fee, not an inverse).
+    #[test]
+    fn balancer_fee_update_applies_absolute() {
+        let path = temp_arena_path("balancer_fee");
+        let a = [0xB3_u8; 32];
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        hydrate_balancer_two_token(&mut shadow, a);
+
+        let fee_ev = |fee: u64, is_revert: bool| PoolUpdateMessage {
+            pool_id: PoolIdentifier::PoolId(a),
+            protocol: Protocol::BalancerV2Weighted,
+            update_type: UpdateType::Swap,
+            block_number: 10,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert,
+            update: PoolUpdate::BalancerFeeUpdate {
+                swap_fee_percentage: fee,
+            },
+        };
+        shadow
+            .apply_live_event(&fee_ev(3_000_000_000_000_000, false))
+            .expect("apply fee");
+        assert_eq!(
+            balancer_v2_pool_balances(&mut shadow, &a).2,
+            3_000_000_000_000_000
+        );
+
+        // A revert carries the canonical (post-reorg) absolute fee, applied as-is.
+        shadow
+            .apply_live_event(&fee_ev(2_500_000_000_000_000, true))
+            .expect("apply revert fee");
+        assert_eq!(
+            balancer_v2_pool_balances(&mut shadow, &a).2,
+            2_500_000_000_000_000
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Round-19 Warning: join/exit deltas are applied by matching the event's token
+    /// addresses to the pool's stored token order — NOT by positional index. Here
+    /// the event lists tokens in reverse (B, A); positional application would move
+    /// the wrong balances.
+    #[test]
+    fn balancer_liquidity_applies_by_token_order() {
+        let path = temp_arena_path("balancer_liq");
+        let a = [0xB4_u8; 32];
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        hydrate_balancer_two_token(&mut shadow, a); // tokens [A=0x11, B=0x22], bal [1000, 2000]
+
+        // Event order reversed: token B then token A; +500 to B, -300 from A.
+        let ev = PoolUpdateMessage {
+            pool_id: PoolIdentifier::PoolId(a),
+            protocol: Protocol::BalancerV2Weighted,
+            update_type: UpdateType::Mint,
+            block_number: 10,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: false,
+            update: PoolUpdate::BalancerLiquidity {
+                tokens: vec![Address::from([0x22; 20]), Address::from([0x11; 20])],
+                deltas: vec![500, -300],
+            },
+        };
+        shadow.apply_live_event(&ev).expect("apply liquidity");
+        let (bal_a, bal_b, _) = balancer_v2_pool_balances(&mut shadow, &a);
+        assert_eq!(bal_a, 700, "A (index 0) took the -300 delta by token match");
+        assert_eq!(
+            bal_b, 2_500,
+            "B (index 1) took the +500 delta by token match"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

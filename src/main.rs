@@ -246,7 +246,7 @@ impl LiquidityExEx {
         log_index: u64,
         is_revert: bool,
         state: &dyn StateProvider,
-        _pool_tracker: &PoolTracker,
+        pool_tracker: &PoolTracker,
     ) -> Option<PoolUpdateMessage> {
         match event {
             // ============================================================================
@@ -614,7 +614,7 @@ impl LiquidityExEx {
             // and RemoveLiquidityOne signatures. Disambiguate by pool protocol.
             DecodedEvent::TwoCryptoSwap { pool } => {
                 let is_tricrypto =
-                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                    pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
                 let protocol = if is_tricrypto {
                     Protocol::CurveTricrypto
                 } else {
@@ -628,7 +628,7 @@ impl LiquidityExEx {
                         d: crypto_state.d,
                     }
                 } else {
-                    let version = _pool_tracker
+                    let version = pool_tracker
                         .get_by_address(&pool)
                         .and_then(|meta| meta.twocrypto_version.as_deref());
                     let crypto_state = read_twocrypto_full_state(state, pool, version);
@@ -653,7 +653,7 @@ impl LiquidityExEx {
 
             DecodedEvent::TwoCryptoLiquidityChange { pool } => {
                 let is_tricrypto =
-                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                    pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
                 let protocol = if is_tricrypto {
                     Protocol::CurveTricrypto
                 } else {
@@ -667,7 +667,7 @@ impl LiquidityExEx {
                         d: crypto_state.d,
                     }
                 } else {
-                    let version = _pool_tracker
+                    let version = pool_tracker
                         .get_by_address(&pool)
                         .and_then(|meta| meta.twocrypto_version.as_deref());
                     let crypto_state = read_twocrypto_full_state(state, pool, version);
@@ -700,7 +700,7 @@ impl LiquidityExEx {
                 future_time,
             } => {
                 let is_tricrypto =
-                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                    pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
                 let protocol = if is_tricrypto {
                     Protocol::CurveTricrypto
                 } else {
@@ -745,7 +745,7 @@ impl LiquidityExEx {
                 fee_gamma,
             } => {
                 let is_tricrypto =
-                    _pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
+                    pool_tracker.get_protocol(&pool) == Some(Protocol::CurveTricrypto);
                 let protocol = if is_tricrypto {
                     Protocol::CurveTricrypto
                 } else {
@@ -825,17 +825,42 @@ impl LiquidityExEx {
                 },
             }),
 
-            DecodedEvent::BalancerPoolBalanceChanged { pool_id, deltas } => {
+            DecodedEvent::BalancerPoolBalanceChanged {
+                pool_id,
+                tokens,
+                deltas,
+            } => Some(PoolUpdateMessage {
+                pool_id: PoolIdentifier::PoolId(pool_id),
+                protocol: Protocol::BalancerV2Weighted,
+                update_type: UpdateType::Mint,
+                block_number,
+                block_timestamp,
+                tx_index,
+                log_index,
+                is_revert,
+                update: PoolUpdate::BalancerLiquidity { tokens, deltas },
+            }),
+
+            // Balancer WeightedPool swap-fee change: read the ABSOLUTE current fee
+            // from the held canonical state (slot 7) rather than trusting the event
+            // payload, so the same value is correct on commit AND reorg/revert
+            // (reorg-safe absolute write — `is_revert` does not invert a fee).
+            DecodedEvent::BalancerFeeChange { pool } => {
+                let pool_id = pool_tracker.balancer_pool_id_for_addr(&pool)?;
+                let fee_raw = read_storage_slot(state, pool, balancer_storage::pool_fee_slot());
+                let swap_fee_percentage = u64::try_from(fee_raw).ok()?;
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::PoolId(pool_id),
                     protocol: Protocol::BalancerV2Weighted,
-                    update_type: UpdateType::Mint,
+                    update_type: UpdateType::Swap,
                     block_number,
                     block_timestamp,
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::BalancerLiquidity { deltas },
+                    update: PoolUpdate::BalancerFeeUpdate {
+                        swap_fee_percentage,
+                    },
                 })
             }
 
@@ -975,10 +1000,16 @@ impl LiquidityExEx {
                 pool_tracker.is_tracked_address(pool)
             }
 
-            // Balancer V2 events: check pool_id (emitted by Vault singleton)
+            // Balancer V2 Vault events: check pool_id (emitted by Vault singleton)
             DecodedEvent::BalancerSwap { pool_id, .. }
             | DecodedEvent::BalancerPoolBalanceChanged { pool_id, .. } => {
                 pool_tracker.is_tracked_pool_id(pool_id)
+            }
+
+            // Balancer fee change: emitted by the pool contract — confirm the
+            // address maps to a tracked Balancer pool.
+            DecodedEvent::BalancerFeeChange { pool } => {
+                pool_tracker.balancer_pool_id_for_addr(pool).is_some()
             }
 
             // Fluid LogOperate: emitted by Liquidity Layer, `pool` is the
@@ -1039,6 +1070,12 @@ impl LiquidityExEx {
                     debug!(
                         "Filtered Balancer V2 event from untracked pool_id: {:?}",
                         hex::encode(pool_id)
+                    );
+                }
+                DecodedEvent::BalancerFeeChange { pool } => {
+                    debug!(
+                        "Filtered Balancer fee change from untracked pool: {:?}",
+                        pool
                     );
                 }
                 DecodedEvent::FluidOperate { pool, .. } => {
@@ -3015,9 +3052,16 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                                 Ok(add_state) => {
                                     let (batch, unhydrated) = {
                                         let pool_tracker = exex.pool_tracker.read().await;
+                                        // Drop additions that were removed between the
+                                        // drain and now (a failed add + later remove
+                                        // must not hydrate a stale slot).
+                                        let still_tracked: Vec<PoolMetadata> = added
+                                            .into_iter()
+                                            .filter(|p| pool_tracker.is_tracked(&p.pool_id))
+                                            .collect();
                                         build_hydration_batch(
                                             add_state.as_ref(),
-                                            &added,
+                                            &still_tracked,
                                             pool_tracker.fluid_configs_map(),
                                             block_timestamp,
                                         )

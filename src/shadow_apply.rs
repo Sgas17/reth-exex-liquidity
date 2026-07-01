@@ -499,7 +499,7 @@ pub fn apply_live_event(
             }
             writer.update_balancer_v2_balances(id, &new_balances)?;
         }
-        PoolUpdate::BalancerLiquidity { deltas } => {
+        PoolUpdate::BalancerLiquidity { tokens, deltas } => {
             let PoolIdentifier::PoolId(id) = &event.pool_id else {
                 return Ok(false);
             };
@@ -508,7 +508,13 @@ pub fn apply_live_event(
             };
             let n = pool.n_tokens as usize;
             let mut new_balances = pool.balances[..n].to_vec();
-            for (i, delta) in deltas.iter().enumerate().take(n) {
+            // Match each event (token, delta) to the pool's stored token order —
+            // do not assume the Vault event order equals the arena/whitelist order.
+            for (token, delta) in tokens.iter().zip(deltas.iter()) {
+                let token_bytes = token.into_array();
+                let Some(i) = pool.tokens.iter().take(n).position(|t| *t == token_bytes) else {
+                    continue;
+                };
                 let effective = if event.is_revert { -*delta } else { *delta };
                 new_balances[i] = if effective >= 0 {
                     new_balances[i].saturating_add(effective as u128)

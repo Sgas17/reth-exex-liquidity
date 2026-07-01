@@ -269,7 +269,12 @@ pub enum PoolUpdate {
 
     /// Balancer V2 PoolBalanceChanged (join/exit).
     /// Signed deltas per token (positive = entering pool, negative = leaving).
-    BalancerLiquidity { deltas: Vec<i128> },
+    /// `tokens` is parallel to `deltas` (Vault event order); apply matches tokens
+    /// to the pool's stored order rather than trusting positional index.
+    BalancerLiquidity {
+        tokens: Vec<Address>,
+        deltas: Vec<i128>,
+    },
 
     /// Balancer V2 SwapFeePercentageChanged event.
     BalancerFeeUpdate { swap_fee_percentage: u64 },

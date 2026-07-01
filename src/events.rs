@@ -429,10 +429,20 @@ mod balancer {
             int256[] deltas,
             uint256[] protocolFeeAmounts
         );
+
+        /// WeightedPool swap-fee change — emitted by the POOL contract (not the
+        /// Vault). Carries the new absolute fee, but we re-read slot 7 from chain
+        /// state for a reorg-safe value, so only the signature match is used here.
+        /// SwapFeePercentageChanged(uint256 swapFeePercentage)
+        #[derive(Debug)]
+        event SwapFeePercentageChanged(uint256 swapFeePercentage);
     }
 }
 
-use balancer::{PoolBalanceChanged as BalancerPoolBalanceChanged, Swap as BalancerVaultSwap};
+use balancer::{
+    PoolBalanceChanged as BalancerPoolBalanceChanged, Swap as BalancerVaultSwap,
+    SwapFeePercentageChanged,
+};
 
 /// Balancer V2 Vault contract address (Ethereum Mainnet).
 pub const BALANCER_V2_VAULT: Address = Address::new([
@@ -609,11 +619,17 @@ pub enum DecodedEvent {
         amount_in: U256,
         amount_out: U256,
     },
-    /// Balancer V2 Vault PoolBalanceChanged (join/exit).
+    /// Balancer V2 Vault PoolBalanceChanged (join/exit). `tokens` is parallel to
+    /// `deltas` (Vault event order); the apply path matches tokens to the pool's
+    /// stored token order rather than trusting positional index.
     BalancerPoolBalanceChanged {
         pool_id: [u8; 32],
+        tokens: Vec<Address>,
         deltas: Vec<i128>,
     },
+    /// Balancer V2 WeightedPool swap-fee change. `pool` is the pool CONTRACT
+    /// address (`pool_id[..20]`); the absolute new fee is read from chain state.
+    BalancerFeeChange { pool: Address },
 }
 
 /// Check if a log is a Fluid `LogOperate` for a specific pool address
@@ -963,9 +979,23 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
                         }
                     })
                     .collect();
-                return Some(DecodedEvent::BalancerPoolBalanceChanged { pool_id, deltas });
+                return Some(DecodedEvent::BalancerPoolBalanceChanged {
+                    pool_id,
+                    tokens: event.tokens.clone(),
+                    deltas,
+                });
             }
         }
+    }
+
+    // Balancer WeightedPool swap-fee change — emitted by the POOL contract, so it
+    // is matched by signature (not gated on the Vault address). The pool contract
+    // address is tracked in the whitelist (see PoolTracker::add_pools), and
+    // `should_process_event` confirms it maps to a tracked Balancer pool.
+    if log.topics().first() == Some(&SwapFeePercentageChanged::SIGNATURE_HASH)
+        && SwapFeePercentageChanged::decode_log_data(&log.data).is_ok()
+    {
+        return Some(DecodedEvent::BalancerFeeChange { pool });
     }
 
     // ── Curve TricryptoNG-specific events ─────────────────────────────────
@@ -1438,6 +1468,25 @@ mod tests {
                 assert!(amount > 0);
             }
             other => panic!("Expected V3Mint, got {:?}", other),
+        }
+    }
+
+    /// Round-19: the Balancer WeightedPool swap-fee change is emitted by the POOL
+    /// contract (not the Vault) and must decode by signature to `BalancerFeeChange`
+    /// carrying the pool contract address.
+    #[test]
+    fn test_decode_balancer_fee_change() {
+        let pool_addr = Address::from([0x5c; 20]);
+        let log = Log {
+            address: pool_addr,
+            data: LogData::new_unchecked(
+                vec![SwapFeePercentageChanged::SIGNATURE_HASH],
+                vec![0u8; 32].into(), // uint256 swapFeePercentage
+            ),
+        };
+        match decode_log(&log) {
+            Some(DecodedEvent::BalancerFeeChange { pool }) => assert_eq!(pool, pool_addr),
+            other => panic!("Expected BalancerFeeChange, got {:?}", other),
         }
     }
 }

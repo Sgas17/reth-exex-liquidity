@@ -55,6 +55,11 @@ pub struct PoolTracker {
     /// Keyed by pool address. Populated at registration time via RPC.
     fluid_configs: HashMap<Address, FluidPoolConfig>,
 
+    /// Balancer V2 pool CONTRACT address (`pool_id[..20]`) -> 32-byte poolId.
+    /// SwapFeePercentageChanged is emitted by the pool contract, so we track the
+    /// pool address and map it back to the poolId for the arena fee update.
+    balancer_pools_by_addr: HashMap<Address, [u8; 32]>,
+
     /// Pending whitelist updates (applied between blocks)
     pending_updates: VecDeque<WhitelistUpdate>,
 
@@ -86,6 +91,7 @@ impl PoolTracker {
             tracked_addresses: HashSet::new(),
             tracked_pool_ids: HashSet::new(),
             fluid_configs: HashMap::new(),
+            balancer_pools_by_addr: HashMap::new(),
             pending_updates: VecDeque::new(),
             newly_added: Vec::new(),
             in_block: false,
@@ -230,6 +236,12 @@ impl PoolTracker {
                                     BALANCER_V2_VAULT
                                 );
                             }
+                            // Also track the POOL contract address: SwapFeePercentage-
+                            // Changed is emitted by the pool itself, not the Vault. Map
+                            // it back to the 32-byte poolId for the fee-update apply.
+                            let pool_addr = Address::from_slice(&id[..20]);
+                            self.tracked_addresses.insert(pool_addr);
+                            self.balancer_pools_by_addr.insert(pool_addr, *id);
                         }
                         _ => {}
                     }
@@ -275,6 +287,9 @@ impl PoolTracker {
         let mut removed = 0;
 
         for pool_id in pool_ids {
+            // Drop any not-yet-hydrated `.add` for this pool: a failed add followed
+            // by a remove must not later hydrate a stale arena slot.
+            self.newly_added.retain(|p| p.pool_id != pool_id);
             match pool_id {
                 PoolIdentifier::Address(addr) => {
                     if let Some(pool) = self.pools_by_address.remove(&addr) {
@@ -304,6 +319,14 @@ impl PoolTracker {
                 PoolIdentifier::PoolId(id) => {
                     if let Some(pool) = self.pools_by_id.remove(&id) {
                         self.tracked_pool_ids.remove(&id);
+
+                        // Balancer pools also track their pool contract address (for
+                        // fee events) — untrack it and drop the reverse mapping.
+                        if pool.protocol == Protocol::BalancerV2Weighted {
+                            let pool_addr = Address::from_slice(&id[..20]);
+                            self.tracked_addresses.remove(&pool_addr);
+                            self.balancer_pools_by_addr.remove(&pool_addr);
+                        }
 
                         // Update counts
                         match pool.protocol {
@@ -337,6 +360,7 @@ impl PoolTracker {
         self.tracked_addresses.clear();
         self.tracked_pool_ids.clear();
         self.fluid_configs.clear();
+        self.balancer_pools_by_addr.clear();
         self.newly_added.clear();
         self.v2_count = 0;
         self.v3_count = 0;
@@ -443,6 +467,21 @@ impl PoolTracker {
     /// build Fluid hydrations from the same source as startup.
     pub fn fluid_configs_map(&self) -> &HashMap<Address, FluidPoolConfig> {
         &self.fluid_configs
+    }
+
+    /// Map a Balancer pool CONTRACT address (`pool_id[..20]`) back to its 32-byte
+    /// poolId, for the fee-update apply. `None` if not a tracked Balancer pool.
+    pub fn balancer_pool_id_for_addr(&self, addr: &Address) -> Option<[u8; 32]> {
+        self.balancer_pools_by_addr.get(addr).copied()
+    }
+
+    /// Whether a pool identifier is currently tracked. Used by live-add hydration
+    /// to skip drained additions that were removed before they could hydrate.
+    pub fn is_tracked(&self, pool_id: &PoolIdentifier) -> bool {
+        match pool_id {
+            PoolIdentifier::Address(addr) => self.pools_by_address.contains_key(addr),
+            PoolIdentifier::PoolId(id) => self.pools_by_id.contains_key(id),
+        }
     }
 
     /// Re-queue pools that could not be hydrated this round (e.g. a Fluid pool
@@ -578,6 +617,53 @@ mod tests {
             2,
             "requeued pools retried"
         );
+    }
+
+    /// Round-19 Warning: an `.add` removed before it hydrates must not linger in
+    /// `newly_added` (else it would later hydrate a stale/untracked slot).
+    #[test]
+    fn remove_purges_pending_newly_added() {
+        let mut tracker = PoolTracker::new();
+        let a = Address::from([9u8; 20]);
+        tracker.queue_update(WhitelistUpdate::Add(vec![create_test_pool(
+            a,
+            Protocol::UniswapV2,
+        )]));
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(a)]));
+        assert!(
+            tracker.take_newly_added().is_empty(),
+            "removed-before-hydrate add is purged from newly_added"
+        );
+    }
+
+    /// Round-19 Critical: a Balancer pool tracks its CONTRACT address (`pool_id[..20]`)
+    /// so pool-emitted SwapFeePercentageChanged logs pass the filter, and maps it
+    /// back to the poolId. Removal untracks the address and clears the mapping.
+    #[test]
+    fn balancer_pool_contract_addr_tracked_and_mapped() {
+        let mut tracker = PoolTracker::new();
+        let mut pid = [0u8; 32];
+        pid[..20].copy_from_slice(&[0x5c; 20]);
+        pid[21] = 0x02; // TwoToken specialization bytes (not used here)
+        let pool = PoolMetadata {
+            pool_id: PoolIdentifier::PoolId(pid),
+            ..create_test_pool(Address::ZERO, Protocol::BalancerV2Weighted)
+        };
+        tracker.queue_update(WhitelistUpdate::Add(vec![pool]));
+
+        let pool_addr = Address::from_slice(&pid[..20]);
+        assert!(
+            tracker.is_tracked_address(&pool_addr),
+            "pool contract address tracked for fee events"
+        );
+        assert_eq!(tracker.balancer_pool_id_for_addr(&pool_addr), Some(pid));
+
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::PoolId(pid)]));
+        assert!(
+            !tracker.is_tracked_address(&pool_addr),
+            "untracked on remove"
+        );
+        assert_eq!(tracker.balancer_pool_id_for_addr(&pool_addr), None);
     }
 
     #[test]
