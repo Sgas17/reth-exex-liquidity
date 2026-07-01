@@ -354,6 +354,13 @@ pub struct PoolMetadata {
     /// whitelist `additional_data.weights`. Required for Balancer arena hydration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balancer_weights: Option<Vec<u64>>,
+
+    /// Balancer V2 swap fee (1e18 scale) from whitelist `additional_data.swap_fee`.
+    /// The fee has no stable contract storage slot across pool implementations
+    /// (WeightedPool2Tokens packs it in `_miscData`; others use a plain uint256), so
+    /// the resolved whitelist value is authoritative for arena hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_swap_fee: Option<u64>,
 }
 
 /// Whitelist control message sent from dynamicWhitelist to ExEx

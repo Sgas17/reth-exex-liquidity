@@ -121,10 +121,16 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         .and_then(|data| data.get("version"))
         .and_then(|version| version.as_str())
         .map(str::to_owned);
-    let balancer_weights = if protocol == Protocol::BalancerV2Weighted {
-        parse_balancer_weights(p.additional_data.as_ref())
+    let (balancer_weights, balancer_swap_fee) = if protocol == Protocol::BalancerV2Weighted {
+        (
+            parse_balancer_weights(p.additional_data.as_ref()),
+            p.additional_data
+                .as_ref()
+                .and_then(|d| d.get("swap_fee"))
+                .and_then(|v| v.as_u64()),
+        )
     } else {
-        None
+        (None, None)
     };
     Some(PoolMetadata {
         pool_id,
@@ -141,6 +147,7 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         ekubo_fee: p.ekubo_fee,
         ekubo_type_config: p.ekubo_type_config,
         balancer_weights,
+        balancer_swap_fee,
     })
 }
 
@@ -339,7 +346,7 @@ mod tests {
                     "token0": {"address": "0xba100000625a3754423978a60c9317c58a424e3D", "symbol": "BAL", "decimals": 18},
                     "token1": {"address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "decimals": 18},
                     "extra_tokens": [],
-                    "additional_data": {"weights": ["800000000000000000", "200000000000000000"]}
+                    "additional_data": {"weights": ["800000000000000000", "200000000000000000"], "swap_fee": 3000000000000000}
                 }
             ]
         }"#;
@@ -353,6 +360,11 @@ mod tests {
             p.balancer_weights.as_deref(),
             Some(&[800_000_000_000_000_000u64, 200_000_000_000_000_000][..]),
             "80/20 weights parsed from additional_data.weights"
+        );
+        assert_eq!(
+            p.balancer_swap_fee,
+            Some(3_000_000_000_000_000),
+            "swap_fee parsed from additional_data.swap_fee"
         );
     }
 

@@ -18,10 +18,37 @@ use alloy_primitives::{keccak256, Address, B256, U256};
 
 /// Vault base slot for `_minimalSwapInfoPoolsBalances`.
 const VAULT_MINIMAL_SWAP_INFO_BALANCES_SLOT: u64 = 7;
-/// Pool contract slot for `_swapFeePercentage`.
+/// Pool contract slot for `_swapFeePercentage` (plain uint256 in base `WeightedPool`
+/// and later single-slot implementations).
 const POOL_SWAP_FEE_SLOT: u64 = 7;
+/// Pool contract slot for `WeightedPool2Tokens._miscData`, which packs the swap fee
+/// (empirically verified: bits [86:150]).
+const POOL_MISC_DATA_SLOT: u64 = 8;
 /// Vault base slot for `_twoTokenPoolsTokens`.
 const VAULT_TWO_TOKEN_TOKENS_SLOT: u64 = 9;
+
+/// Balancer weighted-pool swap-fee bounds (1e18 scale): min 0.0001%, max 10%.
+/// Used to disambiguate which storage layout a pool uses without hard-coding the
+/// implementation version — an out-of-range read means "wrong slot for this impl".
+const MIN_SWAP_FEE: u64 = 1_000_000_000_000;
+const MAX_SWAP_FEE: u64 = 100_000_000_000_000_000;
+
+/// Slot holding `WeightedPool2Tokens._miscData` (packed pool config incl. swap fee).
+pub fn misc_data_slot() -> U256 {
+    U256::from(POOL_MISC_DATA_SLOT)
+}
+
+/// Extract the swap fee from a `WeightedPool2Tokens._miscData` word — bits [86:150]
+/// (1e18 scale). Verified against mainnet pools 0x96646936 (0.3%) and 0x0b09dea (0.05%).
+pub fn decode_two_token_swap_fee(misc: U256) -> u64 {
+    ((misc >> 86_usize) & U256::from(u64::MAX)).as_limbs()[0]
+}
+
+/// Whether a decoded value is a plausible Balancer weighted-pool swap fee. Lets the
+/// caller try known storage layouts and reject a slot that clearly isn't the fee.
+pub fn is_plausible_swap_fee(fee: u64) -> bool {
+    (MIN_SWAP_FEE..=MAX_SWAP_FEE).contains(&fee)
+}
 
 /// Pool specialization extracted from poolId bytes [20..22].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +209,21 @@ mod tests {
         let (cash_a, cash_b, _) = decode_two_token_shared(raw);
         assert_eq!(cash_a, 63654655540344622052533u128);
         assert_eq!(cash_b, 45136732546133818284u128);
+    }
+
+    #[test]
+    fn two_token_swap_fee_decode() {
+        // Verified mainnet _miscData words (slot 8) for two_token WeightedPool2Tokens.
+        let usdc_weth =
+            U256::from_str_radix("2aa1efb94e00031dea44ef4b04e568127ae", 16).expect("hex");
+        assert_eq!(decode_two_token_swap_fee(usdc_weth), 3_000_000_000_000_000); // 0.3%
+        let dai_weth = U256::from_str_radix("71afd498d00037b6a44f0e3046cd41039d", 16).expect("hex");
+        assert_eq!(decode_two_token_swap_fee(dai_weth), 500_000_000_000_000); // 0.05%
+
+        assert!(is_plausible_swap_fee(3_000_000_000_000_000));
+        assert!(is_plausible_swap_fee(500_000_000_000_000));
+        assert!(!is_plausible_swap_fee(0)); // two_token slot 7 reads 0 — rejected
+        assert!(!is_plausible_swap_fee(u64::MAX));
     }
 
     #[test]

@@ -841,14 +841,15 @@ impl LiquidityExEx {
                 update: PoolUpdate::BalancerLiquidity { tokens, deltas },
             }),
 
-            // Balancer WeightedPool swap-fee change: read the ABSOLUTE current fee
-            // from the held canonical state (slot 7) rather than trusting the event
-            // payload, so the same value is correct on commit AND reorg/revert
-            // (reorg-safe absolute write — `is_revert` does not invert a fee).
+            // Balancer WeightedPool swap-fee change: resolve the ABSOLUTE current fee
+            // from held canonical state (layout-aware — Balancer has no single fee
+            // slot across implementations), not the event payload, so the value is
+            // correct on commit AND reorg/revert (reorg-safe absolute write —
+            // `is_revert` does not invert a fee). An unrecognised layout resolves to
+            // None and skips the update, keeping the whitelist-hydrated fee.
             DecodedEvent::BalancerFeeChange { pool } => {
                 let pool_id = pool_tracker.balancer_pool_id_for_addr(&pool)?;
-                let fee_raw = read_storage_slot(state, pool, balancer_storage::pool_fee_slot());
-                let swap_fee_percentage = u64::try_from(fee_raw).ok()?;
+                let swap_fee_percentage = read_balancer_swap_fee_onchain(state, pool)?;
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::PoolId(pool_id),
                     protocol: Protocol::BalancerV2Weighted,
@@ -1330,10 +1331,16 @@ fn balancer_v2_hydration_from_snapshot(
         scaling_factors.push(10u64.pow(18 - u32::from(*d)));
     }
 
-    // Swap fee from the pool contract (slot 7, 1e18 scale).
+    // Swap fee (1e18 scale) from the whitelist. Balancer has no stable fee storage
+    // slot across pool implementations, so the resolved whitelist value is
+    // authoritative. Fall back to the slot-7 read only for legacy whitelists that
+    // predate `additional_data.swap_fee` (best-effort; correct for base WeightedPool,
+    // 0 for WeightedPool2Tokens).
     let pool_addr = balancer_storage::pool_address(&pool_id);
-    let fee_raw = read_storage_slot(state, pool_addr, balancer_storage::pool_fee_slot());
-    let swap_fee = u64::try_from(fee_raw).ok()?;
+    let swap_fee = match pool.balancer_swap_fee {
+        Some(fee) => fee,
+        None => read_balancer_swap_fee_onchain(state, pool_addr)?,
+    };
 
     // Effective per-token balances (cash + managed) from the Vault.
     let balances = read_balancer_v2_balances(state, &pool_id, &tokens)?;
@@ -1347,6 +1354,25 @@ fn balancer_v2_hydration_from_snapshot(
         swap_fee,
         balances,
     })
+}
+
+/// Resolve a Balancer weighted-pool swap fee from chain state, layout-aware.
+/// Balancer has no single fee storage slot across implementations, so try the two
+/// known layouts and accept only a plausible value:
+///  - base `WeightedPool` / single-slot impls: plain uint256 at slot 7;
+///  - `WeightedPool2Tokens`: packed in `_miscData` (slot 8) bits [86:150].
+/// Returns `None` for an unrecognised layout (caller keeps the current fee rather
+/// than clobbering it). Absolute read from `state`, so it is reorg-safe.
+fn read_balancer_swap_fee_onchain(state: &dyn StateProvider, pool_addr: Address) -> Option<u64> {
+    let s7 = read_storage_slot(state, pool_addr, balancer_storage::pool_fee_slot());
+    if let Ok(fee) = u64::try_from(s7) {
+        if balancer_storage::is_plausible_swap_fee(fee) {
+            return Some(fee);
+        }
+    }
+    let misc = read_storage_slot(state, pool_addr, balancer_storage::misc_data_slot());
+    let fee = balancer_storage::decode_two_token_swap_fee(misc);
+    balancer_storage::is_plausible_swap_fee(fee).then_some(fee)
 }
 
 /// Read Balancer V2 effective balances from the Vault per pool specialization,
