@@ -882,7 +882,10 @@ impl LiquidityExEx {
             // None and skips the update, keeping the whitelist-hydrated fee.
             DecodedEvent::BalancerFeeChange { pool } => {
                 let pool_id = pool_tracker.balancer_pool_id_for_addr(&pool)?;
-                let swap_fee_percentage = read_balancer_swap_fee_onchain(state, pool)?;
+                let version = pool_tracker
+                    .get_by_pool_id(&pool_id)
+                    .and_then(|meta| meta.balancer_version.as_deref());
+                let swap_fee_percentage = read_balancer_swap_fee_onchain(state, pool, version)?;
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::PoolId(pool_id),
                     protocol: Protocol::BalancerV2Weighted,
@@ -1372,7 +1375,9 @@ fn balancer_v2_hydration_from_snapshot(
     let swap_fee = pool
         .balancer_swap_fee
         .filter(|fee| balancer_storage::is_plausible_swap_fee(*fee))
-        .or_else(|| read_balancer_swap_fee_onchain(state, pool_addr))?;
+        .or_else(|| {
+            read_balancer_swap_fee_onchain(state, pool_addr, pool.balancer_version.as_deref())
+        })?;
 
     // Effective per-token balances (cash + managed) from the Vault.
     let balances = read_balancer_v2_balances(state, &pool_id, &tokens)?;
@@ -1388,14 +1393,60 @@ fn balancer_v2_hydration_from_snapshot(
     })
 }
 
-/// Resolve a Balancer weighted-pool swap fee from chain state, layout-aware.
-/// Balancer has no single fee storage slot across implementations, so try the two
-/// known layouts and accept only a plausible value:
-///  - base `WeightedPool` / single-slot impls: plain uint256 at slot 7;
-///  - `WeightedPool2Tokens`: packed in `_miscData` (slot 8) bits [86:150].
-/// Returns `None` for an unrecognised layout (caller keeps the current fee rather
-/// than clobbering it). Absolute read from `state`, so it is reorg-safe.
-fn read_balancer_swap_fee_onchain(state: &dyn StateProvider, pool_addr: Address) -> Option<u64> {
+/// Resolve a Balancer weighted-pool swap fee from chain state.
+/// Balancer has no single fee storage slot across implementations. With a
+/// whitelist-classified `version` (`additional_data.version`, set at DB ingestion)
+/// the implementation's exact slot is read and sanity-checked:
+///  - `v1` (original `WeightedPool`): plain uint256 at slot 7;
+///  - `2tokens` (`WeightedPool2Tokens`): `_miscData` (slot 8) bits [86:150);
+///  - `v2`+ (newer `BasePool`): `_poolState` (slot 8) bits [192:256).
+/// Without one (legacy whitelist rows), the v1/2tokens layouts are probed and the
+/// first plausible value wins. Returns `None` for an unrecognised layout or
+/// implausible read (caller keeps the current fee rather than clobbering it).
+/// Absolute read from `state`, so it is reorg-safe.
+fn read_balancer_swap_fee_onchain(
+    state: &dyn StateProvider,
+    pool_addr: Address,
+    version: Option<&str>,
+) -> Option<u64> {
+    if let Some(version) = version {
+        // Whitelist-classified implementation: read exactly its slot; an
+        // implausible value or unknown version refuses rather than guessing.
+        let Some(layout) = balancer_storage::fee_layout_for_version(version) else {
+            warn!(%pool_addr, version, "unknown Balancer pool version — refusing to guess a fee slot");
+            return None;
+        };
+        let fee = match layout {
+            balancer_storage::BalancerFeeLayout::Slot7 => u64::try_from(read_storage_slot(
+                state,
+                pool_addr,
+                balancer_storage::pool_fee_slot(),
+            ))
+            .ok()?,
+            balancer_storage::BalancerFeeLayout::MiscData => {
+                balancer_storage::decode_two_token_swap_fee(read_storage_slot(
+                    state,
+                    pool_addr,
+                    balancer_storage::misc_data_slot(),
+                ))
+            }
+            balancer_storage::BalancerFeeLayout::PoolState => {
+                balancer_storage::decode_pool_state_swap_fee(read_storage_slot(
+                    state,
+                    pool_addr,
+                    balancer_storage::pool_state_slot(),
+                ))
+            }
+        };
+        if !balancer_storage::is_plausible_swap_fee(fee) {
+            warn!(%pool_addr, version, fee, "implausible Balancer swap fee at version-selected slot");
+            return None;
+        }
+        return Some(fee);
+    }
+    // Legacy whitelists without a classified version: try the v1 and 2tokens
+    // layouts and accept the first plausible value (v2+ pools always publish a
+    // version, so _poolState is never probed blind).
     let s7 = read_storage_slot(state, pool_addr, balancer_storage::pool_fee_slot());
     if let Ok(fee) = u64::try_from(s7) {
         if balancer_storage::is_plausible_swap_fee(fee) {

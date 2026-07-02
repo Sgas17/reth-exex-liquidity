@@ -361,6 +361,15 @@ pub struct PoolMetadata {
     /// the resolved whitelist value is authoritative for arena hydration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balancer_swap_fee: Option<u64>,
+
+    /// Balancer V2 weighted-pool implementation version from whitelist
+    /// `additional_data.version` ("v1", "2tokens", "v2", "v3", ...), classified at
+    /// DB ingestion by matching the fee getter against each candidate storage slot.
+    /// Identifies which slot holds the swap fee (see
+    /// `balancer_storage::fee_layout_for_version`). `None` = unknown layout: the
+    /// published `balancer_swap_fee` is then the only trusted fee source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_version: Option<String>,
 }
 
 /// Whitelist control message sent from dynamicWhitelist to ExEx

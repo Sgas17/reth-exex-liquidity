@@ -31,6 +31,7 @@ mod event_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         }
     }
 
@@ -51,6 +52,7 @@ mod event_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         }
     }
 
@@ -71,6 +73,7 @@ mod event_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         }
     }
 
@@ -357,6 +360,7 @@ mod event_decoding_and_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -408,6 +412,7 @@ mod event_decoding_and_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -449,6 +454,7 @@ mod event_decoding_and_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -502,6 +508,7 @@ mod event_decoding_and_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -553,6 +560,7 @@ mod event_decoding_and_filtering {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         };
 
         tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));

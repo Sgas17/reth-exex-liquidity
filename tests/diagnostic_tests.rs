@@ -100,6 +100,7 @@ fn test_diagnostic_v2_event_processing() {
         ekubo_type_config: None,
         balancer_weights: None,
         balancer_swap_fee: None,
+        balancer_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -188,6 +189,7 @@ fn test_diagnostic_v2_event_wrong_pool() {
         ekubo_type_config: None,
         balancer_weights: None,
         balancer_swap_fee: None,
+        balancer_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -256,6 +258,7 @@ fn test_diagnostic_v3_event_processing() {
         ekubo_type_config: None,
         balancer_weights: None,
         balancer_swap_fee: None,
+        balancer_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -320,6 +323,7 @@ fn test_diagnostic_v4_event_processing() {
         ekubo_type_config: None,
         balancer_weights: None,
         balancer_swap_fee: None,
+        balancer_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -414,6 +418,7 @@ fn test_diagnostic_v4_wrong_pool_id() {
         ekubo_type_config: None,
         balancer_weights: None,
         balancer_swap_fee: None,
+        balancer_version: None,
     };
 
     tracker.queue_update(WhitelistUpdate::Add(vec![pool_metadata]));
@@ -553,6 +558,7 @@ fn test_diagnostic_whitelist_not_applied() {
         ekubo_type_config: None,
         balancer_weights: None,
         balancer_swap_fee: None,
+        balancer_version: None,
     };
 
     // Begin block BEFORE queuing update

@@ -118,24 +118,35 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         .iter()
         .filter_map(canonical_token_to_metadata)
         .collect();
-    let twocrypto_version = p
-        .additional_data
-        .as_ref()
-        .and_then(|data| data.get("version"))
-        .and_then(|version| version.as_str())
-        .map(str::to_owned);
-    let (balancer_weights, balancer_swap_fee) = if protocol == Protocol::BalancerV2Weighted {
-        (
-            parse_balancer_weights(p.additional_data.as_ref()),
-            p.additional_data
-                .as_ref()
-                .and_then(|d| d.get("swap_fee"))
-                .and_then(|v| v.as_u64())
-                .filter(|fee| balancer_storage::is_plausible_swap_fee(*fee)),
-        )
+    // `additional_data.version` is overloaded per protocol: twocrypto impl version
+    // for Curve pools, fee-storage version for Balancer weighted pools (below).
+    let twocrypto_version = if protocol == Protocol::BalancerV2Weighted {
+        None
     } else {
-        (None, None)
+        p.additional_data
+            .as_ref()
+            .and_then(|data| data.get("version"))
+            .and_then(|version| version.as_str())
+            .map(str::to_owned)
     };
+    let (balancer_weights, balancer_swap_fee, balancer_version) =
+        if protocol == Protocol::BalancerV2Weighted {
+            (
+                parse_balancer_weights(p.additional_data.as_ref()),
+                p.additional_data
+                    .as_ref()
+                    .and_then(|d| d.get("swap_fee"))
+                    .and_then(|v| v.as_u64())
+                    .filter(|fee| balancer_storage::is_plausible_swap_fee(*fee)),
+                p.additional_data
+                    .as_ref()
+                    .and_then(|d| d.get("version"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            )
+        } else {
+            (None, None, None)
+        };
     Some(PoolMetadata {
         pool_id,
         token0,
@@ -152,6 +163,7 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
         ekubo_type_config: p.ekubo_type_config,
         balancer_weights,
         balancer_swap_fee,
+        balancer_version,
     })
 }
 
@@ -385,7 +397,7 @@ mod tests {
                     "token0": {"address": "0xba100000625a3754423978a60c9317c58a424e3D", "symbol": "BAL", "decimals": 18},
                     "token1": {"address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "decimals": 18},
                     "extra_tokens": [],
-                    "additional_data": {"weights": ["800000000000000000", "200000000000000000"], "swap_fee": 0}
+                    "additional_data": {"weights": ["800000000000000000", "200000000000000000"], "swap_fee": 0, "version": "2tokens"}
                 }
             ]
         }"#;
@@ -393,6 +405,10 @@ mod tests {
         let pools = super::parse_full_snapshot(json.as_bytes()).expect("parse full snapshot");
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].balancer_swap_fee, None);
+        // Fee-storage version rides along so the on-chain fallback reads the
+        // right slot; it must not leak into twocrypto_version.
+        assert_eq!(pools[0].balancer_version.as_deref(), Some("2tokens"));
+        assert_eq!(pools[0].twocrypto_version, None);
     }
 
     #[test]

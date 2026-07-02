@@ -50,6 +50,47 @@ pub fn is_plausible_swap_fee(fee: u64) -> bool {
     (MIN_SWAP_FEE..=MAX_SWAP_FEE).contains(&fee)
 }
 
+/// Slot holding the newer `BasePool._poolState` word (WeightedPool v2+), which packs
+/// the swap fee in bits [192:256) — empirically verified against the whitelisted
+/// v2/v3/v4 pools (e.g. 0xb814ca71 at 0.3%, 0x31aa8cc6 at 2%). Numerically the same
+/// slot index as `WeightedPool2Tokens._miscData`, decoded differently.
+pub fn pool_state_slot() -> U256 {
+    U256::from(POOL_MISC_DATA_SLOT)
+}
+
+/// Extract the swap fee from a v2+ `BasePool._poolState` word — bits [192:256)
+/// (1e18 scale).
+pub fn decode_pool_state_swap_fee(word: U256) -> u64 {
+    (word >> 192_usize).as_limbs()[0]
+}
+
+/// Where a Balancer weighted-pool implementation stores its swap fee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalancerFeeLayout {
+    /// Original `WeightedPool`: plain uint256 at pool slot 7.
+    Slot7,
+    /// `WeightedPool2Tokens`: packed in `_miscData` (slot 8) bits [86:150).
+    MiscData,
+    /// v2+ `BasePool`: packed in `_poolState` (slot 8) bits [192:256).
+    PoolState,
+}
+
+/// Map a whitelist `additional_data.version` value to its fee-storage layout.
+/// Versions are classified at DB ingestion (`populate_balancer_v2_pools.py`):
+/// `"v1"` | `"2tokens"` | `"v2"`/`"v3"`/... (any v ≥ 2 shares the `_poolState`
+/// layout). Unknown strings return `None` so the caller refuses to guess.
+pub fn fee_layout_for_version(version: &str) -> Option<BalancerFeeLayout> {
+    match version {
+        "v1" => Some(BalancerFeeLayout::Slot7),
+        "2tokens" => Some(BalancerFeeLayout::MiscData),
+        _ => version
+            .strip_prefix('v')
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|n| *n >= 2)
+            .map(|_| BalancerFeeLayout::PoolState),
+    }
+}
+
 /// Pool specialization extracted from poolId bytes [20..22].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolSpecialization {
@@ -158,6 +199,38 @@ pub fn decode_two_token_shared(packed: U256) -> (u128, u128, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_layout_mapping_from_version() {
+        assert_eq!(fee_layout_for_version("v1"), Some(BalancerFeeLayout::Slot7));
+        assert_eq!(
+            fee_layout_for_version("2tokens"),
+            Some(BalancerFeeLayout::MiscData)
+        );
+        for v in ["v2", "v3", "v4", "v5"] {
+            assert_eq!(
+                fee_layout_for_version(v),
+                Some(BalancerFeeLayout::PoolState),
+                "{v} should use the _poolState layout"
+            );
+        }
+        // Unknown strings must refuse rather than guess a slot.
+        assert_eq!(fee_layout_for_version(""), None);
+        assert_eq!(fee_layout_for_version("v0"), None);
+        assert_eq!(fee_layout_for_version("weighted"), None);
+        assert_eq!(fee_layout_for_version("vX"), None);
+    }
+
+    #[test]
+    fn decode_pool_state_fee_bits() {
+        // Empirically verified: v4 pool 0xb814ca71 _poolState with fee 0.3% (3e15)
+        // packed in the top 64 bits.
+        let word = U256::from(3_000_000_000_000_000_u64) << 192_usize;
+        assert_eq!(decode_pool_state_swap_fee(word), 3_000_000_000_000_000);
+        // Lower-bit noise (other packed state) must not leak into the fee.
+        let word = word | U256::from(u128::MAX);
+        assert_eq!(decode_pool_state_swap_fee(word), 3_000_000_000_000_000);
+    }
 
     #[test]
     fn pool_specialization_from_id() {

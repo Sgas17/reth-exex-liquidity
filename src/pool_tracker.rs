@@ -563,6 +563,7 @@ mod tests {
             ekubo_type_config: None,
             balancer_weights: None,
             balancer_swap_fee: None,
+            balancer_version: None,
         }
     }
 
