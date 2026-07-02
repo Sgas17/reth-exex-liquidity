@@ -586,6 +586,7 @@ mod message_creation {
             amount0_out: U256::from(0),
             amount1_out: U256::from(500),
         };
+        assert!(matches!(event, DecodedEvent::V2Swap { pool, .. } if pool == pool_addr));
 
         // In main.rs, this would be created by create_pool_update()
         // We'll manually create it here to test the structure

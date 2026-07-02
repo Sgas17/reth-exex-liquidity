@@ -1364,16 +1364,15 @@ fn balancer_v2_hydration_from_snapshot(
         scaling_factors.push(10u64.pow(18 - u32::from(*d)));
     }
 
-    // Swap fee (1e18 scale) from the whitelist. Balancer has no stable fee storage
-    // slot across pool implementations, so the resolved whitelist value is
-    // authoritative. Fall back to the slot-7 read only for legacy whitelists that
-    // predate `additional_data.swap_fee` (best-effort; correct for base WeightedPool,
-    // 0 for WeightedPool2Tokens).
+    // Swap fee (1e18 scale) from the whitelist when it is plausible. Balancer has
+    // no stable fee storage slot across pool implementations, so older/placeholder
+    // whitelist values can be missing or zero. Fall back to a layout-aware canonical
+    // state read in that case.
     let pool_addr = balancer_storage::pool_address(&pool_id);
-    let swap_fee = match pool.balancer_swap_fee {
-        Some(fee) => fee,
-        None => read_balancer_swap_fee_onchain(state, pool_addr)?,
-    };
+    let swap_fee = pool
+        .balancer_swap_fee
+        .filter(|fee| balancer_storage::is_plausible_swap_fee(*fee))
+        .or_else(|| read_balancer_swap_fee_onchain(state, pool_addr))?;
 
     // Effective per-token balances (cash + managed) from the Vault.
     let balances = read_balancer_v2_balances(state, &pool_id, &tokens)?;

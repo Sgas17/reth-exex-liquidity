@@ -4,7 +4,10 @@
 // (`whitelist.pools.{chain}.{full,add,remove}`), which carries token addresses,
 // decimals, and protocol metadata the ExEx arena writer needs.
 
-use crate::types::{PoolIdentifier, PoolMetadata, Protocol, TokenMetadata};
+use crate::{
+    balancer_storage,
+    types::{PoolIdentifier, PoolMetadata, Protocol, TokenMetadata},
+};
 use alloy_primitives::Address;
 use async_nats::Client;
 use eyre::Result;
@@ -127,7 +130,8 @@ fn canonical_pool_to_metadata(p: &CanonicalPool) -> Option<PoolMetadata> {
             p.additional_data
                 .as_ref()
                 .and_then(|d| d.get("swap_fee"))
-                .and_then(|v| v.as_u64()),
+                .and_then(|v| v.as_u64())
+                .filter(|fee| balancer_storage::is_plausible_swap_fee(*fee)),
         )
     } else {
         (None, None)
@@ -366,6 +370,29 @@ mod tests {
             Some(3_000_000_000_000_000),
             "swap_fee parsed from additional_data.swap_fee"
         );
+    }
+
+    #[test]
+    fn parse_full_snapshot_rejects_zero_balancer_swap_fee() {
+        let json = r#"{
+            "snapshot_id": 1,
+            "chain": "ethereum",
+            "pools": [
+                {
+                    "address": "0x5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56",
+                    "pool_id": "0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014",
+                    "protocol": "balancer_v2_weighted",
+                    "token0": {"address": "0xba100000625a3754423978a60c9317c58a424e3D", "symbol": "BAL", "decimals": 18},
+                    "token1": {"address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "symbol": "WETH", "decimals": 18},
+                    "extra_tokens": [],
+                    "additional_data": {"weights": ["800000000000000000", "200000000000000000"], "swap_fee": 0}
+                }
+            ]
+        }"#;
+
+        let pools = super::parse_full_snapshot(json.as_bytes()).expect("parse full snapshot");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].balancer_swap_fee, None);
     }
 
     #[test]

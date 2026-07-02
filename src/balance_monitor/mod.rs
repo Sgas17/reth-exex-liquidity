@@ -15,6 +15,7 @@ use futures::{StreamExt, TryStreamExt};
 use reth::providers::StateProviderFactory;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{BlockBody, FullNodeComponents, NodePrimitives};
+#[cfg(test)]
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ pub struct ChainTokenBalance {
 /// Convert a raw U256 balance to a human-readable Decimal given token decimals.
 ///
 /// E.g. U256(1_000_000) with 6 decimals → Decimal(1.000000)
+#[cfg(test)]
 pub fn u256_to_decimal(raw: U256, decimals: u8) -> Decimal {
     // U256::to_string gives a base-10 integer string. Parse into Decimal, then
     // shift by `decimals` places. Decimal can hold up to 28-29 significant digits
