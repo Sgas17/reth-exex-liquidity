@@ -980,14 +980,27 @@ impl LiquidityExEx {
         }
     }
 
-    fn send_reorg_complete(&self, stream_seq: &mut u64, final_tip_block: u64) {
-        let seq = next_stream_seq(stream_seq);
+    fn send_reorg_complete(&self, stream_seq: u64, final_tip_block: u64) {
         if let Err(e) = self.socket_tx.try_send(ControlMessage::ReorgComplete {
-            stream_seq: seq,
+            stream_seq,
             final_tip_block,
         }) {
             warn!("Failed to send ReorgComplete: {}", e);
         }
+    }
+
+    /// Reorg/revert epilogue: flush the final-tip arena signal and emit
+    /// `ReorgComplete` carrying ONE shared stream sequence. The production
+    /// verifier only verifies the settled tip once the arena header's
+    /// `last_end_stream_seq` equals `ReorgComplete.stream_seq`, so stamping the
+    /// pre-allocation value would miss/time out every post-reorg final-tip
+    /// check (review round 07). Mirrors the per-block ordering, where
+    /// `send_end_block` allocates the sequence that `shadow_end_block` stamps.
+    /// Both `ChainReorged` and `ChainReverted` funnel through here.
+    async fn finish_reorg(&mut self, stream_seq: &mut u64, final_tip_block: u64) {
+        let seq = next_stream_seq(stream_seq);
+        self.shadow_end_block(final_tip_block, 0, seq).await;
+        self.send_reorg_complete(seq, final_tip_block);
     }
 
     /// Check if we should process this decoded event
@@ -3598,8 +3611,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
                 // Flush the reorg epilogue writes (slot0/fluid finals + promotions)
                 // into a shadow block signal at the settled tip.
-                exex.shadow_end_block(final_tip_block, 0, stream_seq).await;
-                exex.send_reorg_complete(&mut stream_seq, final_tip_block);
+                exex.finish_reorg(&mut stream_seq, final_tip_block).await;
 
                 info!("✅ Reorg handled successfully");
             }
@@ -3790,8 +3802,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
                 // Flush the reorg epilogue writes (slot0/fluid finals + promotions)
                 // into a shadow block signal at the settled tip.
-                exex.shadow_end_block(final_tip_block, 0, stream_seq).await;
-                exex.send_reorg_complete(&mut stream_seq, final_tip_block);
+                exex.finish_reorg(&mut stream_seq, final_tip_block).await;
 
                 info!("✅ Revert handled successfully");
             }
@@ -3959,12 +3970,59 @@ mod tests {
     use super::{
         determine_tier, extract_ekubo_ticks_from_bitmap, extract_ticks_from_bitmap_u256,
         record_affected_slot0_pool, twocrypto_storage_slots, v2_swap_deltas, v3_slots_for_factory,
-        TwoCryptoStorageSlots, V3StorageSlots, PANCAKE_V3_FACTORY_ETHEREUM,
+        LiquidityExEx, TwoCryptoStorageSlots, V3StorageSlots, PANCAKE_V3_FACTORY_ETHEREUM,
     };
-    use crate::types::{PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, UpdateType};
+    use crate::shadow_arena::ShadowArena;
+    use crate::types::{
+        ControlMessage, PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, UpdateType,
+    };
     use alloy_primitives::{I256, U256};
     use arena_layout::PoolTier;
     use std::collections::HashSet;
+
+    /// Round-07 critical regression: the reorg final-tip arena signal and the
+    /// `ReorgComplete` frame must carry the SAME stream sequence — the
+    /// production verifier only verifies the settled tip once the arena
+    /// header's `last_end_stream_seq` equals `ReorgComplete.stream_seq`. Both
+    /// `ChainReorged` and `ChainReverted` funnel through `finish_reorg`, so
+    /// this covers the final-tip sequence correlation for both.
+    #[tokio::test]
+    async fn finish_reorg_stamps_the_reorg_complete_seq_into_the_arena() {
+        let arena_path = std::env::temp_dir().join(format!(
+            "ite20_finish_reorg_{}.arena",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&arena_path);
+        let shadow = ShadowArena::open(&arena_path).expect("open arena");
+        let (socket_tx, mut socket_rx) = tokio::sync::mpsc::channel(4);
+        let mut exex = LiquidityExEx::new(socket_tx, Some(shadow), None);
+
+        let mut stream_seq = 41_u64;
+        exex.finish_reorg(&mut stream_seq, 123).await;
+
+        assert_eq!(
+            stream_seq, 42,
+            "exactly one sequence allocated for the reorg epilogue"
+        );
+        let shadow = exex.shadow.as_ref().expect("shadow present");
+        assert_eq!(shadow.header_block_number(), 123, "settled final tip signalled");
+        assert_eq!(shadow.last_end_stream_seq(), 42, "arena stamps the shared seq");
+        match socket_rx.try_recv().expect("ReorgComplete frame sent") {
+            ControlMessage::ReorgComplete {
+                stream_seq: frame_seq,
+                final_tip_block,
+            } => {
+                assert_eq!(final_tip_block, 123);
+                assert_eq!(
+                    frame_seq,
+                    shadow.last_end_stream_seq(),
+                    "ReorgComplete and the arena signal must share one sequence"
+                );
+            }
+            other => panic!("expected ReorgComplete, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&arena_path);
+    }
 
     fn slot0_event(update: PoolUpdate, protocol: Protocol) -> PoolUpdateMessage {
         PoolUpdateMessage {

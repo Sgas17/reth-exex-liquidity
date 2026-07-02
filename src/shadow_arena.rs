@@ -416,6 +416,19 @@ impl ShadowArena {
         self.authoritative
     }
 
+    /// Last `end_stream_seq` stamped into the arena header signal. The verifier
+    /// correlates this with the socket stream sequence (test/diagnostic use).
+    #[allow(dead_code)] // used by the round-07 finish_reorg regression test
+    pub(crate) fn last_end_stream_seq(&self) -> u64 {
+        self.arena.region().header.get_last_end_stream_seq()
+    }
+
+    /// Block number currently signalled in the arena header (test/diagnostic use).
+    #[allow(dead_code)] // used by the round-07 finish_reorg regression test
+    pub(crate) fn header_block_number(&self) -> u64 {
+        self.arena.region().header.get_block_number()
+    }
+
     /// Open (creating if needed) the shadow arena at `path` and reset it to a
     /// fresh state — matching arena_service, which resets header + slot
     /// assignments on start so tracker state and topology begin in sync.

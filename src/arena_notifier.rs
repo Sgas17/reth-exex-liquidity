@@ -38,6 +38,13 @@ impl ArenaCurveNotifier {
     pub fn bind(path: &str) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
+        // The ExEx runs in a container as its own uid; host-side curve_service
+        // must still be able to connect (mirrors the pool-update socket).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+        }
         tracing::info!(path = %path, "ExEx arena → curve notifier listening");
 
         let (accept_tx, accept_rx) = mpsc::channel(2);
