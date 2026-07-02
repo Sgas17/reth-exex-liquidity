@@ -24,11 +24,11 @@ alloy-primitives = { version = "1.6", default-features = false }
 # defi_arb_rust and shared with its readers.
 #
 # NOTE: these are WORKTREE-RELATIVE development path deps. They only resolve when
-# this ExEx worktree sits beside the paired defi_arb_rust/ITE-16 worktree at the
+# this ExEx worktree sits beside the paired defi_arb_rust/ITE-20 worktree at the
 # layout above; this branch must be built/tested in that paired layout. Before
 # CI/deploy/MR, pin both crates to a git rev instead.
-arena_layout = { path = "../../defi_arb_rust/ITE-16/libs/arena_layout" }
-arena_writer = { path = "../../defi_arb_rust/ITE-16/libs/arena_writer" }
+arena_layout = { path = "../../defi_arb_rust/ITE-20/libs/arena_layout" }
+arena_writer = { path = "../../defi_arb_rust/ITE-20/libs/arena_writer" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

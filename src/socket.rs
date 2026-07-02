@@ -12,8 +12,17 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const SOCKET_PATH: &str = "/tmp/reth_exex_pool_updates.sock";
+/// Default pool-update socket path; override with the `EXEX_SOCKET` env var.
+/// The configured path is authoritative (ITE-20): consumers (`arena_service`
+/// in rollback mode, `arena_verifier`, cutover readiness probes) all read the
+/// same `EXEX_SOCKET` value, so the bind path and probe path cannot diverge.
+const DEFAULT_SOCKET_PATH: &str = "/tmp/reth_exex_pool_updates.sock";
 const BUFFER_SIZE: usize = 10_000; // Buffer up to 10k messages if client is slow
+
+/// Resolve the socket path from `EXEX_SOCKET`, falling back to the default.
+pub fn socket_path_from_env() -> String {
+    std::env::var("EXEX_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string())
+}
 
 /// Bounded channel capacity between ExEx producer and socket broadcast loop.
 /// 50k messages ≈ several thousand blocks worth of events. If exceeded, the
@@ -29,10 +38,19 @@ pub struct PoolUpdateSocketServer {
 }
 
 impl PoolUpdateSocketServer {
-    /// Create a new socket server
+    /// Create a new socket server bound to `EXEX_SOCKET` (or the default).
     pub fn new() -> Result<Self> {
+        let socket_path_str = socket_path_from_env();
+        let socket_path = Path::new(&socket_path_str);
+
+        // Ensure the parent directory exists (e.g. /tmp/exex-sockets/).
+        if let Some(parent) = socket_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
         // Remove existing socket if it exists
-        let socket_path = Path::new(SOCKET_PATH);
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
         }
@@ -48,7 +66,7 @@ impl PoolUpdateSocketServer {
             std::fs::set_permissions(socket_path, permissions)?;
         }
 
-        info!("Unix socket server listening on {}", SOCKET_PATH);
+        info!("Unix socket server listening on {}", socket_path_str);
 
         let (message_tx, message_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (broadcast_tx, _) = broadcast::channel(BUFFER_SIZE);
@@ -213,6 +231,6 @@ mod tests {
         assert!(sender.is_closed() == false);
 
         // Cleanup
-        let _ = std::fs::remove_file(SOCKET_PATH);
+        let _ = std::fs::remove_file(socket_path_from_env());
     }
 }

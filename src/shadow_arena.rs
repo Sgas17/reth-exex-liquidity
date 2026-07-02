@@ -30,6 +30,39 @@ use std::path::{Path, PathBuf};
 /// disabled.
 pub const SHADOW_ARENA_PATH_ENV: &str = "SHADOW_ARENA_PATH";
 
+/// Env var naming the *production* pool-arena mmap path (ITE-20 cutover).
+/// Production mode additionally requires [`EXEX_SOLE_WRITER_ENV`] to be truthy
+/// — `SHARED_ARENA_PATH` alone is NOT enough, because it is a standard reader
+/// path present in ordinary deployment envs; opening (and resetting!) the
+/// production arena just because the env leaked in would create a second
+/// writer before the coordinated cutover. When both are set, the ExEx is the
+/// sole, authoritative writer and emits the arena → curve notification
+/// directly. Takes precedence over [`SHADOW_ARENA_PATH_ENV`]. Readers consume
+/// the same [`arena_layout`] layout unchanged.
+pub const SHARED_ARENA_PATH_ENV: &str = "SHARED_ARENA_PATH";
+
+/// Env flag (`1`/`true`) arming ITE-20 production-writer mode. The SAME flag
+/// name is used on the defi_arb side (`arena_service` refuses to write, the
+/// deployment wrappers skip/stop it) — both repos must flip it atomically at
+/// cutover. Unset/other values: the ExEx never opens the production arena.
+pub const EXEX_SOLE_WRITER_ENV: &str = "EXEX_SOLE_WRITER";
+
+/// True when `name` is set to a truthy value (`1`/`true`, case-insensitive,
+/// trimmed) — mirrors `arena_service`'s guard parsing exactly.
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
+}
+
+/// Notification `signal_reason` label for a block that applied ≥1 pool update.
+/// Informational (curve_service branches on `updated_pools`/`slot_version`, not
+/// this string), but kept identical to `arena_service` for log parity.
+const SIGNAL_LABEL_LIVE_BLOCK_APPLY: &str = "live_block_apply";
+/// Notification `signal_reason` label for a block with no applied pool updates.
+const SIGNAL_LABEL_LIVE_BLOCK_EMPTY: &str = "live_block_empty";
+
 /// Scraped V2 pool state for shadow-arena hydration. Token addresses + decimals
 /// come from the rich whitelist; reserves are scraped from chain state at the
 /// frozen anchor block.
@@ -296,7 +329,27 @@ fn add_pools(
     counts
 }
 
-/// In-process writer for the (shadow) pool arena.
+/// Block-boundary outcome returned by [`ShadowArena::end_block`], carrying the
+/// fields the ExEx needs to build the arena → curve [`ArenaBlockNotification`].
+pub struct EndBlockSignal {
+    /// Informational `signal_reason` label (`live_block_apply`/`live_block_empty`).
+    pub reason: &'static str,
+    /// Wire/logical identifiers of the pools whose slots were written this block.
+    pub updated_pools: Vec<arena_layout::PoolIdentifier>,
+}
+
+/// Convert the ExEx's `crate::types::PoolIdentifier` into the wire/logical
+/// [`arena_layout::PoolIdentifier`] used by the arena → curve notification.
+fn to_wire_ident(id: &PoolIdentifier) -> arena_layout::PoolIdentifier {
+    match id {
+        PoolIdentifier::Address(addr) => arena_layout::PoolIdentifier::Address(addr.into_array()),
+        PoolIdentifier::PoolId(id) => arena_layout::PoolIdentifier::PoolId(*id),
+    }
+}
+
+/// In-process writer for the pool arena. Runs as the ITE-16 *shadow* writer
+/// (diffed against `arena_service`) when opened on `SHADOW_ARENA_PATH`, or as
+/// the ITE-20 *production* sole writer when opened on `SHARED_ARENA_PATH`.
 pub struct ShadowArena {
     arena: ArenaMmap,
     /// Frozen anchor block all slots were hydrated at. Live apply (3c) skips
@@ -306,20 +359,61 @@ pub struct ShadowArena {
     /// LIVE_BLOCK_APPLY (with the count) vs LIVE_BLOCK_EMPTY, matching
     /// arena_service so block signals stay diff-comparable.
     applied_this_block: u64,
+    /// Identifiers of pools whose slot was written since the last `end_block`.
+    /// Drained at the block boundary to populate the arena → curve
+    /// notification's `updated_pools` (ITE-20). Only meaningful in production
+    /// mode, but tracked unconditionally so the shadow path stays comparable.
+    updated_this_block: Vec<arena_layout::PoolIdentifier>,
     /// Pools whose tick array overflowed their tier this block and must be
     /// re-tiered (promoted). Drained at the block boundary by the ExEx, which
     /// re-scrapes them and calls `retier_*`.
     retier_pending: HashSet<(Protocol, PoolIdentifier)>,
+    /// True when opened on the production path (`SHARED_ARENA_PATH`): the ExEx
+    /// is the sole, authoritative writer and drives the arena → curve notifier.
+    authoritative: bool,
 }
 
 impl ShadowArena {
-    /// Open the shadow arena iff `SHADOW_ARENA_PATH` is set; `Ok(None)`
-    /// otherwise (the ExEx then runs unchanged).
+    /// Open the in-process arena writer from the environment.
+    ///
+    /// ITE-20: when `SHARED_ARENA_PATH` is set AND `EXEX_SOLE_WRITER` is truthy
+    /// the ExEx opens the **production** arena as the sole authoritative writer
+    /// (and emits the arena → curve notification directly). `SHARED_ARENA_PATH`
+    /// without the flag is ignored for writing (it is a normal reader path in
+    /// deployment envs — opening it would reset the production arena and race
+    /// `arena_service`); a warning is logged so an intended-but-misconfigured
+    /// cutover is visible, and the deployment wrappers' authoritative-mode
+    /// probes fail closed at the next layer. Otherwise falls back to the
+    /// ITE-16 `SHADOW_ARENA_PATH` diff harness; with neither set, `Ok(None)` —
+    /// the ExEx runs unchanged (socket-only).
     pub fn from_env() -> eyre::Result<Option<Self>> {
+        if let Some(path) = std::env::var_os(SHARED_ARENA_PATH_ENV) {
+            if env_flag_enabled(EXEX_SOLE_WRITER_ENV) {
+                let mut arena = Self::open(&PathBuf::from(path))?;
+                arena.authoritative = true;
+                tracing::info!(
+                    "ExEx pool-arena writer: PRODUCTION mode (sole writer, ITE-20; \
+                     SHARED_ARENA_PATH + EXEX_SOLE_WRITER). arena_service must \
+                     run with EXEX_SOLE_WRITER=1."
+                );
+                return Ok(Some(arena));
+            }
+            tracing::warn!(
+                "SHARED_ARENA_PATH is set but EXEX_SOLE_WRITER is not — NOT opening \
+                 the production arena (it would reset it and race arena_service). \
+                 Set EXEX_SOLE_WRITER=1 on both repos to arm the ITE-20 cutover."
+            );
+        }
         match std::env::var_os(SHADOW_ARENA_PATH_ENV) {
             Some(path) => Ok(Some(Self::open(&PathBuf::from(path))?)),
             None => Ok(None),
         }
+    }
+
+    /// True when this writer owns the production arena (opened via
+    /// `SHARED_ARENA_PATH`) and should drive the arena → curve notifier.
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
     }
 
     /// Open (creating if needed) the shadow arena at `path` and reset it to a
@@ -337,7 +431,9 @@ impl ShadowArena {
             arena,
             scraped_at_block: 0,
             applied_this_block: 0,
+            updated_this_block: Vec::new(),
             retier_pending: HashSet::new(),
+            authoritative: false,
         })
     }
 
@@ -473,6 +569,7 @@ impl ShadowArena {
         };
         if applied {
             self.applied_this_block += 1;
+            self.updated_this_block.push(to_wire_ident(&event.pool_id));
         }
         if overflowed {
             // Queue for promotion at the block boundary (re-scrape + re-tier).
@@ -622,26 +719,43 @@ impl ShadowArena {
         };
         if applied {
             self.applied_this_block += 1;
+            let pool_id = match update {
+                ReorgEpilogueUpdate::Slot0Final { pool_id, .. } => pool_id,
+                ReorgEpilogueUpdate::FluidStateFinal { pool_id, .. } => pool_id,
+            };
+            self.updated_this_block.push(to_wire_ident(pool_id));
         }
         Ok(applied)
     }
 
     /// Block boundary end (3a plumbing, 3c apply count). Signals the header so a
-    /// reader sees the shadow arena advance: LIVE_BLOCK_APPLY with the applied
-    /// count for non-empty blocks, LIVE_BLOCK_EMPTY otherwise — matching
-    /// arena_service so the block signal stays diff-comparable. Resets the
-    /// per-block applied counter.
-    pub fn end_block(&mut self, block_number: u64) {
+    /// reader sees the arena advance: LIVE_BLOCK_APPLY with the applied count for
+    /// non-empty blocks, LIVE_BLOCK_EMPTY otherwise — matching arena_service so
+    /// the block signal stays diff-comparable. Resets the per-block applied
+    /// counter and drains the updated-pool set.
+    ///
+    /// `end_stream_seq` is the ExEx's monotonic stream sequence at the block's
+    /// EndBlock; it is stamped into the header signal and returned to the caller
+    /// so the arena → curve notification (ITE-20) carries the same value.
+    /// Returns the [`EndBlockSignal`] the ExEx uses to build that notification.
+    pub fn end_block(&mut self, block_number: u64, end_stream_seq: u64) -> EndBlockSignal {
         let applied = std::mem::take(&mut self.applied_this_block);
-        let reason = if applied == 0 {
-            SIGNAL_REASON_LIVE_BLOCK_EMPTY
+        let updated_pools = std::mem::take(&mut self.updated_this_block);
+        let (reason_code, reason_label) = if applied == 0 {
+            (SIGNAL_REASON_LIVE_BLOCK_EMPTY, SIGNAL_LABEL_LIVE_BLOCK_EMPTY)
         } else {
-            SIGNAL_REASON_LIVE_BLOCK_APPLY
+            (SIGNAL_REASON_LIVE_BLOCK_APPLY, SIGNAL_LABEL_LIVE_BLOCK_APPLY)
         };
-        self.arena
-            .region()
-            .header
-            .signal_update_complete(block_number, applied, reason, 0);
+        self.arena.region().header.signal_update_complete(
+            block_number,
+            applied,
+            reason_code,
+            end_stream_seq,
+        );
+        EndBlockSignal {
+            reason: reason_label,
+            updated_pools,
+        }
     }
 }
 
@@ -668,6 +782,40 @@ mod tests {
 
     fn addr(byte: u8) -> [u8; 20] {
         [byte; 20]
+    }
+
+    /// ITE-20 arming: `SHARED_ARENA_PATH` alone must NOT open the production
+    /// arena (it is a normal reader path in deployment envs); production mode
+    /// requires `EXEX_SOLE_WRITER` to also be truthy. Both env states are
+    /// exercised in ONE test because env vars are process-global.
+    #[test]
+    fn production_mode_requires_explicit_sole_writer_flag() {
+        let path = temp_arena_path("from_env_gate");
+        std::env::set_var(super::SHARED_ARENA_PATH_ENV, &path);
+        std::env::remove_var(super::EXEX_SOLE_WRITER_ENV);
+        std::env::remove_var(super::SHADOW_ARENA_PATH_ENV);
+
+        // Path set, flag missing → no writer at all (and no arena file reset).
+        let disarmed = ShadowArena::from_env().expect("from_env disarmed");
+        assert!(
+            disarmed.is_none(),
+            "SHARED_ARENA_PATH without EXEX_SOLE_WRITER must not open the production arena"
+        );
+        assert!(
+            !path.exists(),
+            "disarmed mode must not create/reset the arena file"
+        );
+
+        // Path + truthy flag → authoritative production writer.
+        std::env::set_var(super::EXEX_SOLE_WRITER_ENV, "1");
+        let armed = ShadowArena::from_env()
+            .expect("from_env armed")
+            .expect("production writer expected");
+        assert!(armed.is_authoritative());
+
+        std::env::remove_var(super::SHARED_ARENA_PATH_ENV);
+        std::env::remove_var(super::EXEX_SOLE_WRITER_ENV);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Proves `arena_layout` compiles into the ExEx (reth) build and that this
@@ -716,7 +864,7 @@ mod tests {
         let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
 
         let before = shadow.arena.region().header.get_sequence();
-        shadow.end_block(100);
+        let signal = shadow.end_block(100, 4242);
 
         assert_eq!(
             shadow.arena.region().header.get_sequence(),
@@ -724,6 +872,11 @@ mod tests {
             "end_block must bump the update sequence"
         );
         assert_eq!(shadow.arena.region().header.get_block_number(), 100);
+        // Empty block (no applies): empty label + no updated pools, and the
+        // end_stream_seq must be stamped into the header signal (ITE-20).
+        assert_eq!(signal.reason, SIGNAL_LABEL_LIVE_BLOCK_EMPTY);
+        assert!(signal.updated_pools.is_empty());
+        assert_eq!(shadow.arena.region().header.get_last_end_stream_seq(), 4242);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -981,6 +1134,52 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// ITE-20: `end_block` reports the pools written this block (the notification's
+    /// `updated_pools`) and the apply/empty label, then resets for the next block.
+    /// Replay-guard-skipped events do NOT count as updates.
+    #[test]
+    fn end_block_reports_updated_pools_after_apply() {
+        let path = temp_arena_path("end_block_updated_pools");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: addr(0xC2),
+                token0: addr(0x11),
+                token1: addr(0x22),
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        // Event at the anchor is skipped by the replay guard → still an empty block.
+        assert!(!shadow
+            .apply_live_event(&v2_swap_event(addr(0xC2), 100, 1, -1))
+            .expect("apply at anchor"));
+        let empty = shadow.end_block(100, 10);
+        assert_eq!(empty.reason, SIGNAL_LABEL_LIVE_BLOCK_EMPTY);
+        assert!(empty.updated_pools.is_empty());
+
+        // Event above the anchor is applied → non-empty block naming the pool.
+        assert!(shadow
+            .apply_live_event(&v2_swap_event(addr(0xC2), 101, 500, -300))
+            .expect("apply after anchor"));
+        let applied = shadow.end_block(101, 11);
+        assert_eq!(applied.reason, SIGNAL_LABEL_LIVE_BLOCK_APPLY);
+        assert_eq!(
+            applied.updated_pools,
+            vec![arena_layout::PoolIdentifier::Address(addr(0xC2))]
+        );
+
+        // The updated set is drained: the next empty block reports none.
+        let next = shadow.end_block(102, 12);
+        assert!(next.updated_pools.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 3c: an event for a pool not in the shadow topology (e.g. live-added but
     /// not yet hydrated) is skipped, not an error.
     #[test]
@@ -1111,7 +1310,7 @@ mod tests {
             .apply_live_event(&ev)
             .expect("apply ekubo position update"));
         // One applied event → non-empty block signal with count 1.
-        shadow.end_block(101);
+        shadow.end_block(101, 0);
         assert_eq!(
             shadow.arena.region().header.get_signal_reason(),
             SIGNAL_REASON_LIVE_BLOCK_APPLY
@@ -1181,7 +1380,7 @@ mod tests {
         );
 
         // No applies this block → empty signal, count 0.
-        shadow.end_block(101);
+        shadow.end_block(101, 0);
         {
             let h = &shadow.arena.region().header;
             assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_EMPTY);
@@ -1191,7 +1390,7 @@ mod tests {
         // One applied update → apply signal, count 1, counter reset for next block.
         let ev = v2_swap_event(addr(0xC2), 102, 500, -300);
         assert!(shadow.apply_live_event(&ev).expect("apply"));
-        shadow.end_block(102);
+        shadow.end_block(102, 0);
         {
             let h = &shadow.arena.region().header;
             assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_APPLY);
@@ -1200,7 +1399,7 @@ mod tests {
         }
 
         // Next block with no applies → back to empty, count 0 (counter was reset).
-        shadow.end_block(103);
+        shadow.end_block(103, 0);
         {
             let h = &shadow.arena.region().header;
             assert_eq!(h.get_signal_reason(), SIGNAL_REASON_LIVE_BLOCK_EMPTY);
@@ -1293,7 +1492,7 @@ mod tests {
         assert!(shadow.apply_reorg_epilogue(&epilogue).expect("epilogue"));
 
         // Epilogue write counts toward the block signal.
-        shadow.end_block(120);
+        shadow.end_block(120, 0);
         assert_eq!(
             shadow.arena.region().header.get_signal_reason(),
             SIGNAL_REASON_LIVE_BLOCK_APPLY

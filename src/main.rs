@@ -19,6 +19,7 @@ mod balancer_storage;
 mod events;
 mod fluid_decoder;
 mod nats_client;
+mod arena_notifier;
 mod pool_tracker;
 mod shadow_apply;
 mod shadow_arena;
@@ -70,9 +71,15 @@ struct LiquidityExEx {
     /// Socket sender for outgoing messages
     socket_tx: tokio::sync::mpsc::Sender<ControlMessage>,
 
-    /// In-process shadow arena writer (ITE-16). `None` unless `SHADOW_ARENA_PATH`
-    /// is set; when present, block boundaries are mirrored into the shadow arena.
+    /// In-process pool-arena writer. `None` unless `SHADOW_ARENA_PATH` (ITE-16
+    /// diff harness) or `SHARED_ARENA_PATH` (ITE-20 production sole writer) is
+    /// set; when present, block boundaries are written into the arena.
     shadow: Option<ShadowArena>,
+
+    /// Arena → curve notifier (ITE-20). `Some` only when the ExEx is the
+    /// authoritative production writer; it then emits the per-block
+    /// notification that `arena_service` previously sent `curve_service`.
+    curve_notifier: Option<arena_notifier::ArenaCurveNotifier>,
 
     /// Statistics
     events_processed: u64,
@@ -219,20 +226,46 @@ impl LiquidityExEx {
     fn new(
         socket_tx: tokio::sync::mpsc::Sender<ControlMessage>,
         shadow: Option<ShadowArena>,
+        curve_notifier: Option<arena_notifier::ArenaCurveNotifier>,
     ) -> Self {
         Self {
             pool_tracker: Arc::new(RwLock::new(PoolTracker::new())),
             socket_tx,
             shadow,
+            curve_notifier,
             events_processed: 0,
             blocks_processed: 0,
         }
     }
 
-    /// Mirror a block end into the shadow arena (signal), if enabled.
-    fn shadow_end_block(&mut self, block_number: u64) {
-        if let Some(shadow) = self.shadow.as_mut() {
-            shadow.end_block(block_number);
+    /// Close a block in the arena writer (if enabled) and, in production mode,
+    /// emit the arena → curve notification (ITE-20).
+    ///
+    /// `end_stream_seq` is the ExEx `stream_seq` at this block's EndBlock;
+    /// `base_fee_per_gas` is the block's base fee (0 for the reorg-complete
+    /// epilogue signal, which has no single base fee). The notification carries
+    /// the pools written this block so `curve_service` recomputes only the
+    /// affected pairs; topology changes are still detected independently by the
+    /// reader via `slot_version`.
+    async fn shadow_end_block(
+        &mut self,
+        block_number: u64,
+        base_fee_per_gas: u64,
+        end_stream_seq: u64,
+    ) {
+        let Some(shadow) = self.shadow.as_mut() else {
+            return;
+        };
+        let signal = shadow.end_block(block_number, end_stream_seq);
+        if let Some(notifier) = self.curve_notifier.as_mut() {
+            let notification = arena_layout::ArenaBlockNotification {
+                block_number,
+                end_stream_seq,
+                signal_reason: signal.reason.to_string(),
+                updated_pools: signal.updated_pools,
+                base_fee_per_gas,
+            };
+            notifier.notify(&notification).await;
         }
     }
 
@@ -2713,12 +2746,36 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
         }
     });
 
-    // Open the shadow arena writer if SHADOW_ARENA_PATH is set (ITE-16). Disabled
-    // by default — when unset the ExEx behaves exactly as before.
+    // Open the in-process arena writer. SHADOW_ARENA_PATH → ITE-16 diff harness;
+    // SHARED_ARENA_PATH → ITE-20 production sole writer. Disabled (socket-only)
+    // when neither is set — the ExEx then behaves exactly as before.
     let shadow = ShadowArena::from_env()?;
 
+    // In production mode the ExEx owns the arena → curve notification that
+    // arena_service used to send. Bind the notifier only when authoritative so
+    // the pre-cutover shadow/diff path leaves arena_service's notifier in place.
+    //
+    // Bind failure is FATAL in authoritative mode: curve_service's live loop is
+    // driven entirely by this socket (`ArenaNotificationReceiver::recv` — it
+    // reconnects, it does not poll the mmap), so continuing without the notifier
+    // would let the arena advance while curves silently stop updating.
+    let curve_notifier = if shadow.as_ref().is_some_and(ShadowArena::is_authoritative) {
+        let notify_path = std::env::var("ARENA_NOTIFY_SOCKET")
+            .unwrap_or_else(|_| arena_notifier::ARENA_NOTIFY_SOCKET.to_string());
+        let notifier = arena_notifier::ArenaCurveNotifier::bind(&notify_path).map_err(|e| {
+            eyre::eyre!(
+                "cannot bind arena → curve notifier at {notify_path}: {e} — refusing to run as \
+                 sole arena writer without it (curve_service has no mmap-polling fallback)"
+            )
+        })?;
+        info!(path = %notify_path, "ExEx arena → curve notifier bound (ITE-20 production)");
+        Some(notifier)
+    } else {
+        None
+    };
+
     // Initialize ExEx state
-    let mut exex = LiquidityExEx::new(socket_tx, shadow);
+    let mut exex = LiquidityExEx::new(socket_tx, shadow, curve_notifier);
 
     info!("Socket protocol configured: v2 (cutover, legacy v1 removed)");
 
@@ -3054,7 +3111,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
-                    exex.shadow_end_block(block_number);
+                    exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
+                        .await;
 
                     // 🔓 End block - apply any pending whitelist updates atomically
                     {
@@ -3282,7 +3340,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
-                    exex.shadow_end_block(block_number);
+                    exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
+                        .await;
 
                     // 🔓 End block - apply pending updates
                     {
@@ -3407,7 +3466,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
-                    exex.shadow_end_block(block_number);
+                    exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
+                        .await;
 
                     // 🔓 End block - apply pending updates
                     {
@@ -3488,7 +3548,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
                 // Flush the reorg epilogue writes (slot0/fluid finals + promotions)
                 // into a shadow block signal at the settled tip.
-                exex.shadow_end_block(final_tip_block);
+                exex.shadow_end_block(final_tip_block, 0, stream_seq).await;
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
                 info!("✅ Reorg handled successfully");
@@ -3608,7 +3668,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
 
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
-                    exex.shadow_end_block(block_number);
+                    exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
+                        .await;
 
                     // 🔓 End block - apply pending updates
                     {
@@ -3679,7 +3740,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 }
                 // Flush the reorg epilogue writes (slot0/fluid finals + promotions)
                 // into a shadow block signal at the settled tip.
-                exex.shadow_end_block(final_tip_block);
+                exex.shadow_end_block(final_tip_block, 0, stream_seq).await;
                 exex.send_reorg_complete(&mut stream_seq, final_tip_block);
 
                 info!("✅ Revert handled successfully");
