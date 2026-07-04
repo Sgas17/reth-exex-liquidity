@@ -23,12 +23,14 @@ alloy-primitives = { version = "1.6", default-features = false }
 # arena_writer (slot allocation + typed write API). Both are owned by
 # defi_arb_rust and shared with its readers.
 #
-# NOTE: these are WORKTREE-RELATIVE development path deps. They only resolve when
-# this ExEx worktree sits beside the paired defi_arb_rust/ITE-20 worktree at the
-# layout above; this branch must be built/tested in that paired layout. Before
-# CI/deploy/MR, pin both crates to a git rev instead.
-arena_layout = { path = "../../defi_arb_rust/ITE-20/libs/arena_layout" }
-arena_writer = { path = "../../defi_arb_rust/ITE-20/libs/arena_writer" }
+# NOTE: these are CHECKOUT-RELATIVE development path deps: they resolve when
+# this repo's main checkout sits beside the defi_arb_rust main checkout (both
+# directly under $HOME). A branch developed in paired worktrees must adjust
+# both paths to the paired worktree layout (e.g. ../../defi_arb_rust/<ticket>)
+# and restore them before merging. Before CI/deploy/MR, pin both crates to a
+# git rev instead.
+arena_layout = { path = "../defi_arb_rust/libs/arena_layout" }
+arena_writer = { path = "../defi_arb_rust/libs/arena_writer" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

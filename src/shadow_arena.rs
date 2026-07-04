@@ -429,6 +429,12 @@ impl ShadowArena {
         self.arena.region().header.get_block_number()
     }
 
+    /// Arena header `slot_version` (test/diagnostic use).
+    #[allow(dead_code)] // used by the ITE-29 block-signal-ordering regression test
+    pub(crate) fn header_slot_version(&self) -> u64 {
+        self.arena.region().header.get_slot_version()
+    }
+
     /// Open (creating if needed) the shadow arena at `path` and reset it to a
     /// fresh state — matching arena_service, which resets header + slot
     /// assignments on start so tracker state and topology begin in sync.
@@ -528,6 +534,50 @@ impl ShadowArena {
             "Shadow arena: hydrated live-added pools"
         );
         counts
+    }
+
+    /// Remove whitelist-removed pools' slots from the arena topology, so a live
+    /// `.remove` (or a live `.full` replace that drops pools) cannot leave a
+    /// stale active slot that no longer receives events. A pool that never
+    /// hydrated (e.g. added then removed before its hydration block, or a
+    /// failed add) has no slot — `PoolNotFound` is tolerated. Bumps
+    /// `slot_version` once when at least one slot was removed so readers
+    /// re-index, and drops any pending re-tier for removed pools. Returns the
+    /// number of slots actually removed.
+    pub fn remove_pools(&mut self, removed: &[PoolIdentifier]) -> usize {
+        if removed.is_empty() {
+            return 0;
+        }
+        let mut removed_slots = 0usize;
+        {
+            let mut writer = SharedArenaWriter::new(self.arena.region_mut());
+            for pool_id in removed {
+                let result = match pool_id {
+                    PoolIdentifier::Address(addr) => writer.remove_pool(addr.into_array()),
+                    PoolIdentifier::PoolId(id) => writer.remove_pool_v4(*id),
+                };
+                match result {
+                    Ok(()) => removed_slots += 1,
+                    Err(WriterError::PoolNotFound(_)) => {
+                        tracing::debug!(
+                            ?pool_id,
+                            "whitelist-removed pool had no arena slot (never hydrated)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(?pool_id, error = %e, "failed to remove arena slot");
+                    }
+                }
+            }
+            if removed_slots > 0 {
+                writer.signal_topology_change();
+            }
+        }
+        // A removed pool must not be promoted back into the topology by a
+        // pending re-tier queued earlier in the block.
+        self.retier_pending
+            .retain(|(_, pool_id)| !removed.contains(pool_id));
+        removed_slots
     }
 
     /// Hydrate only V2 pool slots. Kept as a focused unit-test/convenience
@@ -755,9 +805,15 @@ impl ShadowArena {
         let applied = std::mem::take(&mut self.applied_this_block);
         let updated_pools = std::mem::take(&mut self.updated_this_block);
         let (reason_code, reason_label) = if applied == 0 {
-            (SIGNAL_REASON_LIVE_BLOCK_EMPTY, SIGNAL_LABEL_LIVE_BLOCK_EMPTY)
+            (
+                SIGNAL_REASON_LIVE_BLOCK_EMPTY,
+                SIGNAL_LABEL_LIVE_BLOCK_EMPTY,
+            )
         } else {
-            (SIGNAL_REASON_LIVE_BLOCK_APPLY, SIGNAL_LABEL_LIVE_BLOCK_APPLY)
+            (
+                SIGNAL_REASON_LIVE_BLOCK_APPLY,
+                SIGNAL_LABEL_LIVE_BLOCK_APPLY,
+            )
         };
         self.arena.region().header.signal_update_complete(
             block_number,
@@ -1883,6 +1939,188 @@ mod tests {
         assert_eq!(pending[0].0, Protocol::UniswapV3);
         // Draining clears it.
         assert!(shadow.take_retier_pending().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ITE-29: whitelist-removed pools' slots are removed from the arena
+    /// topology — address-keyed and pool-id-keyed alike — with one
+    /// `slot_version` bump so readers re-index; never-hydrated pools are
+    /// tolerated (`PoolNotFound`), and a removal-free call does not bump.
+    #[test]
+    fn remove_pools_deactivates_slots_and_bumps_slot_version() {
+        let path = temp_arena_path("remove_pools");
+        let a = addr(0x71);
+        let v4_id = [0x72u8; 32];
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+
+        let mut v4 = UniswapV4LowPoolData {
+            pool_id: v4_id,
+            ..Default::default()
+        };
+        v4.common.pool_id.copy_from_slice(&v4_id[..20]);
+        v4.common.is_active.store(true, Ordering::Release);
+        v4.sqrt_price_x96 = U256::from(2_000u64);
+        v4.tick_spacing = 10;
+
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+            }],
+            &[UniswapV4Hydration {
+                pool_id: v4_id,
+                pool: AnyUniswapV4Pool::Low(v4),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        {
+            let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            assert!(writer.get_v3_pool(&a).is_some());
+            assert!(writer.get_v4_pool(&v4_id).is_some());
+        }
+        let version_before = shadow.arena.region().header.get_slot_version();
+
+        // Remove both hydrated pools plus one that never hydrated: the
+        // unhydrated removal is tolerated, not counted.
+        let removed = shadow.remove_pools(&[
+            PoolIdentifier::Address(Address::from(a)),
+            PoolIdentifier::PoolId(v4_id),
+            PoolIdentifier::Address(Address::from(addr(0x7F))),
+        ]);
+        assert_eq!(removed, 2, "both hydrated slots removed");
+
+        {
+            let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+            assert!(writer.get_v3_pool(&a).is_none(), "V3 slot gone");
+            assert!(writer.get_v4_pool(&v4_id).is_none(), "V4 slot gone");
+        }
+        let version_after = shadow.arena.region().header.get_slot_version();
+        assert!(
+            version_after > version_before,
+            "slot_version bumped so readers re-index"
+        );
+
+        // A second removal finds nothing and must NOT signal topology change.
+        assert_eq!(
+            shadow.remove_pools(&[PoolIdentifier::Address(Address::from(a))]),
+            0
+        );
+        assert_eq!(
+            shadow.arena.region().header.get_slot_version(),
+            version_after,
+            "no-op removal does not bump slot_version"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ITE-29: removing a pool also drops its pending re-tier — a promotion
+    /// queued earlier in the block must not resurrect a removed pool's slot.
+    #[test]
+    fn remove_pools_purges_pending_retier() {
+        let path = temp_arena_path("remove_purges_retier");
+        let a = addr(0x73);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        shadow.retier_pending.insert((
+            Protocol::UniswapV3,
+            PoolIdentifier::Address(Address::from(a)),
+        ));
+
+        assert_eq!(
+            shadow.remove_pools(&[PoolIdentifier::Address(Address::from(a))]),
+            1
+        );
+        assert!(
+            shadow.take_retier_pending().is_empty(),
+            "pending re-tier for the removed pool purged"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ITE-29 integration: a live `.full` replace that drops a hydrated pool
+    /// surfaces it via `take_newly_removed`, and applying the drain to the
+    /// shadow removes the stale slot — the end-to-end path that previously left
+    /// stale active slots for de-whitelisted pools (the arena_verifier
+    /// `missing_socket_update_mismatches` bug).
+    #[test]
+    fn live_full_replace_removes_stale_arena_slot() {
+        use crate::pool_tracker::{PoolTracker, WhitelistUpdate};
+        use crate::types::PoolMetadata;
+
+        let path = temp_arena_path("replace_removes_stale");
+        let a = addr(0x74);
+        let b = addr(0x75);
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_startup(
+            100,
+            &[],
+            &[UniswapV3Hydration {
+                address: a,
+                pool: AnyUniswapV3Pool::Low(v3_low_pool(a)),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let meta = |address: [u8; 20]| PoolMetadata {
+            pool_id: PoolIdentifier::Address(Address::from(address)),
+            token0: Address::ZERO,
+            token1: Address::ZERO,
+            protocol: Protocol::UniswapV3,
+            factory: Address::ZERO,
+            tick_spacing: Some(10),
+            fee: Some(500),
+            token0_decimals: Some(6),
+            token1_decimals: Some(18),
+            extra_tokens: vec![],
+            twocrypto_version: None,
+            ekubo_fee: None,
+            ekubo_type_config: None,
+            balancer_weights: None,
+            balancer_swap_fee: None,
+            balancer_version: None,
+        };
+
+        let mut tracker = PoolTracker::new();
+        tracker.replace_startup(vec![meta(a)]);
+
+        // Live full snapshot no longer contains pool A.
+        tracker.queue_update(WhitelistUpdate::Replace(vec![meta(b)]));
+        let removed = tracker.take_newly_removed();
+        assert_eq!(removed, vec![PoolIdentifier::Address(Address::from(a))]);
+
+        assert_eq!(shadow.remove_pools(&removed), 1);
+        let writer = SharedArenaWriter::new(shadow.arena.region_mut());
+        assert!(
+            writer.get_v3_pool(&a).is_none(),
+            "de-whitelisted pool's slot cannot be read from the arena"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

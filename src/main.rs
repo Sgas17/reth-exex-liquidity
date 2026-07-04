@@ -14,12 +14,12 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+mod arena_notifier;
 mod balance_monitor;
 mod balancer_storage;
 mod events;
 mod fluid_decoder;
 mod nats_client;
-mod arena_notifier;
 mod pool_tracker;
 mod shadow_apply;
 mod shadow_arena;
@@ -1001,6 +1001,35 @@ impl LiquidityExEx {
         let seq = next_stream_seq(stream_seq);
         self.shadow_end_block(final_tip_block, 0, seq).await;
         self.send_reorg_complete(seq, final_tip_block);
+    }
+
+    /// Block-boundary whitelist topology step: apply queued whitelist updates
+    /// (`end_block`) and remove de-whitelisted pools' arena slots.
+    ///
+    /// MUST run BEFORE the block's socket `EndBlock` / arena block signal
+    /// (round-03 Critical): the tracker stops filtering a removed pool's
+    /// events the moment the update applies, so a reader synchronized on the
+    /// block signal must never observe the pool's slot still active — it
+    /// would be permanently stale. Removals need no state provider, so every
+    /// per-block path (committed and both reorg loops) drains them here;
+    /// live-add hydration needs block state and stays in the committed path,
+    /// re-queueing on failure.
+    async fn end_block_whitelist_topology(&mut self, block_number: u64) {
+        let removed = {
+            let mut pool_tracker = self.pool_tracker.write().await;
+            pool_tracker.end_block();
+            pool_tracker.take_newly_removed()
+        };
+        if removed.is_empty() {
+            return;
+        }
+        if let Some(shadow) = self.shadow.as_mut() {
+            let removed_slots = shadow.remove_pools(&removed);
+            info!(
+                requested = removed.len(),
+                removed_slots, block_number, "shadow arena: removed whitelist-removed pools"
+            );
+        }
     }
 
     /// Check if we should process this decoded event
@@ -2945,10 +2974,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 // 3b: hydrate shadow arena slots from one frozen startup anchor.
                 hydrate_shadow_from_snapshot(&ctx, &pools, &fluid_config_map, exex.shadow.as_mut());
 
-                let update = crate::pool_tracker::WhitelistUpdate::Replace(pools);
+                // Startup replace installs the snapshot without surfacing
+                // topology deltas: hydration above already covered every pool,
+                // and the arena was freshly reset. Live `.full` snapshots go
+                // through `WhitelistUpdate::Replace`, which applies deltas.
                 {
                     let mut tracker = exex.pool_tracker.write().await;
-                    tracker.queue_update(update);
+                    tracker.replace_startup(pools);
                     for config in startup_fluid_configs.iter().cloned() {
                         tracker.register_fluid_config(config);
                     }
@@ -3173,21 +3205,19 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(state);
                     drop(pool_tracker);
 
-                    exex.send_end_block(&mut stream_seq, block_number, events_in_block);
-                    exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
-                        .await;
-
-                    // 🔓 End block - apply any pending whitelist updates atomically
-                    {
-                        let mut pool_tracker = exex.pool_tracker.write().await;
-                        pool_tracker.end_block();
-                    }
+                    // 🔓 End block — apply pending whitelist updates and drop
+                    // removed pools' arena slots BEFORE this block's EndBlock /
+                    // arena signal, so a reader synchronized on the block signal
+                    // never observes a stale active slot for a de-whitelisted
+                    // pool (see `end_block_whitelist_topology`).
+                    exex.end_block_whitelist_topology(block_number).await;
 
                     // Hydrate pools added by this block's whitelist `.add` into the
-                    // shadow arena from current state, so their subsequent committed
-                    // events update a real slot instead of being skipped until a
-                    // restart. Pools that cannot hydrate yet (e.g. a Fluid config
-                    // still resolving) are re-queued for the next block.
+                    // shadow arena from current state — also before the block
+                    // signal, so the topology a reader rebuilds at this block
+                    // already contains them. Pools that cannot hydrate yet (e.g.
+                    // a Fluid config still resolving) are re-queued for the next
+                    // committed block.
                     if exex.shadow.is_some() {
                         let added = exex.pool_tracker.write().await.take_newly_added();
                         if !added.is_empty() {
@@ -3241,6 +3271,15 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             }
                         }
                     }
+
+                    // Block signal LAST: the socket EndBlock and the arena block
+                    // signal / arena → curve notification are emitted only after
+                    // this block's whitelist topology (removals + additions) has
+                    // landed, so readers synchronized on them see one coherent
+                    // post-block topology.
+                    exex.send_end_block(&mut stream_seq, block_number, events_in_block);
+                    exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
+                        .await;
 
                     if events_in_block > 0 {
                         info!(
@@ -3402,15 +3441,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(state);
                     drop(pool_tracker);
 
+                    // 🔓 End block — whitelist topology (incl. removed-pool slot
+                    // drop) BEFORE the block signal, as in the committed path.
+                    exex.end_block_whitelist_topology(block_number).await;
+
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
                     exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
                         .await;
-
-                    // 🔓 End block - apply pending updates
-                    {
-                        let mut pool_tracker = exex.pool_tracker.write().await;
-                        pool_tracker.end_block();
-                    }
 
                     if events_reverted > 0 {
                         debug!(
@@ -3528,15 +3565,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(state);
                     drop(pool_tracker);
 
+                    // 🔓 End block — whitelist topology (incl. removed-pool slot
+                    // drop) BEFORE the block signal, as in the committed path.
+                    exex.end_block_whitelist_topology(block_number).await;
+
                     exex.send_end_block(&mut stream_seq, block_number, events_in_block);
                     exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
                         .await;
-
-                    // 🔓 End block - apply pending updates
-                    {
-                        let mut pool_tracker = exex.pool_tracker.write().await;
-                        pool_tracker.end_block();
-                    }
 
                     if events_in_block > 0 {
                         debug!(
@@ -3729,15 +3764,13 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
 
                     drop(pool_tracker);
 
+                    // 🔓 End block — whitelist topology (incl. removed-pool slot
+                    // drop) BEFORE the block signal, as in the committed path.
+                    exex.end_block_whitelist_topology(block_number).await;
+
                     exex.send_end_block(&mut stream_seq, block_number, events_reverted);
                     exex.shadow_end_block(block_number, base_fee_per_gas, stream_seq)
                         .await;
-
-                    // 🔓 End block - apply pending updates
-                    {
-                        let mut pool_tracker = exex.pool_tracker.write().await;
-                        pool_tracker.end_block();
-                    }
 
                     if events_reverted > 0 {
                         debug!(
@@ -3988,10 +4021,8 @@ mod tests {
     /// this covers the final-tip sequence correlation for both.
     #[tokio::test]
     async fn finish_reorg_stamps_the_reorg_complete_seq_into_the_arena() {
-        let arena_path = std::env::temp_dir().join(format!(
-            "ite20_finish_reorg_{}.arena",
-            std::process::id()
-        ));
+        let arena_path =
+            std::env::temp_dir().join(format!("ite20_finish_reorg_{}.arena", std::process::id()));
         let _ = std::fs::remove_file(&arena_path);
         let shadow = ShadowArena::open(&arena_path).expect("open arena");
         let (socket_tx, mut socket_rx) = tokio::sync::mpsc::channel(4);
@@ -4005,8 +4036,16 @@ mod tests {
             "exactly one sequence allocated for the reorg epilogue"
         );
         let shadow = exex.shadow.as_ref().expect("shadow present");
-        assert_eq!(shadow.header_block_number(), 123, "settled final tip signalled");
-        assert_eq!(shadow.last_end_stream_seq(), 42, "arena stamps the shared seq");
+        assert_eq!(
+            shadow.header_block_number(),
+            123,
+            "settled final tip signalled"
+        );
+        assert_eq!(
+            shadow.last_end_stream_seq(),
+            42,
+            "arena stamps the shared seq"
+        );
         match socket_rx.try_recv().expect("ReorgComplete frame sent") {
             ControlMessage::ReorgComplete {
                 stream_seq: frame_seq,
@@ -4021,6 +4060,93 @@ mod tests {
             }
             other => panic!("expected ReorgComplete, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&arena_path);
+    }
+
+    /// ITE-29 round-03 Critical regression: `end_block_whitelist_topology` —
+    /// the step every per-block path (committed + both reorg loops) runs
+    /// BEFORE the block's EndBlock/arena signal — applies a queued live
+    /// `.remove` and drops the pool's arena slot, so a reader synchronized on
+    /// the block signal observes the pool already absent (assignment gone,
+    /// `slot_version` bumped) rather than a stale active slot.
+    #[tokio::test]
+    async fn whitelist_removal_lands_before_the_block_signal() {
+        use crate::pool_tracker::WhitelistUpdate;
+        use crate::shadow_arena::V2Hydration;
+        use crate::types::PoolMetadata;
+        use alloy_primitives::Address;
+
+        let arena_path =
+            std::env::temp_dir().join(format!("ite29_removal_order_{}.arena", std::process::id()));
+        let _ = std::fs::remove_file(&arena_path);
+        let mut shadow = ShadowArena::open(&arena_path).expect("open arena");
+        let pool = [0x29u8; 20];
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: pool,
+                token0: [0x11; 20],
+                token1: [0x22; 20],
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        let (socket_tx, _socket_rx) = tokio::sync::mpsc::channel(4);
+        let mut exex = LiquidityExEx::new(socket_tx, Some(shadow), None);
+        {
+            let mut tracker = exex.pool_tracker.write().await;
+            tracker.replace_startup(vec![PoolMetadata {
+                pool_id: PoolIdentifier::Address(Address::from(pool)),
+                token0: Address::from([0x11; 20]),
+                token1: Address::from([0x22; 20]),
+                protocol: Protocol::UniswapV2,
+                factory: Address::ZERO,
+                tick_spacing: None,
+                fee: None,
+                token0_decimals: Some(18),
+                token1_decimals: Some(6),
+                extra_tokens: vec![],
+                twocrypto_version: None,
+                ekubo_fee: None,
+                ekubo_type_config: None,
+                balancer_weights: None,
+                balancer_swap_fee: None,
+                balancer_version: None,
+            }]);
+            // A live `.remove` arriving mid-block stays queued until end-of-block.
+            tracker.begin_block();
+            tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(
+                Address::from(pool),
+            )]));
+        }
+
+        let version_before = exex.shadow.as_ref().expect("shadow").header_slot_version();
+
+        exex.end_block_whitelist_topology(101).await;
+
+        let shadow = exex.shadow.as_mut().expect("shadow");
+        assert_eq!(
+            shadow.remove_pools(&[PoolIdentifier::Address(Address::from(pool))]),
+            0,
+            "slot already removed before any block-101 signal"
+        );
+        assert!(
+            shadow.header_slot_version() > version_before,
+            "slot_version bumped before the block signal"
+        );
+
+        // The block signal is emitted AFTER the topology step: a reader waking
+        // on the block-101 signal sees the pool absent.
+        exex.shadow_end_block(101, 0, 7).await;
+        assert_eq!(
+            exex.shadow.as_ref().expect("shadow").header_block_number(),
+            101,
+            "block signal lands after removal"
+        );
+
         let _ = std::fs::remove_file(&arena_path);
     }
 

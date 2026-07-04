@@ -33,7 +33,11 @@ pub enum WhitelistUpdate {
     Add(Vec<PoolMetadata>),
     /// Remove pools from whitelist
     Remove(Vec<PoolIdentifier>),
-    /// Full replacement (for initial load only)
+    /// Live full replacement (a `.full` snapshot on the live subscription).
+    /// Applied as a topology delta: dropped pools surface for arena-slot
+    /// removal, new pools for live hydration, retained pools refresh their
+    /// metadata in place. Startup uses [`PoolTracker::replace_startup`], which
+    /// installs the snapshot without surfacing deltas.
     Replace(Vec<PoolMetadata>),
 }
 
@@ -68,6 +72,12 @@ pub struct PoolTracker {
     /// from current state, so live `.add` pools are written without a restart.
     newly_added: Vec<PoolMetadata>,
 
+    /// Pools removed since the last `take_newly_removed` drain. The ExEx drains
+    /// this at each committed block boundary and removes their shadow-arena
+    /// slots, so live `.remove` (and live `.full` replace) cannot leave stale
+    /// active slots that no longer receive events.
+    newly_removed: Vec<PoolIdentifier>,
+
     /// Whether we're currently processing a block
     in_block: bool,
 
@@ -94,6 +104,7 @@ impl PoolTracker {
             balancer_pools_by_addr: HashMap::new(),
             pending_updates: VecDeque::new(),
             newly_added: Vec::new(),
+            newly_removed: Vec::new(),
             in_block: false,
             v2_count: 0,
             v3_count: 0,
@@ -313,6 +324,9 @@ impl PoolTracker {
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
+                        // Surface for shadow-arena slot removal at the next
+                        // committed block boundary.
+                        self.newly_removed.push(PoolIdentifier::Address(addr));
                         removed += 1;
                     }
                 }
@@ -341,6 +355,9 @@ impl PoolTracker {
                             Protocol::Fluid => self.fluid_count -= 1,
                         }
 
+                        // Surface for shadow-arena slot removal at the next
+                        // committed block boundary.
+                        self.newly_removed.push(PoolIdentifier::PoolId(id));
                         removed += 1;
                     }
                 }
@@ -350,9 +367,73 @@ impl PoolTracker {
         info!("Removed {} pools from whitelist", removed);
     }
 
-    /// Full replacement of whitelist (used for initial load)
+    /// Live full replacement of the whitelist (a `.full` snapshot on the live
+    /// subscription). Applied as a topology DELTA against the current tracker:
+    /// pools absent from the new snapshot are removed (surfacing via
+    /// `take_newly_removed` so their shadow-arena slots are dropped), pools
+    /// new to the snapshot are added (surfacing via `take_newly_added` for
+    /// live hydration), and pools present in both refresh their stored
+    /// metadata from the snapshot — the full snapshot is the current whitelist
+    /// truth — without surfacing topology deltas (their arena slots stay
+    /// live). Resolved Fluid configs are keyed separately and kept. Startup
+    /// uses [`Self::replace_startup`] instead, which installs the snapshot
+    /// without surfacing deltas.
     fn replace_all(&mut self, pools: Vec<PoolMetadata>) {
-        warn!("Full whitelist replacement with {} pools", pools.len());
+        warn!("Live full whitelist replacement with {} pools", pools.len());
+
+        let new_ids: HashSet<PoolIdentifier> = pools.iter().map(|p| p.pool_id.clone()).collect();
+        let removed: Vec<PoolIdentifier> = self
+            .pools_by_address
+            .keys()
+            .map(|addr| PoolIdentifier::Address(*addr))
+            .chain(
+                self.pools_by_id
+                    .keys()
+                    .map(|id| PoolIdentifier::PoolId(*id)),
+            )
+            .filter(|id| !new_ids.contains(id))
+            .collect();
+
+        // removed = old − new: untrack + surface via `newly_removed`.
+        self.remove_pools(removed);
+
+        // retained = old ∩ new: refresh stored metadata in place. Protocol
+        // counts, tracked sets, and the Balancer addr↔id map are all keyed by
+        // the (unchanged) identifier, so only the metadata value is replaced.
+        // A protocol flip for the same identifier would desync the per-protocol
+        // counts — that is a whitelist bug, so keep the old entry and warn.
+        for pool in &pools {
+            let existing = match &pool.pool_id {
+                PoolIdentifier::Address(addr) => self.pools_by_address.get_mut(addr),
+                PoolIdentifier::PoolId(id) => self.pools_by_id.get_mut(id),
+            };
+            if let Some(existing) = existing {
+                if existing.protocol == pool.protocol {
+                    *existing = pool.clone();
+                } else {
+                    warn!(
+                        pool_id = ?pool.pool_id,
+                        old = ?existing.protocol,
+                        new = ?pool.protocol,
+                        "full snapshot changes a retained pool's protocol — keeping old metadata"
+                    );
+                }
+            }
+        }
+
+        // added = new − old: `add_pools` skips already-tracked pools, so only
+        // genuinely-new pools surface as `newly_added` for live hydration.
+        self.add_pools(pools, true);
+    }
+
+    /// Startup full replacement: clear the tracker and install the snapshot
+    /// WITHOUT surfacing topology deltas. Startup shadow hydration is driven
+    /// explicitly from the same snapshot at the frozen anchor before this is
+    /// called, so surfacing the universe as `newly_added` would re-hydrate
+    /// every pool at the first committed block; the arena is freshly reset, so
+    /// there is nothing to remove either.
+    pub fn replace_startup(&mut self, pools: Vec<PoolMetadata>) {
+        warn!("Startup whitelist replacement with {} pools", pools.len());
 
         // Clear existing
         self.pools_by_address.clear();
@@ -362,6 +443,7 @@ impl PoolTracker {
         self.fluid_configs.clear();
         self.balancer_pools_by_addr.clear();
         self.newly_added.clear();
+        self.newly_removed.clear();
         self.v2_count = 0;
         self.v3_count = 0;
         self.v4_count = 0;
@@ -372,9 +454,6 @@ impl PoolTracker {
         self.balancer_v2_count = 0;
         self.fluid_count = 0;
 
-        // Add new pools. A full snapshot is not a live `.add` delta: startup
-        // shadow hydration is driven explicitly from the same snapshot before the
-        // tracker is replaced, so do not put every pool into `newly_added`.
         self.add_pools(pools, false);
     }
 
@@ -518,6 +597,14 @@ impl PoolTracker {
     /// live `.add` pool is written without waiting for a restart.
     pub fn take_newly_added(&mut self) -> Vec<PoolMetadata> {
         std::mem::take(&mut self.newly_added)
+    }
+
+    /// Drain the pools removed since the last call. The ExEx removes their
+    /// shadow-arena slots at the committed block boundary so a live `.remove`
+    /// (or a live `.full` replace that drops pools) cannot leave stale active
+    /// slots behind.
+    pub fn take_newly_removed(&mut self) -> Vec<PoolIdentifier> {
+        std::mem::take(&mut self.newly_removed)
     }
 }
 
@@ -669,16 +756,132 @@ mod tests {
     }
 
     #[test]
-    fn replace_does_not_surface_startup_snapshot_as_newly_added() {
+    fn replace_startup_does_not_surface_snapshot_as_topology_deltas() {
         let mut tracker = PoolTracker::new();
-        tracker.queue_update(WhitelistUpdate::Replace(vec![create_test_pool(
+        tracker.replace_startup(vec![create_test_pool(
             Address::from([3u8; 20]),
             Protocol::UniswapV2,
-        )]));
+        )]);
         assert!(
             tracker.take_newly_added().is_empty(),
-            "full replace/startup snapshot is hydrated separately, not as live-add"
+            "startup snapshot is hydrated separately, not as live-add"
         );
+        assert!(
+            tracker.take_newly_removed().is_empty(),
+            "fresh arena has nothing to remove"
+        );
+        assert_eq!(tracker.stats().total_pools, 1);
+    }
+
+    /// ITE-29: a live `.remove` surfaces the removed IDs via `take_newly_removed`
+    /// so the ExEx can drop the pools' shadow-arena slots — otherwise the slots
+    /// stay active but never receive events again (stale-arena bug).
+    #[test]
+    fn remove_surfaces_removed_ids_for_arena_slot_removal() {
+        let mut tracker = PoolTracker::new();
+        let a = Address::from([1u8; 20]);
+        tracker.queue_update(WhitelistUpdate::Add(vec![create_test_pool(
+            a,
+            Protocol::UniswapV3,
+        )]));
+        let _ = tracker.take_newly_added();
+
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(a)]));
+        assert_eq!(
+            tracker.take_newly_removed(),
+            vec![PoolIdentifier::Address(a)],
+            "removed pool surfaced exactly once"
+        );
+        assert!(
+            tracker.take_newly_removed().is_empty(),
+            "drain empties the set"
+        );
+
+        // Removing an untracked pool surfaces nothing.
+        tracker.queue_update(WhitelistUpdate::Remove(vec![PoolIdentifier::Address(a)]));
+        assert!(
+            tracker.take_newly_removed().is_empty(),
+            "no-op remove does not surface"
+        );
+    }
+
+    /// ITE-29: a live `.full` replace applies as a topology delta — pools absent
+    /// from the new snapshot surface as removed, genuinely-new pools surface as
+    /// newly added, and retained pools surface as neither.
+    #[test]
+    fn live_replace_surfaces_topology_deltas() {
+        let mut tracker = PoolTracker::new();
+        let a = Address::from([0xA1u8; 20]);
+        let b = Address::from([0xB2u8; 20]);
+        let c = Address::from([0xC3u8; 20]);
+        tracker.replace_startup(vec![
+            create_test_pool(a, Protocol::UniswapV2),
+            create_test_pool(b, Protocol::UniswapV3),
+        ]);
+
+        // Live full snapshot: B retained, A dropped, C new.
+        tracker.queue_update(WhitelistUpdate::Replace(vec![
+            create_test_pool(b, Protocol::UniswapV3),
+            create_test_pool(c, Protocol::UniswapV2),
+        ]));
+
+        assert_eq!(
+            tracker.take_newly_removed(),
+            vec![PoolIdentifier::Address(a)],
+            "dropped pool surfaces as removed"
+        );
+        let added: Vec<_> = tracker
+            .take_newly_added()
+            .into_iter()
+            .map(|p| p.pool_id)
+            .collect();
+        assert_eq!(
+            added,
+            vec![PoolIdentifier::Address(c)],
+            "only the genuinely-new pool surfaces as added"
+        );
+
+        assert!(!tracker.is_tracked_address(&a));
+        assert!(tracker.is_tracked_address(&b));
+        assert!(tracker.is_tracked_address(&c));
+        assert_eq!(tracker.stats().total_pools, 2);
+        assert_eq!(tracker.stats().v2_pools, 1);
+        assert_eq!(tracker.stats().v3_pools, 1);
+    }
+
+    /// ITE-29 round-03: a live `.full` snapshot is the current whitelist truth
+    /// — a retained pool's stored metadata is refreshed in place, without
+    /// surfacing topology deltas (its arena slot stays live).
+    #[test]
+    fn live_replace_refreshes_retained_pool_metadata() {
+        let mut tracker = PoolTracker::new();
+        let b = Address::from([0xB2u8; 20]);
+        let stale = PoolMetadata {
+            fee: Some(500),
+            ..create_test_pool(b, Protocol::UniswapV3)
+        };
+        tracker.replace_startup(vec![stale]);
+
+        let fresh = PoolMetadata {
+            fee: Some(3000),
+            ..create_test_pool(b, Protocol::UniswapV3)
+        };
+        tracker.queue_update(WhitelistUpdate::Replace(vec![fresh]));
+
+        assert_eq!(
+            tracker.pool_metadata(&b).and_then(|m| m.fee),
+            Some(3000),
+            "retained pool metadata refreshed from the snapshot"
+        );
+        assert!(
+            tracker.take_newly_added().is_empty(),
+            "no topology add surfaced for a retained pool"
+        );
+        assert!(
+            tracker.take_newly_removed().is_empty(),
+            "no topology remove surfaced for a retained pool"
+        );
+        assert_eq!(tracker.stats().v3_pools, 1, "counts unchanged");
     }
 
     #[test]
