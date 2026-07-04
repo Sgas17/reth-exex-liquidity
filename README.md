@@ -111,9 +111,10 @@ ChainCommitted
    │   ├─ whitelist check by address or pool_id
    │   └─ send PoolUpdate for matching events
    ├─ Fluid only: decode touched pools from storage after log scan
-   ├─ send EndBlock
-   └─ end_block() on PoolTracker
-       └─ apply queued whitelist changes atomically between blocks
+   ├─ apply queued whitelist changes atomically at the block boundary
+   │   ├─ remove dropped pools from the shared-arena topology
+   │   └─ hydrate newly-added pools into the shared arena when possible
+   └─ send EndBlock + signal the arena block
 ```
 
 Block envelope:
@@ -127,7 +128,7 @@ BeginBlock
 EndBlock
 ```
 
-This ordering is intentional: downstream consumers can treat each block as an atomic batch.
+This ordering is intentional: downstream consumers can treat each block as an atomic batch, and any reader that wakes on `EndBlock` or the arena block signal sees the post-block whitelist topology rather than stale active slots.
 
 ---
 
@@ -311,17 +312,20 @@ The whitelist is maintained in memory by `PoolTracker`.
 
 Supported update types:
 
-- `Replace` — full snapshot hydration
+- `Replace` — live full-snapshot replacement; computes add/remove topology deltas and refreshes retained metadata
 - `Add` — incremental additions
 - `Remove` — incremental removals
+
+Startup uses a separate full-snapshot install path because the shared arena is reset and hydrated from scratch at the startup anchor.
 
 Property that matters operationally:
 
 - updates arriving during block processing are queued
-- queued updates are applied only after `EndBlock`
+- queued updates are applied at the block boundary before `EndBlock` and before the arena block signal
 - whitelist membership therefore changes **between blocks**, not mid-block
+- dropped pools are removed from the shared-arena topology before readers are notified for that block
 
-This avoids inconsistent filtering inside a single block.
+This avoids inconsistent filtering inside a single block and prevents stale active slots for de-whitelisted pools.
 
 ---
 

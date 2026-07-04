@@ -457,12 +457,6 @@ impl PoolTracker {
         self.add_pools(pools, false);
     }
 
-    /// Legacy method for backward compatibility - converts to Replace update
-    #[allow(dead_code)]
-    pub fn update_whitelist(&mut self, pools: Vec<PoolMetadata>) {
-        self.queue_update(WhitelistUpdate::Replace(pools));
-    }
-
     /// Check if an address is a tracked pool
     pub fn is_tracked_address(&self, address: &Address) -> bool {
         self.tracked_addresses.contains(address)
