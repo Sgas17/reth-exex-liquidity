@@ -31,7 +31,7 @@ mod transfers;
 mod types;
 
 use alloy_consensus::{BlockHeader, TxReceipt};
-use alloy_primitives::{Address, I256, U256};
+use alloy_primitives::{Address, U256};
 use arena_layout::ekubo::EkuboPoolData;
 use arena_layout::{
     AnyEkuboPool, AnyUniswapV3Pool, AnyUniswapV4Pool, CurveStablePoolData, CurveTricryptoPoolData,
@@ -209,19 +209,6 @@ fn promote_overflowed_pools(
     }
 }
 
-fn v2_swap_deltas(
-    amount0_in: U256,
-    amount1_in: U256,
-    amount0_out: U256,
-    amount1_out: U256,
-) -> (I256, I256) {
-    let delta0 = I256::try_from(amount0_in).unwrap_or(I256::ZERO)
-        - I256::try_from(amount0_out).unwrap_or(I256::ZERO);
-    let delta1 = I256::try_from(amount1_in).unwrap_or(I256::ZERO)
-        - I256::try_from(amount1_out).unwrap_or(I256::ZERO);
-    (delta0, delta1)
-}
-
 impl LiquidityExEx {
     fn new(
         socket_tx: tokio::sync::mpsc::Sender<ControlMessage>,
@@ -285,20 +272,18 @@ impl LiquidityExEx {
             // ============================================================================
             // UNISWAP V2 EVENTS
             // ============================================================================
-            DecodedEvent::V2Swap {
-                pool,
-                amount0_in,
-                amount1_in,
-                amount0_out,
-                amount1_out,
-            } => {
-                // V2 reserve movement is the net of all four event fields.
-                // Do not branch on amount0_in == 0: rare swaps can have both an input and
-                // an output amount populated on the same token side, and dropping one side
-                // creates persistent reserve drift.
-                let (amount0, amount1) =
-                    v2_swap_deltas(amount0_in, amount1_in, amount0_out, amount1_out);
+            DecodedEvent::V2Swap { .. }
+            | DecodedEvent::V2Mint { .. }
+            | DecodedEvent::V2Burn { .. } => None,
 
+            DecodedEvent::V2Sync {
+                pool,
+                reserve0,
+                reserve1,
+            } => {
+                if is_revert {
+                    return None;
+                }
                 Some(PoolUpdateMessage {
                     pool_id: PoolIdentifier::Address(pool),
                     protocol: Protocol::UniswapV2,
@@ -308,57 +293,7 @@ impl LiquidityExEx {
                     tx_index,
                     log_index,
                     is_revert,
-                    update: PoolUpdate::V2Swap { amount0, amount1 },
-                })
-            }
-
-            DecodedEvent::V2Mint {
-                pool,
-                amount0,
-                amount1,
-            } => {
-                // Mint: positive deltas (liquidity added)
-                let delta0 = I256::try_from(amount0).unwrap_or(I256::ZERO);
-                let delta1 = I256::try_from(amount1).unwrap_or(I256::ZERO);
-
-                Some(PoolUpdateMessage {
-                    pool_id: PoolIdentifier::Address(pool),
-                    protocol: Protocol::UniswapV2,
-                    update_type: UpdateType::Mint,
-                    block_number,
-                    block_timestamp,
-                    tx_index,
-                    log_index,
-                    is_revert,
-                    update: PoolUpdate::V2Liquidity {
-                        amount0: delta0,
-                        amount1: delta1,
-                    },
-                })
-            }
-
-            DecodedEvent::V2Burn {
-                pool,
-                amount0,
-                amount1,
-            } => {
-                // Burn: negative deltas (liquidity removed)
-                let delta0 = -I256::try_from(amount0).unwrap_or(I256::ZERO);
-                let delta1 = -I256::try_from(amount1).unwrap_or(I256::ZERO);
-
-                Some(PoolUpdateMessage {
-                    pool_id: PoolIdentifier::Address(pool),
-                    protocol: Protocol::UniswapV2,
-                    update_type: UpdateType::Burn,
-                    block_number,
-                    block_timestamp,
-                    tx_index,
-                    log_index,
-                    is_revert,
-                    update: PoolUpdate::V2Liquidity {
-                        amount0: delta0,
-                        amount1: delta1,
-                    },
+                    update: PoolUpdate::V2Sync { reserve0, reserve1 },
                 })
             }
 
@@ -1041,6 +976,7 @@ impl LiquidityExEx {
             DecodedEvent::V2Swap { pool, .. }
             | DecodedEvent::V2Mint { pool, .. }
             | DecodedEvent::V2Burn { pool, .. }
+            | DecodedEvent::V2Sync { pool, .. }
             | DecodedEvent::V3Swap { pool, .. }
             | DecodedEvent::V3Mint { pool, .. }
             | DecodedEvent::V3Burn { pool, .. } => pool_tracker.is_tracked_address(pool),
@@ -1101,7 +1037,8 @@ impl LiquidityExEx {
             match event {
                 DecodedEvent::V2Swap { pool, .. }
                 | DecodedEvent::V2Mint { pool, .. }
-                | DecodedEvent::V2Burn { pool, .. } => {
+                | DecodedEvent::V2Burn { pool, .. }
+                | DecodedEvent::V2Sync { pool, .. } => {
                     debug!("Filtered V2 event from untracked pool: {:?}", pool);
                 }
                 DecodedEvent::V3Swap { pool, .. }
@@ -2733,6 +2670,52 @@ fn build_ekubo_pool(
     }
 }
 
+fn active_affected_v2_pools(
+    pool_tracker: &PoolTracker,
+    affected_pools: &HashSet<Address>,
+) -> HashSet<Address> {
+    affected_pools
+        .iter()
+        .copied()
+        .filter(|addr| pool_tracker.get_protocol(addr) == Some(Protocol::UniswapV2))
+        .collect()
+}
+
+/// Send final V2 reserve epilogue messages for active affected pools after a reorg.
+///
+/// Forward V2 applies absolute `Sync` post-state. Reorg/revert handling records
+/// touched V2 pools and writes one final canonical reserve epilogue from the
+/// settled state, avoiding imperfect Swap/Mint/Burn delta reconstruction.
+fn send_v2_finals(
+    state: &dyn StateProvider,
+    affected_pools: &HashSet<Address>,
+    exex: &mut LiquidityExEx,
+    stream_seq: &mut u64,
+    block_number: u64,
+    block_timestamp: u64,
+) {
+    let mut overrides_sent = 0u32;
+
+    for addr in affected_pools {
+        let (reserve0, reserve1) = read_v2_reserves(state, *addr);
+        let update = ReorgEpilogueUpdate::V2ReservesFinal {
+            pool_id: PoolIdentifier::Address(*addr),
+            reserve0,
+            reserve1,
+        };
+        apply_epilogue_to_shadow(&mut exex.shadow, &update);
+        exex.send_reorg_epilogue(stream_seq, block_number, block_timestamp, update);
+        overrides_sent += 1;
+    }
+
+    if overrides_sent > 0 {
+        info!(
+            "Sent {} V2 reserve final epilogue updates after reorg",
+            overrides_sent
+        );
+    }
+}
+
 /// Send final slot0 epilogue messages for all affected pools after a reorg.
 ///
 /// Reads definitive post-reorg state from one held final-tip snapshot and sends
@@ -2810,6 +2793,21 @@ fn record_affected_slot0_pool(
     );
     if dominated_by_slot0 {
         affected.insert((event.pool_id.clone(), event.protocol));
+    }
+}
+
+/// Record V2 pools touched by reverted-away logs. This runs on decoded logs,
+/// not produced updates, because explicit `sync()` has no Swap/Mint/Burn delta
+/// message but still needs the final reserve epilogue after a reorg/revert.
+fn record_affected_v2_pool(event: &DecodedEvent, affected: &mut HashSet<Address>) {
+    match event {
+        DecodedEvent::V2Swap { pool, .. }
+        | DecodedEvent::V2Mint { pool, .. }
+        | DecodedEvent::V2Burn { pool, .. }
+        | DecodedEvent::V2Sync { pool, .. } => {
+            affected.insert(*pool);
+        }
+        _ => {}
     }
 }
 
@@ -3337,6 +3335,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 exex.send_reorg_start(&mut stream_seq, old_range.clone(), new_range.clone());
 
                 let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
+                let mut affected_v2_pools = HashSet::<Address>::new();
                 let mut reorg_fluid_touched = HashSet::<Address>::new();
 
                 // Step 1: Revert old blocks
@@ -3410,6 +3409,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             if !exex.should_process_event(&decoded_event, &pool_tracker) {
                                 continue;
                             }
+
+                            record_affected_v2_pool(&decoded_event, &mut affected_v2_pools);
 
                             // Create and send revert update
                             if let Some(update_msg) = exex.create_pool_update(
@@ -3621,6 +3622,28 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     drop(pool_tracker);
                 }
 
+                let final_tip_timestamp = new
+                    .blocks()
+                    .values()
+                    .last()
+                    .map(|b| b.timestamp())
+                    .unwrap_or(0);
+
+                let active_v2_pools = {
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    active_affected_v2_pools(&pool_tracker, &affected_v2_pools)
+                };
+
+                // Send definitive V2 reserve overrides from the final-tip state snapshot.
+                send_v2_finals(
+                    final_state.as_ref(),
+                    &active_v2_pools,
+                    &mut exex,
+                    &mut stream_seq,
+                    final_tip_block,
+                    final_tip_timestamp,
+                );
+
                 // Send definitive slot0 overrides from the final-tip state snapshot.
                 send_slot0_finals(
                     final_state.as_ref(),
@@ -3628,11 +3651,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     &mut exex,
                     &mut stream_seq,
                     final_tip_block,
-                    new.blocks()
-                        .values()
-                        .last()
-                        .map(|b| b.timestamp())
-                        .unwrap_or(0),
+                    final_tip_timestamp,
                 );
                 // Drain overflow promotions ONCE, now that every revert + new-chain
                 // delta has landed. Re-scraping each overflowed pool from the settled
@@ -3674,6 +3693,7 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                 );
 
                 let mut affected_slot0_pools: HashSet<(PoolIdentifier, Protocol)> = HashSet::new();
+                let mut affected_v2_pools = HashSet::<Address>::new();
                 let mut revert_fluid_touched = HashSet::<Address>::new();
                 // Reth exposes canonical post-revert state here, not the reverted-away
                 // old blocks' state. Absolute full-state revert messages and final
@@ -3737,6 +3757,8 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                             if !exex.should_process_event(&decoded_event, &pool_tracker) {
                                 continue;
                             }
+
+                            record_affected_v2_pool(&decoded_event, &mut affected_v2_pools);
 
                             if let Some(update_msg) = exex.create_pool_update(
                                 decoded_event,
@@ -3815,6 +3837,21 @@ async fn liquidity_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) ->
                     }
                     drop(pool_tracker);
                 }
+
+                let active_v2_pools = {
+                    let pool_tracker = exex.pool_tracker.read().await;
+                    active_affected_v2_pools(&pool_tracker, &affected_v2_pools)
+                };
+
+                // Send definitive V2 reserve overrides from the final-tip state snapshot.
+                send_v2_finals(
+                    final_state.as_ref(),
+                    &active_v2_pools,
+                    &mut exex,
+                    &mut stream_seq,
+                    final_tip_block,
+                    0,
+                );
 
                 // Send definitive slot0 overrides from the final-tip state snapshot.
                 send_slot0_finals(
@@ -4001,15 +4038,16 @@ fn main() -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        determine_tier, extract_ekubo_ticks_from_bitmap, extract_ticks_from_bitmap_u256,
-        record_affected_slot0_pool, twocrypto_storage_slots, v2_swap_deltas, v3_slots_for_factory,
-        LiquidityExEx, TwoCryptoStorageSlots, V3StorageSlots, PANCAKE_V3_FACTORY_ETHEREUM,
+        active_affected_v2_pools, determine_tier, extract_ekubo_ticks_from_bitmap,
+        extract_ticks_from_bitmap_u256, record_affected_slot0_pool, twocrypto_storage_slots,
+        v3_slots_for_factory, LiquidityExEx, TwoCryptoStorageSlots, V3StorageSlots,
+        PANCAKE_V3_FACTORY_ETHEREUM,
     };
     use crate::shadow_arena::ShadowArena;
     use crate::types::{
         ControlMessage, PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, UpdateType,
     };
-    use alloy_primitives::{I256, U256};
+    use alloy_primitives::U256;
     use arena_layout::PoolTier;
     use std::collections::HashSet;
 
@@ -4061,6 +4099,49 @@ mod tests {
             other => panic!("expected ReorgComplete, got {other:?}"),
         }
         let _ = std::fs::remove_file(&arena_path);
+    }
+
+    #[test]
+    fn active_v2_final_filter_skips_removed_or_non_v2_pools() {
+        use crate::pool_tracker::PoolTracker;
+        use crate::types::PoolMetadata;
+        use alloy_primitives::Address;
+
+        fn meta(address: Address, protocol: Protocol) -> PoolMetadata {
+            PoolMetadata {
+                pool_id: PoolIdentifier::Address(address),
+                token0: Address::ZERO,
+                token1: Address::ZERO,
+                protocol,
+                factory: Address::ZERO,
+                tick_spacing: None,
+                fee: None,
+                token0_decimals: None,
+                token1_decimals: None,
+                extra_tokens: vec![],
+                twocrypto_version: None,
+                ekubo_fee: None,
+                ekubo_type_config: None,
+                balancer_weights: None,
+                balancer_swap_fee: None,
+                balancer_version: None,
+            }
+        }
+
+        let v2 = Address::from([0x11; 20]);
+        let v3 = Address::from([0x22; 20]);
+        let removed = Address::from([0x33; 20]);
+
+        let mut tracker = PoolTracker::new();
+        tracker.replace_startup(vec![
+            meta(v2, Protocol::UniswapV2),
+            meta(v3, Protocol::UniswapV3),
+        ]);
+
+        let affected = HashSet::from([v2, v3, removed]);
+        let active = active_affected_v2_pools(&tracker, &affected);
+
+        assert_eq!(active, HashSet::from([v2]));
     }
 
     /// ITE-29 round-03 Critical regression: `end_block_whitelist_topology` —
@@ -4283,37 +4364,5 @@ mod tests {
         assert_eq!(determine_tier(500, 50), PoolTier::Popular);
         assert_eq!(determine_tier(501, 50), PoolTier::Major);
         assert_eq!(determine_tier(500, 51), PoolTier::Major);
-    }
-
-    #[test]
-    fn v2_swap_deltas_handle_standard_one_sided_swap() {
-        let (delta0, delta1) = v2_swap_deltas(
-            U256::from(1_000u64),
-            U256::ZERO,
-            U256::ZERO,
-            U256::from(500u64),
-        );
-
-        assert_eq!(delta0, I256::try_from(1_000u64).unwrap());
-        assert_eq!(delta1, -I256::try_from(500u64).unwrap());
-    }
-
-    #[test]
-    fn v2_swap_deltas_keep_rare_nonzero_amount1_in_on_token0_to_token1_swap() {
-        let (delta0, delta1) = v2_swap_deltas(
-            U256::from(4_630_623_146_782_210_569u128),
-            U256::from(100u64),
-            U256::ZERO,
-            U256::from(8_101_991_724u64),
-        );
-
-        assert_eq!(
-            delta0,
-            I256::from_raw(U256::from(4_630_623_146_782_210_569u128))
-        );
-        assert_eq!(
-            delta1,
-            I256::try_from(100u64).unwrap() - I256::try_from(8_101_991_724u64).unwrap()
-        );
     }
 }

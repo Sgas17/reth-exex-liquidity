@@ -3,7 +3,7 @@
 // These tests verify the complete event processing pipeline to help debug
 // why events might not be output for watched pools.
 
-use alloy_primitives::{address, Address, Log, LogData, B256, I256, U256};
+use alloy_primitives::{address, Address, Log, LogData, B256, U256};
 use alloy_sol_types::SolEvent;
 use reth_exex_liquidity::{
     events::{decode_log, DecodedEvent},
@@ -583,21 +583,18 @@ mod message_creation {
     use super::*;
 
     #[test]
-    fn test_create_v2_swap_message() {
-        // Simulate creating a PoolUpdateMessage from a V2 Swap event
+    fn test_create_v2_sync_message() {
+        // Simulate creating a PoolUpdateMessage from a V2 Sync event.
         let pool_addr = address!("0000000000000000000000000000000000000001");
 
-        let event = DecodedEvent::V2Swap {
+        let event = DecodedEvent::V2Sync {
             pool: pool_addr,
-            amount0_in: U256::from(1000),
-            amount1_in: U256::from(0),
-            amount0_out: U256::from(0),
-            amount1_out: U256::from(500),
+            reserve0: 1_500,
+            reserve1: 1_700,
         };
-        assert!(matches!(event, DecodedEvent::V2Swap { pool, .. } if pool == pool_addr));
+        assert!(matches!(event, DecodedEvent::V2Sync { pool, .. } if pool == pool_addr));
 
-        // In main.rs, this would be created by create_pool_update()
-        // We'll manually create it here to test the structure
+        // In main.rs, this would be created by create_pool_update().
         let message = reth_exex_liquidity::types::PoolUpdateMessage {
             pool_id: PoolIdentifier::Address(pool_addr),
             protocol: Protocol::UniswapV2,
@@ -607,9 +604,9 @@ mod message_creation {
             tx_index: 0,
             log_index: 0,
             is_revert: false,
-            update: PoolUpdate::V2Swap {
-                amount0: I256::try_from(1000i64).unwrap(),
-                amount1: I256::try_from(-500i64).unwrap(),
+            update: PoolUpdate::V2Sync {
+                reserve0: 1_500,
+                reserve1: 1_700,
             },
         };
 
@@ -620,11 +617,11 @@ mod message_creation {
         assert_eq!(message.update_type, UpdateType::Swap);
 
         match message.update {
-            PoolUpdate::V2Swap { amount0, amount1 } => {
-                assert_eq!(amount0, I256::try_from(1000i64).unwrap());
-                assert_eq!(amount1, I256::try_from(-500i64).unwrap());
+            PoolUpdate::V2Sync { reserve0, reserve1 } => {
+                assert_eq!(reserve0, 1_500);
+                assert_eq!(reserve1, 1_700);
             }
-            _ => panic!("Expected V2Swap"),
+            _ => panic!("Expected V2Sync"),
         }
     }
 
@@ -775,9 +772,9 @@ mod serialization {
             tx_index: 0,
             log_index: 0,
             is_revert: false,
-            update: PoolUpdate::V2Swap {
-                amount0: I256::try_from(1000i64).unwrap(),
-                amount1: I256::try_from(-500i64).unwrap(),
+            update: PoolUpdate::V2Sync {
+                reserve0: 1_500,
+                reserve1: 1_700,
             },
         };
 

@@ -609,11 +609,11 @@ impl ShadowArena {
     /// Apply a reorg revert/replay pool update (ITE-16 step 3d), **bypassing** the
     /// replay guard. A reorg can cross the startup hydration anchor; its
     /// revert/replay events must still adjust state baked into the hydration
-    /// snapshot. This is correct because relative-delta protocols (V2/Balancer/
-    /// tick liquidity) invert exactly regardless of baseline, and absolute-state
-    /// protocols (V3/V4/Ekubo slot0, Fluid) are restored by the slot0/fluid-final
-    /// epilogue. For reorgs that do not cross the anchor the bypass is a no-op
-    /// (all blocks are already `> scraped_at_block`).
+    /// snapshot. This is correct because relative-delta protocols (Balancer/tick
+    /// liquidity) invert from the current baseline, while absolute-state
+    /// protocols (V2 reserves, V3/V4/Ekubo slot0, Fluid) are restored by final
+    /// epilogues where needed. For reorgs that do not cross the anchor the
+    /// bypass is a no-op (all blocks are already `> scraped_at_block`).
     pub fn apply_reorg_event(
         &mut self,
         event: &PoolUpdateMessage,
@@ -785,6 +785,7 @@ impl ShadowArena {
             let pool_id = match update {
                 ReorgEpilogueUpdate::Slot0Final { pool_id, .. } => pool_id,
                 ReorgEpilogueUpdate::FluidStateFinal { pool_id, .. } => pool_id,
+                ReorgEpilogueUpdate::V2ReservesFinal { pool_id, .. } => pool_id,
             };
             self.updated_this_block.push(to_wire_ident(pool_id));
         }
@@ -1149,7 +1150,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    fn v2_swap_event(pool: [u8; 20], block: u64, a0: i64, a1: i64) -> PoolUpdateMessage {
+    fn v2_delta_event(pool: [u8; 20], block: u64, a0: i64, a1: i64) -> PoolUpdateMessage {
         PoolUpdateMessage {
             pool_id: PoolIdentifier::Address(Address::from(pool)),
             protocol: Protocol::UniswapV2,
@@ -1166,10 +1167,29 @@ mod tests {
         }
     }
 
-    /// 3c: a V2 swap above the anchor folds reserve deltas; the replay guard
+    fn v2_sync_event(
+        pool: [u8; 20],
+        block: u64,
+        reserve0: u128,
+        reserve1: u128,
+    ) -> PoolUpdateMessage {
+        PoolUpdateMessage {
+            pool_id: PoolIdentifier::Address(Address::from(pool)),
+            protocol: Protocol::UniswapV2,
+            update_type: UpdateType::Swap,
+            block_number: block,
+            block_timestamp: 0,
+            tx_index: 0,
+            log_index: 0,
+            is_revert: false,
+            update: PoolUpdate::V2Sync { reserve0, reserve1 },
+        }
+    }
+
+    /// 3c: a V2 Sync above the anchor writes absolute reserves; the replay guard
     /// skips an event at the anchor block (already reflected in hydrated state).
     #[test]
-    fn live_v2_swap_folds_reserve_deltas_after_anchor() {
+    fn live_v2_sync_writes_absolute_reserves_after_anchor() {
         let path = temp_arena_path("live_v2_swap");
         let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
         shadow.hydrate_v2(
@@ -1186,13 +1206,13 @@ mod tests {
         );
 
         // Replay guard: event at the anchor block is skipped.
-        let at_anchor = v2_swap_event(addr(0xC2), 100, 500, -300);
+        let at_anchor = v2_sync_event(addr(0xC2), 100, 1_500, 1_700);
         assert!(!shadow
             .apply_live_event(&at_anchor)
             .expect("apply at anchor"));
 
-        // Above the anchor: deltas fold into reserves (+500 / -300).
-        let after = v2_swap_event(addr(0xC2), 101, 500, -300);
+        // Above the anchor: Sync writes the absolute post-state.
+        let after = v2_sync_event(addr(0xC2), 101, 1_500, 1_700);
         assert!(shadow.apply_live_event(&after).expect("apply after anchor"));
 
         let writer = SharedArenaWriter::new(shadow.arena.region_mut());
@@ -1225,7 +1245,7 @@ mod tests {
 
         // Event at the anchor is skipped by the replay guard → still an empty block.
         assert!(!shadow
-            .apply_live_event(&v2_swap_event(addr(0xC2), 100, 1, -1))
+            .apply_live_event(&v2_sync_event(addr(0xC2), 100, 1_001, 1_999))
             .expect("apply at anchor"));
         let empty = shadow.end_block(100, 10);
         assert_eq!(empty.reason, SIGNAL_LABEL_LIVE_BLOCK_EMPTY);
@@ -1233,7 +1253,7 @@ mod tests {
 
         // Event above the anchor is applied → non-empty block naming the pool.
         assert!(shadow
-            .apply_live_event(&v2_swap_event(addr(0xC2), 101, 500, -300))
+            .apply_live_event(&v2_sync_event(addr(0xC2), 101, 1_500, 1_700))
             .expect("apply after anchor"));
         let applied = shadow.end_block(101, 11);
         assert_eq!(applied.reason, SIGNAL_LABEL_LIVE_BLOCK_APPLY);
@@ -1256,7 +1276,7 @@ mod tests {
         let path = temp_arena_path("live_v2_missing");
         let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
         shadow.hydrate_v2(100, &[]);
-        let ev = v2_swap_event(addr(0xDD), 101, 1, -1);
+        let ev = v2_sync_event(addr(0xDD), 101, 1_001, 1_999);
         assert!(!shadow.apply_live_event(&ev).expect("apply"));
         let _ = std::fs::remove_file(&path);
     }
@@ -1457,7 +1477,7 @@ mod tests {
         }
 
         // One applied update → apply signal, count 1, counter reset for next block.
-        let ev = v2_swap_event(addr(0xC2), 102, 500, -300);
+        let ev = v2_sync_event(addr(0xC2), 102, 1_500, 1_700);
         assert!(shadow.apply_live_event(&ev).expect("apply"));
         shadow.end_block(102, 0);
         {
@@ -1478,11 +1498,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 3d: a reverted V2 swap (`is_revert = true`) un-applies the delta, returning
-    /// reserves to their pre-swap value.
+    /// V2 reserve writes are absolute-only. Swap/Mint/Burn delta updates are not
+    /// accepted even on reorg paths; reorgs use `V2ReservesFinal` instead.
     #[test]
-    fn live_v2_swap_revert_unapplies_delta() {
-        let path = temp_arena_path("revert_v2");
+    fn v2_delta_update_is_unsupported() {
+        let path = temp_arena_path("v2_delta_unsupported");
         let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
         shadow.hydrate_v2(
             100,
@@ -1497,20 +1517,66 @@ mod tests {
             }],
         );
 
-        // Forward swap at block 101: +500 / -300 → 1500 / 1700.
-        assert!(shadow
-            .apply_live_event(&v2_swap_event(addr(0xC2), 101, 500, -300))
-            .expect("forward"));
+        let err = shadow
+            .apply_reorg_event(&v2_delta_event(addr(0xC2), 101, 500, -300))
+            .expect_err("V2 delta updates are rejected");
+        assert!(matches!(
+            err,
+            crate::shadow_apply::ApplyError::Unsupported(_)
+        ));
 
-        // Reorg reverts block 101 at block 102: applies the inverse → 1000 / 2000.
-        let mut revert = v2_swap_event(addr(0xC2), 102, 500, -300);
-        revert.is_revert = true;
-        assert!(shadow.apply_live_event(&revert).expect("revert"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 3d: a reorg-epilogue `V2ReservesFinal` overwrites a V2 pool's reserves
+    /// with the definitive post-reorg state, covering direct-transfer/explicit
+    /// sync residuals that Swap/Mint/Burn revert deltas cannot reconstruct.
+    #[test]
+    fn reorg_epilogue_v2_reserves_final_overwrites_reserves() {
+        let path = temp_arena_path("epilogue_v2");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(
+            100,
+            &[V2Hydration {
+                address: addr(0xC2),
+                token0: addr(0x11),
+                token1: addr(0x22),
+                reserve0: 1_000,
+                reserve1: 2_000,
+                token0_decimals: 18,
+                token1_decimals: 6,
+            }],
+        );
+
+        assert!(shadow
+            .apply_reorg_epilogue(&ReorgEpilogueUpdate::V2ReservesFinal {
+                pool_id: PoolIdentifier::Address(Address::from(addr(0xC2))),
+                reserve0: 1_234,
+                reserve1: 2_345,
+            })
+            .expect("epilogue"));
 
         let writer = SharedArenaWriter::new(shadow.arena.region_mut());
         let pool = writer.get_v2_pool(&addr(0xC2)).expect("v2 pool");
-        assert_eq!(pool.reserve0, 1_000);
-        assert_eq!(pool.reserve1, 2_000);
+        assert_eq!(pool.reserve0, 1_234);
+        assert_eq!(pool.reserve1, 2_345);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reorg_epilogue_v2_reserves_final_skips_missing_pool() {
+        let path = temp_arena_path("epilogue_v2_missing");
+        let mut shadow = ShadowArena::open(&path).expect("open shadow arena");
+        shadow.hydrate_v2(100, &[]);
+
+        assert!(!shadow
+            .apply_reorg_epilogue(&ReorgEpilogueUpdate::V2ReservesFinal {
+                pool_id: PoolIdentifier::Address(Address::from(addr(0xC2))),
+                reserve0: 1_234,
+                reserve1: 2_345,
+            })
+            .expect("missing V2 final is skipped"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1716,7 +1782,7 @@ mod tests {
 
         // Live path at the anchor block is guarded → skipped, reserves unchanged.
         assert!(!shadow
-            .apply_live_event(&v2_swap_event(addr(0xC2), 100, 500, -300))
+            .apply_live_event(&v2_sync_event(addr(0xC2), 100, 1_500, 1_700))
             .expect("guarded"));
         {
             let writer = SharedArenaWriter::new(shadow.arena.region_mut());
@@ -1726,7 +1792,7 @@ mod tests {
 
         // Reorg path at the same anchor block bypasses the guard → applies.
         assert!(shadow
-            .apply_reorg_event(&v2_swap_event(addr(0xC2), 100, 500, -300))
+            .apply_reorg_event(&v2_sync_event(addr(0xC2), 100, 1_500, 1_700))
             .expect("bypass"));
         let writer = SharedArenaWriter::new(shadow.arena.region_mut());
         let pool = writer.get_v2_pool(&addr(0xC2)).expect("v2 pool");

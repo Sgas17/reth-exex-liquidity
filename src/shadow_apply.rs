@@ -5,16 +5,14 @@
 //! socket — keeping the two writers in lockstep for the pre-cutover diff. Reuses
 //! the shared [`arena_writer`] mutation API.
 //!
-//! The Curve/Fluid "full-state" variants carry absolute post-state, so applying
-//! them needs no swap math; only V2 (reserve deltas) and Balancer (balance
-//! deltas) fold deltas into current arena state. Reorg/revert apply lands in 3d
-//! — this module is driven only from the committed path, where `is_revert` is
-//! always `false`, but the revert handling is ported faithfully for reuse.
+//! The Curve/Fluid/V2 Sync "full-state" variants carry absolute post-state, so
+//! applying them needs no swap math. Balancer still folds Vault deltas into
+//! current arena state; V2 reorg recovery uses a final absolute reserve epilogue.
 
 use crate::types::{
     PoolIdentifier, PoolUpdate, PoolUpdateMessage, Protocol, ReorgEpilogueUpdate, UpdateType,
 };
-use alloy_primitives::{I256, U256};
+use alloy_primitives::U256;
 use arena_writer::{SharedArenaWriter, WriterError};
 
 /// Apply failure: a writer error (e.g. the pool is not in the shadow topology),
@@ -45,52 +43,6 @@ impl From<WriterError> for ApplyError {
 }
 
 type Result<T> = std::result::Result<T, ApplyError>;
-
-/// Convert `I256` to `i128`, returning `None` if it does not fit.
-fn i256_to_i128(value: I256) -> Option<i128> {
-    let min = I256::try_from(i128::MIN).ok()?;
-    let max = I256::try_from(i128::MAX).ok()?;
-    if value >= min && value <= max {
-        let bytes = value.to_be_bytes::<32>();
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&bytes[16..32]);
-        Some(i128::from_be_bytes(buf))
-    } else {
-        None
-    }
-}
-
-/// Apply a signed delta to an unsigned value; `None` on over/underflow.
-fn apply_delta(value: u128, delta: i128) -> Option<u128> {
-    if delta >= 0 {
-        value.checked_add(delta as u128)
-    } else {
-        value.checked_sub(delta.unsigned_abs())
-    }
-}
-
-/// New V2 reserves after folding signed swap/liquidity deltas.
-fn calculate_v2_reserves(
-    old0: u128,
-    old1: u128,
-    amount0: I256,
-    amount1: I256,
-) -> Result<(u128, u128)> {
-    let d0 = i256_to_i128(amount0).ok_or(ApplyError::Overflow("v2 amount0"))?;
-    let d1 = i256_to_i128(amount1).ok_or(ApplyError::Overflow("v2 amount1"))?;
-    let new0 = apply_delta(old0, d0).ok_or(ApplyError::Overflow("v2 reserve0"))?;
-    let new1 = apply_delta(old1, d1).ok_or(ApplyError::Overflow("v2 reserve1"))?;
-    Ok((new0, new1))
-}
-
-/// Negate V2 deltas when applying a revert.
-fn maybe_negate_v2(amount0: I256, amount1: I256, is_revert: bool) -> (I256, I256) {
-    if is_revert {
-        (-amount0, -amount1)
-    } else {
-        (amount0, amount1)
-    }
-}
 
 /// Negate a liquidity delta when applying a revert.
 fn maybe_negate_liquidity_delta(delta: i128, is_revert: bool) -> Result<i128> {
@@ -207,19 +159,24 @@ pub fn apply_live_event(
     overflowed: &mut bool,
 ) -> Result<bool> {
     match &event.update {
-        // ── Uniswap V2: fold reserve deltas into current state ──────────
-        PoolUpdate::V2Swap { amount0, amount1 } | PoolUpdate::V2Liquidity { amount0, amount1 } => {
+        // ── Uniswap V2: absolute reserve writes only ───────────────────
+        PoolUpdate::V2Sync { reserve0, reserve1 } => {
+            if event.is_revert {
+                return Ok(false);
+            }
             let PoolIdentifier::Address(addr) = &event.pool_id else {
                 return Ok(false);
             };
             let addr = addr.into_array();
-            let Some(pool) = writer.get_v2_pool(&addr) else {
+            if writer.get_v2_pool(&addr).is_none() {
                 return Ok(false);
-            };
-            let (r0, r1) = (pool.reserve0, pool.reserve1);
-            let (a0, a1) = maybe_negate_v2(*amount0, *amount1, event.is_revert);
-            let (new0, new1) = calculate_v2_reserves(r0, r1, a0, a1)?;
-            writer.update_v2_reserves(addr, new0, new1)?;
+            }
+            writer.update_v2_reserves(addr, *reserve0, *reserve1)?;
+        }
+        PoolUpdate::V2Swap { .. } | PoolUpdate::V2Liquidity { .. } => {
+            return Err(ApplyError::Unsupported(
+                "V2 delta update; expected V2Sync or V2ReservesFinal absolute reserves",
+            ));
         }
 
         // ── Uniswap V3/V4 swap: absolute slot0 post-state ───────────────
@@ -613,6 +570,20 @@ pub fn apply_reorg_epilogue(
                 state.center_price,
                 state.fee,
             )?;
+        }
+        ReorgEpilogueUpdate::V2ReservesFinal {
+            pool_id,
+            reserve0,
+            reserve1,
+        } => {
+            let PoolIdentifier::Address(addr) = pool_id else {
+                return Ok(false);
+            };
+            let addr = addr.into_array();
+            if writer.get_v2_pool(&addr).is_none() {
+                return Ok(false);
+            }
+            writer.update_v2_reserves(addr, *reserve0, *reserve1)?;
         }
     }
     Ok(true)

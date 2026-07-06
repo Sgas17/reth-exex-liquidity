@@ -105,11 +105,11 @@ pub struct FluidState {
 /// Pool update data - enum of all possible update types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolUpdate {
-    /// V2 Swap Update (reserve deltas - one positive, one negative)
+    /// Retired V2 Swap delta update. Producer no longer emits this; V2 reserves
+    /// are written from `V2Sync` / `V2ReservesFinal` absolute states.
     V2Swap { amount0: I256, amount1: I256 },
 
-    /// V2 Liquidity Update (Mint or Burn)
-    /// Positive amounts for mint, negative amounts for burn
+    /// Retired V2 Liquidity delta update. Producer no longer emits this.
     V2Liquidity { amount0: I256, amount1: I256 },
 
     /// V3 Swap Update (sqrtPriceX96, liquidity, tick)
@@ -285,6 +285,10 @@ pub enum PoolUpdate {
     /// complete reserve state — no further RPC calls needed by the arena.
     /// All reserve values in 1e12 decimals (resolver format).
     FluidState { state: FluidState },
+
+    /// Uniswap V2 absolute reserve post-state from `Sync`.
+    /// Canonical forward-path update for V2 pools.
+    V2Sync { reserve0: u128, reserve1: u128 },
 }
 
 /// Reorg-epilogue-only canonical state updates.
@@ -302,6 +306,13 @@ pub enum ReorgEpilogueUpdate {
     FluidStateFinal {
         pool_id: PoolIdentifier,
         state: FluidState,
+    },
+
+    /// Definitive final V2 reserve state after a reorg/revert settles.
+    V2ReservesFinal {
+        pool_id: PoolIdentifier,
+        reserve0: u128,
+        reserve1: u128,
     },
 }
 

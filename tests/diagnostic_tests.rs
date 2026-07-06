@@ -52,6 +52,7 @@ fn simulate_event_processing(log: &Log, pool_tracker: &PoolTracker) -> EventProc
         DecodedEvent::V2Swap { pool, .. }
         | DecodedEvent::V2Mint { pool, .. }
         | DecodedEvent::V2Burn { pool, .. }
+        | DecodedEvent::V2Sync { pool, .. }
         | DecodedEvent::V3Swap { pool, .. }
         | DecodedEvent::V3Mint { pool, .. }
         | DecodedEvent::V3Burn { pool, .. } => pool_tracker.is_tracked_address(pool),
@@ -109,35 +110,21 @@ fn test_diagnostic_v2_event_processing() {
     println!("  Tracker stats: {:?}", tracker.stats());
     println!("  Is tracked: {}", tracker.is_tracked_address(&pool_addr));
 
-    // Create V2 Swap event
+    // Create V2 Sync event (canonical forward reserve update).
     use alloy_sol_types::sol;
     sol! {
         #[derive(Debug)]
-        event Swap(
-            address indexed sender,
-            uint256 amount0In,
-            uint256 amount1In,
-            uint256 amount0Out,
-            uint256 amount1Out,
-            address indexed to
-        );
+        event Sync(uint112 reserve0, uint112 reserve1);
     }
 
     let log = Log {
         address: pool_addr,
-        data: LogData::new_unchecked(
-            vec![
-                Swap::SIGNATURE_HASH,
-                B256::ZERO, // sender
-                B256::ZERO, // to
-            ],
-            vec![0u8; 160].into(),
-        ),
+        data: LogData::new_unchecked(vec![Sync::SIGNATURE_HASH], vec![0u8; 64].into()),
     };
 
-    println!("\n✓ Created V2 Swap event log");
+    println!("\n✓ Created V2 Sync event log");
     println!("  Log address: {:?}", log.address);
-    println!("  Event signature: {:?}", Swap::SIGNATURE_HASH);
+    println!("  Event signature: {:?}", Sync::SIGNATURE_HASH);
 
     // Process the event
     let result = simulate_event_processing(&log, &tracker);
@@ -162,7 +149,7 @@ fn test_diagnostic_v2_event_processing() {
     );
     assert!(result.should_output, "❌ FAILED: Event should be output");
 
-    println!("\n✅ SUCCESS: V2 event would be output correctly\n");
+    println!("\n✅ SUCCESS: V2 Sync event would be output correctly\n");
 }
 
 #[test]

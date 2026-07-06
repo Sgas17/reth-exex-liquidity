@@ -42,11 +42,17 @@ mod v2 {
             uint256 amount1,
             address indexed to
         );
+
+        /// V2 Sync - absolute reserve post-state emitted by `_update()`.
+        #[derive(Debug)]
+        event Sync(uint112 reserve0, uint112 reserve1);
     }
 }
 
 // Re-export with namespaced names to avoid conflicts
-use v2::{Burn as UniswapV2Burn, Mint as UniswapV2Mint, Swap as UniswapV2Swap};
+use v2::{
+    Burn as UniswapV2Burn, Mint as UniswapV2Mint, Swap as UniswapV2Swap, Sync as UniswapV2Sync,
+};
 
 // ============================================================================
 // UNISWAP V3 EVENTS
@@ -337,6 +343,11 @@ mod twocrypto {
             uint256 packed_price_scale
         );
 
+        /// Tricrypto v2.0 ClaimAdminFee(address admin, uint256 tokens).
+        /// Touch signal; producer re-reads full crypto pool state.
+        #[derive(Debug)]
+        event ClaimAdminFee(address indexed admin, uint256 tokens);
+
         /// NewParameters(uint256 mid_fee, uint256 out_fee, uint256 fee_gamma,
         ///               uint256 allowed_extra_profit, uint256 adjustment_step,
         ///               uint256 ma_time, uint256 xcp_profit_a)
@@ -366,10 +377,24 @@ mod twocrypto {
 }
 
 use twocrypto::{
-    AddLiquidity as TwoCryptoAddLiquidity, NewParameters as TwoCryptoNewParameters,
-    RampAgamma as TwoCryptoRampAgamma, RemoveLiquidity as TwoCryptoRemoveLiquidity,
-    RemoveLiquidityOne as TwoCryptoRemoveLiquidityOne, TokenExchange as TwoCryptoTokenExchange,
+    AddLiquidity as TwoCryptoAddLiquidity, ClaimAdminFee as CryptoClaimAdminFeeScalar,
+    NewParameters as TwoCryptoNewParameters, RampAgamma as TwoCryptoRampAgamma,
+    RemoveLiquidity as TwoCryptoRemoveLiquidity, RemoveLiquidityOne as TwoCryptoRemoveLiquidityOne,
+    TokenExchange as TwoCryptoTokenExchange,
 };
+
+mod twocrypto_admin_fee_array2 {
+    use super::*;
+
+    sol! {
+        /// Twocrypto v2.1 ClaimAdminFee(address admin, uint256[2] tokens).
+        /// Touch signal; producer re-reads full crypto pool state.
+        #[derive(Debug)]
+        event ClaimAdminFee(address indexed admin, uint256[2] tokens);
+    }
+}
+
+use twocrypto_admin_fee_array2::ClaimAdminFee as TwoCryptoClaimAdminFeeArray2;
 
 mod ekubo {
     use super::*;
@@ -462,13 +487,14 @@ mod tricrypto {
 
     sol! {
         /// TricryptoNG AddLiquidity (uint256[3] token_amounts, not [2]).
+        /// Vyper emits packed_price_scale as a single packed uint256.
         #[derive(Debug)]
         event AddLiquidity(
             address indexed provider,
             uint256[3] token_amounts,
             uint256 fee,
             uint256 token_supply,
-            uint256[2] packed_price_scale
+            uint256 packed_price_scale
         );
 
         /// TricryptoNG RemoveLiquidity (uint256[3] token_amounts, not [2]).
@@ -494,20 +520,17 @@ use tricrypto::{
 pub enum DecodedEvent {
     V2Swap {
         pool: Address,
-        amount0_in: U256,
-        amount1_in: U256,
-        amount0_out: U256,
-        amount1_out: U256,
     },
     V2Mint {
         pool: Address,
-        amount0: U256,
-        amount1: U256,
     },
     V2Burn {
         pool: Address,
-        amount0: U256,
-        amount1: U256,
+    },
+    V2Sync {
+        pool: Address,
+        reserve0: u128,
+        reserve1: u128,
     },
     V3Swap {
         pool: Address,
@@ -560,10 +583,14 @@ pub enum DecodedEvent {
     },
     /// Curve StableSwap-NG TokenExchange touch signal.
     /// Full post-state is scraped after detection.
-    CurveSwap { pool: Address },
+    CurveSwap {
+        pool: Address,
+    },
     /// Curve liquidity event (AddLiquidity, RemoveLiquidity, etc).
     /// We don't decode the amounts — balances will be re-scraped from storage.
-    CurveLiquidityChange { pool: Address },
+    CurveLiquidityChange {
+        pool: Address,
+    },
     /// Curve RampA parameter change.
     CurveRampA {
         pool: Address,
@@ -580,9 +607,13 @@ pub enum DecodedEvent {
     },
     /// TwoCryptoNG TokenExchange touch signal.
     /// Full post-state is scraped after detection.
-    TwoCryptoSwap { pool: Address },
+    TwoCryptoSwap {
+        pool: Address,
+    },
     /// TwoCryptoNG liquidity event (AddLiquidity, RemoveLiquidity, RemoveLiquidityOne).
-    TwoCryptoLiquidityChange { pool: Address },
+    TwoCryptoLiquidityChange {
+        pool: Address,
+    },
     /// TwoCryptoNG RampAgamma parameter change.
     TwoCryptoRampAgamma {
         pool: Address,
@@ -610,7 +641,9 @@ pub enum DecodedEvent {
     /// TricryptoNG liquidity event (AddLiquidity / RemoveLiquidity).
     /// Only these two have unique signatures (uint256[3] arrays); other Tricrypto
     /// events share signatures with TwoCrypto and are disambiguated in create_pool_update.
-    TricryptoLiquidityChange { pool: Address },
+    TricryptoLiquidityChange {
+        pool: Address,
+    },
     /// Balancer V2 Vault Swap event.
     BalancerSwap {
         pool_id: [u8; 32],
@@ -629,7 +662,9 @@ pub enum DecodedEvent {
     },
     /// Balancer V2 WeightedPool swap-fee change. `pool` is the pool CONTRACT
     /// address (`pool_id[..20]`); the absolute new fee is read from chain state.
-    BalancerFeeChange { pool: Address },
+    BalancerFeeChange {
+        pool: Address,
+    },
 }
 
 /// Check if a log is a Fluid `LogOperate` for a specific pool address
@@ -674,29 +709,23 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     }
 
     // Try V2 events - using decode_log() to validate signature (topic[0])
-    if let Ok(event) = UniswapV2Swap::decode_log(log) {
-        return Some(DecodedEvent::V2Swap {
-            pool,
-            amount0_in: event.data.amount0In,
-            amount1_in: event.data.amount1In,
-            amount0_out: event.data.amount0Out,
-            amount1_out: event.data.amount1Out,
-        });
+    if let Ok(_event) = UniswapV2Swap::decode_log(log) {
+        return Some(DecodedEvent::V2Swap { pool });
     }
 
-    if let Ok(event) = UniswapV2Mint::decode_log(log) {
-        return Some(DecodedEvent::V2Mint {
-            pool,
-            amount0: event.data.amount0,
-            amount1: event.data.amount1,
-        });
+    if let Ok(_event) = UniswapV2Mint::decode_log(log) {
+        return Some(DecodedEvent::V2Mint { pool });
     }
 
-    if let Ok(event) = UniswapV2Burn::decode_log(log) {
-        return Some(DecodedEvent::V2Burn {
+    if let Ok(_event) = UniswapV2Burn::decode_log(log) {
+        return Some(DecodedEvent::V2Burn { pool });
+    }
+
+    if let Ok(event) = UniswapV2Sync::decode_log(log) {
+        return Some(DecodedEvent::V2Sync {
             pool,
-            amount0: event.data.amount0,
-            amount1: event.data.amount1,
+            reserve0: event.data.reserve0.to::<u128>(),
+            reserve1: event.data.reserve1.to::<u128>(),
         });
     }
 
@@ -850,6 +879,14 @@ pub fn decode_log(log: &Log) -> Option<DecodedEvent> {
     }
 
     if let Ok(_event) = TwoCryptoRemoveLiquidityOne::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = TwoCryptoClaimAdminFeeArray2::decode_log(log) {
+        return Some(DecodedEvent::TwoCryptoLiquidityChange { pool });
+    }
+
+    if let Ok(_event) = CryptoClaimAdminFeeScalar::decode_log(log) {
         return Some(DecodedEvent::TwoCryptoLiquidityChange { pool });
     }
 
@@ -1040,6 +1077,12 @@ mod tests {
             "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496"
         );
 
+        // Sync(uint112,uint112)
+        assert_eq!(
+            UniswapV2Sync::SIGNATURE_HASH.to_string(),
+            "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
+        );
+
         // V3 Event Signatures
         // Swap(address,address,int256,int256,uint160,uint128,int24)
         assert_eq!(
@@ -1108,11 +1151,23 @@ mod tests {
             "0xe200e24d4a4c7cd367dd9befe394dc8a14e6d58c88ff5e2f512d65a9e0aa9c5c"
         );
 
+        // Curve Twocrypto v2.1 ClaimAdminFee touch signal.
+        assert_eq!(
+            TwoCryptoClaimAdminFeeArray2::SIGNATURE_HASH.to_string(),
+            "0x3bbd5f2f4711532d6e9ee88dfdf2f1468e9a4c3ae5e14d2e1a67bf4242d008d0"
+        );
+
+        // Curve Tricrypto v2.0 ClaimAdminFee touch signal.
+        assert_eq!(
+            CryptoClaimAdminFeeScalar::SIGNATURE_HASH.to_string(),
+            "0x6059a38198b1dc42b3791087d1ff0fbd72b3179553c25f678cd246f52ffaaf59"
+        );
+
         // Curve TricryptoNG Event Signatures (unique — differ from TwoCrypto)
-        // AddLiquidity(address,uint256[3],uint256,uint256,uint256[2])
+        // AddLiquidity(address,uint256[3],uint256,uint256,uint256)
         assert_eq!(
             TricryptoAddLiquidity::SIGNATURE_HASH.to_string(),
-            "0x4a25e5f3348d6ab046b8d1d91f70bc1bc13edf735bc3faf523868488dc39326c"
+            "0xe1b60455bd9e33720b547f60e4e0cfbf1252d0f2ee0147d53029945f39fe3c1a"
         );
 
         // RemoveLiquidity(address,uint256[3],uint256)
@@ -1217,6 +1272,60 @@ mod tests {
 
         let decoded = decode_log(&log);
         assert!(matches!(decoded, Some(DecodedEvent::V2Burn { .. })));
+    }
+
+    #[test]
+    fn test_decode_v2_sync() {
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![UniswapV2Sync::SIGNATURE_HASH],
+                vec![0u8; 64].into(), // reserve0, reserve1
+            ),
+        };
+
+        let decoded = decode_log(&log);
+        assert!(matches!(decoded, Some(DecodedEvent::V2Sync { .. })));
+    }
+
+    #[test]
+    fn test_decode_twocrypto_claim_admin_fee_array2() {
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![
+                    TwoCryptoClaimAdminFeeArray2::SIGNATURE_HASH,
+                    alloy_primitives::B256::ZERO, // admin
+                ],
+                vec![0u8; 64].into(), // uint256[2] tokens
+            ),
+        };
+
+        let decoded = decode_log(&log);
+        assert!(matches!(
+            decoded,
+            Some(DecodedEvent::TwoCryptoLiquidityChange { .. })
+        ));
+    }
+
+    #[test]
+    fn test_decode_crypto_claim_admin_fee_scalar() {
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![
+                    CryptoClaimAdminFeeScalar::SIGNATURE_HASH,
+                    alloy_primitives::B256::ZERO, // admin
+                ],
+                vec![0u8; 32].into(), // uint256 tokens
+            ),
+        };
+
+        let decoded = decode_log(&log);
+        assert!(matches!(
+            decoded,
+            Some(DecodedEvent::TwoCryptoLiquidityChange { .. })
+        ));
     }
 
     #[test]
