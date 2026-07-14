@@ -1,0 +1,5 @@
+[toolchain]
+# Reth v2.4.0 declares rust-version = "1.95"; the ExEx binary is built from the
+# same crate graph, so it is pinned to the same toolchain as the node.
+channel = "1.95"
+components = ["rustfmt", "clippy"]

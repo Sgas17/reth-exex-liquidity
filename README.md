@@ -352,9 +352,14 @@ docs/benchmarks.md     performance notes and benchmark guidance
 
 Current dependency target:
 
-- Reth `v2.2.0`
-- Alloy consensus `2.0.4` (kept aligned with Reth's Alloy 2 graph)
+- Reth `v2.4.0` (tag commit `943af245c4d69c6c1df241df016c278ffb5d15df`)
+- Rust `1.95` (pinned by `rust-toolchain.toml`; Reth v2.4.0 declares `rust-version = "1.95"`)
+- Alloy consensus `2.1.1`, `alloy-primitives`/`alloy-sol-types` `1.6.0` (kept aligned with Reth's Alloy 2 graph)
 - `roaring` pinned by `Cargo.lock` to `0.11.4` for the Reth DB bitmap implementation
+
+Reth v2.4.0 added `jit` (the experimental revmc JIT) and `gmp` to the `reth`
+crate's default features. This build deliberately disables `jit` and keeps every
+other default (see `Cargo.toml`). `gmp` needs `m4` at build time.
 
 Build locally:
 
