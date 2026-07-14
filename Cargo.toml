@@ -6,18 +6,36 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Reth ExEx framework
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", features = ["jemalloc"] }
-reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", features = ["serde"] }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+#
+# v2.4.0 added `jit` (the experimental revmc JIT) and `gmp` to reth's default
+# features. revmc is deliberately NOT enabled: it needs LLVM dev headers to
+# build and is not part of this baseline. Cargo cannot subtract a single default
+# feature, so defaults are turned off and re-listed verbatim minus `jit`.
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0", default-features = false, features = [
+    "jemalloc",
+    "otlp",
+    "otlp-logs",
+    "js-tracer",
+    "keccak-cache-global",
+    "asm-keccak",
+    "gmp",
+    "min-trace-logs",
+] }
+# The one default we cannot re-list above is the `reth-revm/portable` rule
+# (dep/feature syntax is not allowed in a dependency's feature list). Enabling
+# it on reth-revm directly is equivalent: cargo feature unification is global.
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0", features = ["portable"] }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0", features = ["serde"] }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0" }
+reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.0" }
 
-# Alloy for type-safe event decoding
-alloy-consensus = { version = "2.0.4", default-features = false }
-alloy-sol-types = { version = "1.6", features = ["json"] }
-alloy-primitives = { version = "1.6", default-features = false }
+# Alloy for type-safe event decoding (aligned with the Reth v2.4.0 baseline)
+alloy-consensus = { version = "2.1.1", default-features = false }
+alloy-sol-types = { version = "1.6.0", features = ["json"] }
+alloy-primitives = { version = "1.6.0", default-features = false }
 
 # Pool-arena shared crates: arena_layout (mmap layout / reader contract) and
 # arena_writer (slot allocation + typed write API). Both are owned by
