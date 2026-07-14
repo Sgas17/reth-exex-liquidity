@@ -94,6 +94,7 @@ cd /home/sam-sullivan/reth-exex-liquidity
 
 docker run --rm --network host \
   -v /home/sam-sullivan/reth-exex-liquidity:/workspace \
+  -v /home/sam-sullivan/defi_arb_rust:/defi_arb_rust:ro \
   -w /workspace \
   ubuntu:22.04 \
   bash -c "
@@ -227,7 +228,7 @@ This intentionally does not restart the node. Complete the rollback-artifact
 steps above before recreating the execution container.
 
 ```bash
-cd /home/sam-sullivan/reth-exex-liquidity && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -w /workspace ubuntu:22.04 bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && CARGO_TARGET_DIR=/workspace/target-user cargo build --release && mkdir -p /workspace/target/release && install -m 0755 /workspace/target-user/release/exex /workspace/target/release/.exex.ite54-new && mv -f /workspace/target/release/.exex.ite54-new /workspace/target/release/exex"
+cd /home/sam-sullivan/reth-exex-liquidity && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -v /home/sam-sullivan/defi_arb_rust:/defi_arb_rust:ro -w /workspace ubuntu:22.04 bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && CARGO_TARGET_DIR=/workspace/target-user cargo build --release && mkdir -p /workspace/target/release && install -m 0755 /workspace/target-user/release/exex /workspace/target/release/.exex.ite54-new && mv -f /workspace/target/release/.exex.ite54-new /workspace/target/release/exex"
 ```
 
 ## Justfile Automation
