@@ -80,7 +80,7 @@ sha256sum "$ROLLBACK_DIR/exex.v2.3.0.rollback" \
 {
   target/release/exex --version
   stat target/release/exex
-  printf 'checkout_head_at_capture=%s\n' "$(git rev-parse HEAD)"
+  printf 'checkout_head_at_capture: %s\n' "$(git rev-parse HEAD)"
 } > "$ROLLBACK_DIR/exex.provenance.txt"
 sha256sum "$ROLLBACK_DIR/exex.provenance.txt" \
   > "$ROLLBACK_DIR/exex.provenance.sha256"
@@ -101,6 +101,9 @@ just verify-rollback
 
 Do not continue unless `just verify-rollback` confirms the binary, protected
 env, image tag/ID, checksum, and provenance under the external rollback root.
+The `EXPECTED_*` values in the owned `verify-rollback.sh` are reviewed anchors
+for the established ITE-54 bundle. Replacing or regenerating that bundle requires
+a reviewed anchor update; never repoint `latest` and recompute sidecars alone.
 
 ### 2. Build and atomically promote the ExEx/Reth binary
 
