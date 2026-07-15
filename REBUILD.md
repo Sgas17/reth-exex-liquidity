@@ -69,38 +69,57 @@ $DEPLOY preflight
 deployment/eth-docker/validate-config.sh
 
 cd /home/sam-sullivan/reth-exex-liquidity
-cp -a target/release/exex target/release/exex.v2.3.0.rollback
-sha256sum target/release/exex.v2.3.0.rollback | tee exex-v2.3.0.sha256
-git rev-parse HEAD | tee exex-v2.3.0.source-commit
+umask 077
+ROLLBACK_ROOT="${HOME}/rollback/ITE-54"
+ROLLBACK_DIR="${ROLLBACK_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 0700 "$ROLLBACK_DIR"
+cp -a target/release/exex "$ROLLBACK_DIR/exex.v2.3.0.rollback"
+chmod 0755 "$ROLLBACK_DIR/exex.v2.3.0.rollback"
+sha256sum "$ROLLBACK_DIR/exex.v2.3.0.rollback" \
+  > "$ROLLBACK_DIR/exex.v2.3.0.sha256"
+{
+  target/release/exex --version
+  stat target/release/exex
+  printf 'checkout_head_at_capture=%s\n' "$(git rev-parse HEAD)"
+} > "$ROLLBACK_DIR/exex.provenance.txt"
 
-sudo cp -a /etc/itrcap/eth-docker.env \
+install -m 0600 /etc/itrcap/eth-docker.env \
+  "$ROLLBACK_DIR/eth-docker.env.pre-v2.4.0"
+install -m 0600 /etc/itrcap/eth-docker.env \
   /etc/itrcap/eth-docker.env.pre-v2.4.0
 docker image inspect reth:local >/dev/null
 docker tag reth:local reth:ite54-pre-v2.4.0
 docker image inspect --format '{{.Id}}' reth:ite54-pre-v2.4.0 \
-  | tee reth-image-pre-v2.4.0.id
+  > "$ROLLBACK_DIR/reth-image-pre-v2.4.0.id"
+ln -sfn "$(basename "$ROLLBACK_DIR")" "$ROLLBACK_ROOT/latest"
+just verify-rollback
 ```
 
-Do not continue unless the binary, runtime env, image tag, checksums, and source
-commit have all been preserved.
+Do not continue unless `just verify-rollback` confirms the binary, protected
+env, image tag/ID, checksum, and provenance under the external rollback root.
 
 ### 2. Build and atomically promote the ExEx/Reth binary
 
 Build in Ubuntu 22.04 for the production GLIBC baseline. The build is isolated
 under `target-user`; only a successful build is promoted to the mounted path.
+The coupled service crates are mounted from a temporary `git archive HEAD`
+snapshot so untracked runtime configuration is never visible in the container.
 
 ```bash
 cd /home/sam-sullivan/reth-exex-liquidity
+service_source="$(mktemp -d)"
+trap 'rm -rf "$service_source"' EXIT
+git -C /home/sam-sullivan/defi_arb_rust archive HEAD | tar -x -C "$service_source"
 
 docker run --rm --network host \
   -v /home/sam-sullivan/reth-exex-liquidity:/workspace \
-  -v /home/sam-sullivan/defi_arb_rust:/defi_arb_rust:ro \
+  -v "$service_source":/defi_arb_rust:ro \
   -w /workspace \
   ubuntu:22.04 \
   bash -c "
-    apt-get update -qq &&
-    apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 &&
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+    timeout 180s apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq &&
+    timeout 300s apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 &&
+    curl --connect-timeout 15 --max-time 300 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
     . \$HOME/.cargo/env &&
     CARGO_TARGET_DIR=/workspace/target-user cargo build --release &&
     mkdir -p /workspace/target/release &&
@@ -135,6 +154,22 @@ deployment/eth-docker/compose.sh logs execution --tail 200 \
 curl -s -X POST -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","method":"web3_clientVersion","params":[],"id":1}' \
   http://localhost:8545 | jq -r .result
+
+node <<'JS'
+const ws = new WebSocket('ws://127.0.0.1:8546');
+const timer = setTimeout(() => process.exit(1), 10_000);
+ws.onopen = () => ws.send(JSON.stringify({
+  jsonrpc: '2.0', method: 'web3_clientVersion', params: [], id: 1,
+}));
+ws.onmessage = ({ data }) => {
+  const response = JSON.parse(data);
+  console.log(response.result);
+  clearTimeout(timer);
+  ws.close();
+  if (!response.result?.startsWith('reth/v2.4.0-')) process.exitCode = 1;
+};
+ws.onerror = () => process.exit(1);
+JS
 ```
 
 Then confirm Engine/consensus health, peer sync, ExEx socket events, shared-arena
@@ -149,11 +184,13 @@ downgrade the datadir.
 
 ```bash
 cd /home/sam-sullivan/reth-exex-liquidity
-install -m 0755 target/release/exex.v2.3.0.rollback \
+ROLLBACK_DIR="${HOME}/rollback/ITE-54/latest"
+just verify-rollback
+install -m 0755 "$ROLLBACK_DIR/exex.v2.3.0.rollback" \
   target/release/.exex.rollback-tmp
 mv -f target/release/.exex.rollback-tmp target/release/exex
 
-sudo cp -a /etc/itrcap/eth-docker.env.pre-v2.4.0 \
+install -m 0600 "$ROLLBACK_DIR/eth-docker.env.pre-v2.4.0" \
   /etc/itrcap/eth-docker.env
 docker tag reth:ite54-pre-v2.4.0 reth:local
 
@@ -228,7 +265,7 @@ This intentionally does not restart the node. Complete the rollback-artifact
 steps above before recreating the execution container.
 
 ```bash
-cd /home/sam-sullivan/reth-exex-liquidity && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -v /home/sam-sullivan/defi_arb_rust:/defi_arb_rust:ro -w /workspace ubuntu:22.04 bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && CARGO_TARGET_DIR=/workspace/target-user cargo build --release && mkdir -p /workspace/target/release && install -m 0755 /workspace/target-user/release/exex /workspace/target/release/.exex.ite54-new && mv -f /workspace/target/release/.exex.ite54-new /workspace/target/release/exex"
+cd /home/sam-sullivan/reth-exex-liquidity && service_source="$(mktemp -d)" && trap 'rm -rf "$service_source"' EXIT && git -C /home/sam-sullivan/defi_arb_rust archive HEAD | tar -x -C "$service_source" && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -v "$service_source":/defi_arb_rust:ro -w /workspace ubuntu:22.04 bash -c "timeout 180s apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && timeout 300s apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 && curl --connect-timeout 15 --max-time 300 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && CARGO_TARGET_DIR=/workspace/target-user cargo build --release && mkdir -p /workspace/target/release && install -m 0755 /workspace/target-user/release/exex /workspace/target/release/.exex.ite54-new && mv -f /workspace/target/release/.exex.ite54-new /workspace/target/release/exex"
 ```
 
 ## Justfile Automation
@@ -249,9 +286,11 @@ just rebuild-and-restart
 
 Available recipes:
 - `just set-reth-version vX.Y.Z`
+- `just verify-rollback`
 - `just build-exex`
 - `just build-deployment-image`
 - `just restart-execution`
+- `just verify-websocket`
 - `just verify-exex`
 - `just deploy vX.Y.Z`
 
