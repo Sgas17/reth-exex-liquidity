@@ -2,7 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 project_dir := "/home/sam-sullivan/reth-exex-liquidity"
 deployment_compose := "/home/sam-sullivan/defi_arb_rust/deployment/eth-docker/compose.sh"
-rollback_dir := "/home/sam-sullivan/rollback/ITE-54/latest"
+rollback_verifier := "/home/sam-sullivan/defi_arb_rust/deployment/eth-docker/verify-rollback.sh"
 
 default:
     @just --list
@@ -16,12 +16,7 @@ set-reth-version version:
     rg -n '^reth|^reth-' Cargo.toml
 
 verify-rollback:
-    test "$(stat -Lc '%a:%u:%g' {{rollback_dir}})" = "700:$(id -u):$(id -g)"
-    test -x {{rollback_dir}}/exex.v2.3.0.rollback
-    test -s {{rollback_dir}}/exex.provenance.txt
-    sha256sum -c {{rollback_dir}}/exex.v2.3.0.sha256
-    test "$(stat -Lc '%a:%u:%g' {{rollback_dir}}/eth-docker.env.pre-v2.4.0)" = "600:$(id -u):$(id -g)"
-    test "$(docker image inspect --format '{{"{{"}}.Id{{"}}"}}' reth:ite54-pre-v2.4.0)" = "$(cat {{rollback_dir}}/reth-image-pre-v2.4.0.id)"
+    {{rollback_verifier}}
 
 build-exex: verify-rollback
     service_source="$(mktemp -d)"; trap 'rm -rf "$service_source"' EXIT; \

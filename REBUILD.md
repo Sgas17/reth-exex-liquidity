@@ -82,9 +82,13 @@ sha256sum "$ROLLBACK_DIR/exex.v2.3.0.rollback" \
   stat target/release/exex
   printf 'checkout_head_at_capture=%s\n' "$(git rev-parse HEAD)"
 } > "$ROLLBACK_DIR/exex.provenance.txt"
+sha256sum "$ROLLBACK_DIR/exex.provenance.txt" \
+  > "$ROLLBACK_DIR/exex.provenance.sha256"
 
 install -m 0600 /etc/itrcap/eth-docker.env \
   "$ROLLBACK_DIR/eth-docker.env.pre-v2.4.0"
+sha256sum "$ROLLBACK_DIR/eth-docker.env.pre-v2.4.0" \
+  > "$ROLLBACK_DIR/eth-docker.env.pre-v2.4.0.sha256"
 install -m 0600 /etc/itrcap/eth-docker.env \
   /etc/itrcap/eth-docker.env.pre-v2.4.0
 docker image inspect reth:local >/dev/null
@@ -107,26 +111,7 @@ snapshot so untracked runtime configuration is never visible in the container.
 
 ```bash
 cd /home/sam-sullivan/reth-exex-liquidity
-service_source="$(mktemp -d)"
-trap 'rm -rf "$service_source"' EXIT
-git -C /home/sam-sullivan/defi_arb_rust archive HEAD | tar -x -C "$service_source"
-
-docker run --rm --network host \
-  -v /home/sam-sullivan/reth-exex-liquidity:/workspace \
-  -v "$service_source":/defi_arb_rust:ro \
-  -w /workspace \
-  ubuntu:22.04 \
-  bash -c "
-    timeout 180s apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq &&
-    timeout 300s apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 &&
-    curl --connect-timeout 15 --max-time 300 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
-    . \$HOME/.cargo/env &&
-    CARGO_TARGET_DIR=/workspace/target-user cargo build --release &&
-    mkdir -p /workspace/target/release &&
-    install -m 0755 /workspace/target-user/release/exex /workspace/target/release/.exex.ite54-new &&
-    mv -f /workspace/target/release/.exex.ite54-new /workspace/target/release/exex
-  "
-
+just build-exex
 target/release/exex --version
 ```
 
@@ -136,13 +121,15 @@ The version output must identify Reth 2.4.0 and tag commit
 ### 3. Build the pinned base image and recreate execution
 
 ```bash
-cd /home/sam-sullivan/defi_arb_rust
-ETH_DOCKER_APPLY=1 deployment/eth-docker/compose.sh build-execution
-ETH_DOCKER_APPLY=1 deployment/eth-docker/compose.sh apply-execution
+cd /home/sam-sullivan/reth-exex-liquidity
+just build-deployment-image
+just restart-execution
 ```
 
-The wrapper uses the reviewed Reth and eth-docker pins from
-`deployment/eth-docker/versions.env`; it does not edit the upstream checkout.
+The recipes and deployment wrapper both verify the external rollback bundle
+before replacing the binary, image, or execution container. The wrapper uses the
+reviewed Reth and eth-docker pins from `deployment/eth-docker/versions.env`; it
+does not edit the upstream checkout.
 
 ### 4. Verify the deployment
 
@@ -252,11 +239,11 @@ deployment/eth-docker/compose.sh logs execution | grep "fork id mismatch"
    # Rebuild using the Docker command above
    ```
 
-4. Rebuild and recreate execution through the owned wrapper after preserving rollback artifacts:
+4. Rebuild and recreate execution through the guarded recipes after preserving rollback artifacts:
    ```bash
-   cd /home/sam-sullivan/defi_arb_rust
-   ETH_DOCKER_APPLY=1 deployment/eth-docker/compose.sh build-execution
-   ETH_DOCKER_APPLY=1 deployment/eth-docker/compose.sh apply-execution
+   cd /home/sam-sullivan/reth-exex-liquidity
+   just build-deployment-image
+   just restart-execution
    ```
 
 ## One-Line Build Command (build only)
@@ -265,7 +252,7 @@ This intentionally does not restart the node. Complete the rollback-artifact
 steps above before recreating the execution container.
 
 ```bash
-cd /home/sam-sullivan/reth-exex-liquidity && service_source="$(mktemp -d)" && trap 'rm -rf "$service_source"' EXIT && git -C /home/sam-sullivan/defi_arb_rust archive HEAD | tar -x -C "$service_source" && docker run --rm --network host -v /home/sam-sullivan/reth-exex-liquidity:/workspace -v "$service_source":/defi_arb_rust:ro -w /workspace ubuntu:22.04 bash -c "timeout 180s apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && timeout 300s apt-get install -y -qq curl build-essential pkg-config libssl-dev git libclang-dev m4 && curl --connect-timeout 15 --max-time 300 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . \$HOME/.cargo/env && CARGO_TARGET_DIR=/workspace/target-user cargo build --release && mkdir -p /workspace/target/release && install -m 0755 /workspace/target-user/release/exex /workspace/target/release/.exex.ite54-new && mv -f /workspace/target/release/.exex.ite54-new /workspace/target/release/exex"
+cd /home/sam-sullivan/reth-exex-liquidity && just build-exex
 ```
 
 ## Justfile Automation
